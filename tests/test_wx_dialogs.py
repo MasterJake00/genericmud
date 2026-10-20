@@ -275,3 +275,12 @@ def test_deferred_focus_on_a_closed_window_is_harmless(frame):
     field = wx.TextCtrl(frame)
     field.Destroy()
     _focus_if_alive(field)  # the editor closed before the deferred call ran
+
+
+def test_the_connection_menu_item_names_what_it_will_do():
+    # One item, relabelled: Ctrl+D has to mean "drop it" while connected and "bring it
+    # back" once it is down, so the label has to follow the tab, not the menu.
+    from genericmud.ui.wx_app import _connection_menu_label
+
+    assert _connection_menu_label(True) == "&Disconnect\tCtrl+D"
+    assert _connection_menu_label(False) == "&Reconnect\tCtrl+D"
