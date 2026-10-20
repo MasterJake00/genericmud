@@ -22,7 +22,7 @@ from genericmud.voice.governor import TokenBucket
 DEFAULT_RATE = 20  # sustained self-voiced lines/sec on the governed channel
 DEFAULT_BURST = 200  # lines absorbed from a single arrival: a couple of screenfuls
 MAIN_CHANNEL = "main"
-REVIEW_CHANNEL = "review"  # answers to a review gesture: Alt+Up/Down, Ctrl+1-9, Alt+T/C
+REVIEW_CHANNEL = "review"  # answers to a review gesture: Alt+Up/Down, Ctrl+1-9/Ctrl+0, Alt+T/C
 SYSTEM_CHANNEL = "system"  # the client talking about itself, not the MUD
 # Ctrl+M exists so the MUD transcript stops and the user can read the output box with their
 # screen reader's own commands. It must not silence the client's reply to a keypress: the

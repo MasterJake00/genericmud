@@ -104,6 +104,15 @@ def test_recall_key_speaks_last_line():
     assert backend.spoken[-1] == "second"
 
 
+def test_recall_key_speaks_the_tenth_line():
+    # Ctrl+0 reaches one past VIPMud's nine, so the tenth has to come back spoken.
+    app, backend, _sent, _posted = _app()
+    app.on_telnet_event(DataReceived("".join(f"line {i}\n" for i in range(1, 11)).encode()))
+    backend.spoken.clear()
+    app.on_ws_message({"type": "key", "key": "ctrl+0"})
+    assert backend.spoken[-1] == "line 1"
+
+
 def test_review_prev_line_key_enters_and_moves():
     app, backend, _sent, _posted = _app()
     app.on_telnet_event(DataReceived(b"l1\nl2\nl3\n"))

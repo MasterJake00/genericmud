@@ -228,6 +228,7 @@ Shift+F11         Stop all sounds (panic)
 
 Reviewing output:
 Ctrl+1 to 9       Recall the last nine lines, newest first
+Ctrl+0            Recall the tenth line back
 Alt+Up / Down     Review line by line
 Alt+Left / Right  Review word by word
 Alt+Shift+Left / Right   Review character by character

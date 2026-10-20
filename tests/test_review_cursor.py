@@ -56,6 +56,15 @@ def test_recall_last_n():
     assert cursor.recall(9) == ""  # fewer than 9 lines
 
 
+def test_recall_reaches_the_tenth_line():
+    # Ctrl+0 is bound to recall:10, so ten has to be inside the cap and eleven outside it.
+    cursor = ReviewCursor(_buffer(*[f"m{i}" for i in range(1, 11)]))  # m1..m10
+    assert cursor.recall(1) == "m10"
+    assert cursor.recall(9) == "m2"
+    assert cursor.recall(10) == "m1"
+    assert cursor.recall(11) == ""  # still bounded; the cap is what Ctrl+0 needed raised
+
+
 def test_search_backward_from_bottom():
     cursor = ReviewCursor(_buffer("alpha", "beta dragon", "gamma"))
     cursor.enter()  # at "gamma"

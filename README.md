@@ -114,7 +114,8 @@ always in the output box.
 
 ## Reading back what happened
 
-- **Ctrl+1 through Ctrl+9** speak the last nine lines, newest first.
+- **Ctrl+1 through Ctrl+9** speak the last nine lines, newest first, and
+  **Ctrl+0** speaks the tenth.
 - **Alt+Up/Down** walk the output line by line; **Alt+Left/Right** by word;
   **Alt+Shift+Left/Right** by character; **Alt+Home/End** jump to the oldest or
   newest line.
@@ -383,6 +384,7 @@ View, **Alt+H** Help.
 | Esc / F11 | Stop speech now |
 | Shift+F11 | Stop all sounds (panic) |
 | Ctrl+1..9 | Recall the last nine lines |
+| Ctrl+0 | Recall the tenth line back |
 | Alt+Up / Alt+Down | Review line by line |
 | Alt+Left / Alt+Right | Review word by word |
 | Alt+Shift+Left / Right | Review character by character |
