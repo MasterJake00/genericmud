@@ -1352,8 +1352,15 @@ class EngineApp:
         self.begin_login(self.name)
 
     def on_connection_status(self, message: str) -> None:
-        """Surface a transport status line (reconnecting, reconnected) to the user."""
+        """Surface a transport status line (reconnecting, reconnected) to the user.
+
+        The end of a session arrives here whatever caused it. A dropped link and a quit
+        both end in the transport's own "disconnected"; the UI's deliberate close emits
+        no status at all, so _do_disconnect calls this method itself. Naming the world in
+        one place is what keeps those three worded identically.
+        """
         spoken = message
+        echoed = f"* {message}"
         if message.startswith(("disconnected", "protocol error", "reconnect failed")):
             # A terminal drop (quit, network death we won't reconnect): silence the pack's
             # looping music/ambience -- nothing will ever stop those cues otherwise. A
@@ -1368,10 +1375,15 @@ class EngineApp:
                 # detail in the output log (echoed below) for anyone who wants it.
                 spoken = ("Lost connection: the MUD sent data the client couldn't read. "
                           "Not reconnecting.")
+            elif message == "disconnected":
+                # Name the world, so a quit, a dropped link and Ctrl+D all read the same.
+                label = self.name or "the MUD"
+                spoken = f"Disconnected from {label}."
+                echoed = f"* Disconnected from {label}"
         elif message.startswith("reconnected"):
             self.after_reconnect()
         self.voice.speak(spoken, channel=SYSTEM_CHANNEL, interrupt=True)
-        self._post(protocol.echo(f"* {message}"))  # raw detail stays reviewable in the output
+        self._post(protocol.echo(echoed))  # raw detail stays reviewable in the output
 
     def _log(self, text: str) -> None:
         if self.logger is not None and self.logger.active and not self.logger.log(text):
