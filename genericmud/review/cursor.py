@@ -2,16 +2,17 @@
 
 Drives the read-on-demand review model: line/word/char navigation, jump to
 top/bottom, search, copy-word, and VIPMud-style recall of the last N messages
-(Ctrl+1-9). Methods return the text to speak; the caller voices it on a review
-channel (interrupt=True) so each move barges in. Pure and synchronous — the live
-output stream never moves this cursor (the anti-flooding split).
+(Ctrl+1-9, plus Ctrl+0 for the tenth). Methods return the text to speak; the
+caller voices it on a review channel (interrupt=True) so each move barges in.
+Pure and synchronous — the live output stream never moves this cursor (the
+anti-flooding split).
 """
 
 from __future__ import annotations
 
 from genericmud.model.buffer import Buffer
 
-RECALL_MAX = 9  # VIPMud recalls the last nine messages via Ctrl+1-9
+RECALL_MAX = 10  # VIPMud's Ctrl+1-9 covers nine; Ctrl+0 recalls the tenth
 
 
 class ReviewCursor:
