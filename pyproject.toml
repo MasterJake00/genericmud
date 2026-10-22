@@ -39,9 +39,11 @@ voice = [
   # prism speaks through the running screen reader on all three platforms (NVDA/JAWS on
   # Windows, VoiceOver on macOS, Orca on Linux) and falls back to the system TTS itself.
   # Wheels cover win_amd64/arm64, macOS 11+, manylinux_2_34 and musllinux_1_2.
-  # Compatible-release pinned, not a floor: prism is 0.17.x with ~40 releases in seven months
+  # Compatible-release pinned, not a floor: prism is 0.x with ~40 releases in seven months
   # and publishes no ABI or SemVer policy, and self-voice is the whole app. Bump deliberately.
-  "prismatoid~=0.17.3",
+  # 0.18.3 at least: 0.17's native UTF-8 check rejected valid text (em dashes, curly quotes,
+  # Hangul, CJK) depending on byte position, and the router drops a line that fails to speak.
+  "prismatoid~=0.18.3",
   "pywin32>=306; platform_system == 'Windows'",  # SAPI5 fallback voice
 ]
 # native soundpack audio playback (the SoundBus pygame backend; --web doesn't need it)
