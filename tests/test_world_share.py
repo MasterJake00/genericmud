@@ -49,6 +49,38 @@ def test_export_without_a_pack_dir_still_shares_the_connection(tmp_path):
     assert meta["host"] == "mud.example"
 
 
+def test_export_keeps_unicode_metadata_readable_without_rewriting_rules(tmp_path):
+    world = World("Мир", "mud.example", 4000, tls=True, encoding="cp1251")
+    pack = _pack_dir(tmp_path, rules=r'{"version": 1, "aliases": [{"send": "\u044f"}]}')
+    original_rules = (pack / "rules.json").read_bytes()
+    dest = tmp_path / "unicode.zip"
+
+    export_world(world, pack, dest)
+
+    with zipfile.ZipFile(dest) as archive:
+        serialized = archive.read("world.json").decode("utf-8")
+        assert "Мир" in serialized
+        assert r"\u" not in serialized
+        assert json.loads(serialized) == {
+            "name": "Мир", "host": "mud.example", "port": 4000,
+            "tls": True, "encoding": "cp1251",
+        }
+        assert archive.read("rules.json") == original_rules
+    assert (pack / "rules.json").read_bytes() == original_rules
+    assert import_world(dest, tmp_path / "userpacks") == world
+
+
+def test_import_reads_legacy_escaped_unicode_metadata(tmp_path):
+    shared = tmp_path / "legacy.zip"
+    with zipfile.ZipFile(shared, "w") as archive:
+        archive.writestr(
+            "world.json",
+            r'{"name": "\u041c\u0438\u0440", "host": "mud.example", "port": 23}',
+        )
+
+    assert import_world(shared, tmp_path / "userpacks") == World("Мир", "mud.example", 23)
+
+
 def test_import_suffixes_the_name_instead_of_overwriting(tmp_path):
     world = World(name="Aardwolf", host="aardmud.org", port=4000)
     dest = tmp_path / "share.zip"

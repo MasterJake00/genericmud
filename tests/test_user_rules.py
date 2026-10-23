@@ -138,6 +138,28 @@ def test_key_macro(tmp_path):
     assert sink.spoken[-1][0] == "health check"
 
 
+def test_saved_rules_keep_unicode_readable_and_round_trip_special_characters(tmp_path):
+    command = 'сказать "привет"\nпуть C:\\миры\\карта'
+    rules = UserRules(aliases=[UserAlias(pattern="привет", send=command)])
+
+    save_rules(tmp_path, rules)
+
+    serialized = (tmp_path / "rules.json").read_bytes().decode("utf-8")
+    assert "сказать" in serialized
+    assert r"\u" not in serialized
+    assert UserRules.from_json(serialized) == rules
+    assert load_rules(tmp_path) == rules
+
+
+def test_legacy_escaped_unicode_rules_still_load(tmp_path):
+    (tmp_path / "rules.json").write_text(
+        r'{"version": 1, "aliases": [{"pattern": "x", "send": "\u044f"}]}',
+        encoding="utf-8",
+    )
+
+    assert load_rules(tmp_path) == UserRules(aliases=[UserAlias(pattern="x", send="я")])
+
+
 def test_disabled_automation_is_saved_but_not_registered(tmp_path):
     rules = UserRules(
         triggers=[UserTrigger(pattern="danger", speak="warning", enabled=False)],

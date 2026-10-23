@@ -97,7 +97,7 @@ class UserRules:
 
     def to_json(self) -> str:
         payload = {"version": 1, **asdict(self)}
-        return json.dumps(payload, indent=2, sort_keys=True)
+        return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False)
 
     @classmethod
     def from_json(cls, text: str) -> UserRules:

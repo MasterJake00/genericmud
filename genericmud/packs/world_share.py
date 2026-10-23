@@ -53,7 +53,7 @@ def export_world(world: World, pack_dir: Path | None, dest: Path) -> int:
     }
     count = 1
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(WORLD_META_FILENAME, json.dumps(meta, indent=2))
+        archive.writestr(WORLD_META_FILENAME, json.dumps(meta, indent=2, ensure_ascii=False))
         if pack_dir is None:
             return count
         rules = Path(pack_dir) / RULES_FILENAME
