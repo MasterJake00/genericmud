@@ -596,3 +596,24 @@ def test_short_alias_names_leave_longer_commands_alone():
     engine.process_input("se")
     engine.process_input("S")  # alias names are case-insensitive, like VIPMud variables
     assert sink.sent == ["southeast", "south"]
+
+
+@pytest.mark.parametrize(
+    ("pack_key", "pressed"),
+    [
+        ("alt-f2", "alt+f2"),  # Cosmic Rage VIPMud
+        ("Alt-shift-right", "alt+shift+right"),
+        ("Control-alt-shift-S", "ctrl+alt+shift+s"),  # Star Conquest
+        ("Shift-Alt-PageUp", "alt+shift+pageup"),
+        ("control-f11", "ctrl+f11"),  # Prometheus
+        ("Alt--", "alt+-"),  # the minus key itself
+        ("f9", "f9"),
+    ],
+)
+def test_hotkey_names_reach_the_combo_the_window_sends(pack_key, pressed):
+    # Packs write "alt-f2"; the window sends "alt+f2". Taken literally, every hotkey with a
+    # modifier was dead: 124 of Cosmic Rage's 148, 32 of Star Conquest's 40.
+    sink, engine = _load(f"#key {pack_key} {{score}}")
+    assert engine.press_key(pressed)
+    assert sink.sent == ["score"]
+

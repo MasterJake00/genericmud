@@ -77,6 +77,14 @@ _DEFAULT_VOLUME = 100
 _MASTER_HANDLE = "0"  # VIPMud handle 0 == all cues / master volume
 _MAX_EXEC_DEPTH = 20  # bare-text alias expansion recursion cap (self-invoking alias)
 _PLAY_HANDLE_TOKEN = "%playhandle"
+# VIPMud key names ("Alt-Shift-PageUp", "control-f11") -> the combo the window builds
+# (wx_app._key_combo: ctrl, alt, shift in that order, then the key, joined with "+").
+_KEY_MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "alt": "alt", "shift": "shift"}
+_KEY_MODIFIER_ORDER = ("ctrl", "alt", "shift")
+_KEY_NAMES = {
+    "pgup": "pageup", "pgdn": "pagedown", "del": "delete", "ins": "insert",
+    "return": "enter", "esc": "escape", "spacebar": "space",
+}
 _REMOTE_SOUND_MAX_BYTES = 32 * 1024 * 1024
 
 
@@ -265,6 +273,35 @@ def vip_pattern_to_regex(pattern: str) -> str:
         i = literal_start = match.end()
     out.append(re.escape(pattern[literal_start:]))
     return "".join(out)
+
+
+def vip_key_to_combo(spec: str) -> str:
+    """A VIPMud #key name as the combo the window sends for that keypress.
+
+    Packs write "alt-f2", "Control-alt-shift-S" and "Shift-Alt-PageUp"; the window sends
+    "alt+f2", "ctrl+alt+shift+s" and "alt+shift+pageup". Taken as written, every
+    hotkey with a modifier could never fire: 124 of Cosmic Rage's 148, 32 of Star
+    Conquest's 40. The key itself may be "-" ("alt--"), so modifiers are peeled off
+    the front one at a time rather than split on every dash.
+    """
+    remaining = "".join(spec.split()).lower()  # "shift-alt + pgdn" spacing varies too
+    modifiers: set[str] = set()
+    peeled = True
+    while peeled:
+        peeled = False
+        for word, modifier in _KEY_MODIFIERS.items():
+            for separator in "-+":
+                prefix = word + separator
+                if remaining.startswith(prefix) and len(remaining) > len(prefix):
+                    modifiers.add(modifier)
+                    remaining = remaining[len(prefix):]
+                    peeled = True
+                    break
+            if peeled:
+                break
+    key = _KEY_NAMES.get(remaining, remaining)
+    ordered = [modifier for modifier in _KEY_MODIFIER_ORDER if modifier in modifiers]
+    return "+".join([*ordered, key])
 
 
 def _to_int(value: str, default: int) -> int:
@@ -565,7 +602,7 @@ class VipMudPack:
         elif command == "ALIAS":
             self._define_alias(args[0].text, body)
         elif command == "KEY":
-            self._api.add_key(args[0].text, self._runner(body))
+            self._api.add_key(vip_key_to_combo(args[0].text), self._runner(body))
 
     def _define_alias(self, name: str, body: str) -> None:
         """``#ALIAS``: the first word of what the player types names the alias.
