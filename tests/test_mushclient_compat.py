@@ -1696,3 +1696,33 @@ def test_send_text_takes_percent_escapes_and_named_captures():
     )
     engine.process_line(Line("85% 140 HP."))
     assert sink.sent == ["say 85% of 140, 85"]
+
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        "ATTACH DATABASE '{path}' AS o; CREATE TABLE o.t(x TEXT);"
+        " INSERT INTO o.t VALUES ('\r\ncalc.exe\r\n')",
+        "CREATE TABLE t(x TEXT); INSERT INTO t VALUES ('\r\ncalc.exe\r\n'); VACUUM INTO '{path}'",
+    ],
+)
+def test_a_sandboxed_pack_cannot_write_outside_its_folder_through_sqlite(tmp_path, escape):
+    # sqlite3.open() confines the database to the pack, but ATTACH and VACUUM INTO take any
+    # path. This is the untrusted configuration the "Check compatibility" dry-run uses.
+    pack_dir = tmp_path / "pack"
+    pack_dir.mkdir()
+    outside = tmp_path / "outside" / "startup.bat"
+    outside.parent.mkdir()
+    sql = escape.format(path=outside.as_posix())
+    pack = MushclientPack(
+        ScriptApi(AutomationEngine(RecordingSink()), source="p", base_dir=str(pack_dir)),
+        full_stdlib=False,
+    )
+    pack.load_source(
+        "<muclient><script><![CDATA[\n"
+        'local db = sqlite3.open("state.db")\n'
+        f"db:exec([[{sql}]])\n"
+        "]]></script></muclient>"
+    )
+    assert not outside.exists()
+    assert (pack_dir / "state.db").exists()  # the pack's own database still works

@@ -12,6 +12,18 @@ _ROW = 100
 _DONE = 101
 
 
+def _no_attach(action: int, *_details: object) -> int:
+    """SQLite authorizer that refuses ATTACH, which VACUUM INTO also goes through.
+
+    open() keeps a pack's database inside its own folder, but SQL could ATTACH, or VACUUM
+    INTO, any path the user can write and fill it with chosen text: a sandboxed pack being
+    checked for compatibility could leave a .bat in the Startup folder.
+    """
+    if action == sqlite3.SQLITE_ATTACH:
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
 def make_sqlite_bridge(lua, base_dir: str | None, anchor: Callable[[], Path | None]):
     base = Path(base_dir).resolve() if base_dir else None
     make_iterator = lua.eval(
@@ -52,6 +64,7 @@ def make_sqlite_bridge(lua, base_dir: str | None, anchor: Callable[[], Path | No
             return None
         try:
             connection = sqlite3.connect(path, isolation_level=None)
+            connection.set_authorizer(_no_attach)
             connection.row_factory = sqlite3.Row
         except sqlite3.Error:
             return None
