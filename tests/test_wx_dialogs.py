@@ -332,3 +332,53 @@ def test_disconnecting_at_a_password_prompt_makes_typing_ordinary_again(frame, m
         panel.Destroy()
         loop.run_until_complete(asyncio.sleep(0.01))
         loop.close()
+
+
+@pytest.mark.parametrize(
+    ("combo", "reason"),
+    [
+        ("alt+up", "Alt+Up is already genericMud's key for reviewing the output"),
+        ("F11", "F11 is already genericMud's key for speech"),
+        ("ctrl+c", "Ctrl+C is kept for the menus and text editing"),
+        ("ctrl+space", "Ctrl+Space completes words in the command box"),
+    ],
+)
+def test_a_hotkey_on_a_key_genericmud_keeps_says_why_it_would_never_run(frame, combo, reason):
+    from genericmud.config.keymap import load_keymap
+    from genericmud.ui.wx_app import _hotkey_taken
+
+    message = _hotkey_taken(combo, load_keymap("vipmud"))
+    assert message is not None and message.startswith(reason)
+    assert _hotkey_taken("f2", load_keymap("vipmud")) is None
+
+
+def test_the_automation_manager_refuses_a_hotkey_genericmud_already_uses(
+    frame, tmp_path, monkeypatch
+):
+    # A hotkey saved on Ctrl+1, Alt+Up or F11 never fired (the keymap answers first) and
+    # nothing said so. The editor now stays open with the reason instead of saving it.
+    import types
+
+    from genericmud.config.keymap import load_keymap
+    from genericmud.packs.user_rules import UserKey
+    from genericmud.ui import wx_app
+
+    panel = types.SimpleNamespace(
+        world=World("Test", "mud.example", 4000),
+        app=types.SimpleNamespace(user_rules_dir=lambda: tmp_path),
+        variable_snapshot=None,
+        _keymap=load_keymap("vipmud"),
+    )
+    answers = iter([wx.ID_OK, wx.ID_CANCEL])  # press OK, read the refusal, then cancel
+    monkeypatch.setattr(wx_app.KeyEditorDialog, "ShowModal", lambda _editor: next(answers))
+    told: list[str] = []
+    monkeypatch.setattr(wx_app.wx, "MessageBox", lambda text, *_args: told.append(text))
+    manager = wx_app.AutomationManagerDialog(frame, panel)
+    try:
+        assert manager._edit_rule("key", UserKey(key="alt+up", send="score")) is None
+        assert len(told) == 1 and "Alt+Up" in told[0]
+        free = UserKey(key="f2", send="score")
+        answers = iter([wx.ID_OK])
+        assert manager._edit_rule("key", free) == free
+    finally:
+        manager.Destroy()

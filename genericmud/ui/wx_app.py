@@ -184,6 +184,39 @@ _NUMPAD_COMPASS = {
 }
 _COMPLETE_FORWARD = "ctrl+space"  # cycle a completion of the current input word
 _COMPLETE_BACKWARD = "ctrl+shift+space"
+# What each keymap namespace is for, so a refused hotkey can say what has the key.
+_KEYMAP_AREAS = {
+    "recall": "reading back recent messages",
+    "review": "reviewing the output",
+    "voice": "speech",
+    "sound": "stopping sounds",
+    "input": "auto-repeat",
+    "chan": "browsing channels",
+    "nav": "walking and breadcrumbs",
+    "map": "the map",
+    "log": "logging",
+}
+
+
+def _hotkey_taken(combo: str, keymap: dict[str, str]) -> str | None:
+    """Why a hotkey on ``combo`` would never run, or None when the key is free.
+
+    genericMud's own keymap answers a key before any hotkey does, the menu and editing
+    keys in _PASSTHROUGH_COMBOS never reach the engine, and the command box keeps the
+    completion keys, so a hotkey saved on one of them sat in the list doing nothing.
+    """
+    combo = combo.strip().lower()
+    name = "+".join(part.capitalize() for part in combo.split("+"))
+    if combo in keymap:
+        area = _KEYMAP_AREAS.get(keymap[combo].partition(":")[0], "one of its own commands")
+        reason = f"{name} is already genericMud's key for {area}"
+    elif combo in _PASSTHROUGH_COMBOS:
+        reason = f"{name} is kept for the menus and text editing"
+    elif combo in (_COMPLETE_FORWARD, _COMPLETE_BACKWARD):
+        reason = f"{name} completes words in the command box"
+    else:
+        return None
+    return f"{reason}, so a hotkey on it would never run. Choose another key."
 
 
 class SessionPanel(wx.Panel):
@@ -2480,7 +2513,11 @@ class AutomationManagerDialog(wx.Dialog):
                 if dialog.ShowModal() != wx.ID_OK:
                     return None
                 result = dialog.result()
-                if self._complete(kind, result) and self._valid_rule(kind, result):
+                if (
+                    self._complete(kind, result)
+                    and self._valid_rule(kind, result)
+                    and self._key_is_free(kind, result)
+                ):
                     return result
         finally:
             dialog.Destroy()
@@ -2508,6 +2545,15 @@ class AutomationManagerDialog(wx.Dialog):
             )
             return False
         return True
+
+    def _key_is_free(self, kind: str, rule: object) -> bool:
+        if kind != "key":
+            return True
+        reason = _hotkey_taken(rule.key, self._panel._keymap)
+        if reason is None:
+            return True
+        wx.MessageBox(f"Not saved: {reason}", "Hotkey", wx.OK | wx.ICON_INFORMATION, self)
+        return False
 
     def _complete(self, kind: str, rule: object) -> bool:
         attr, label = self._REQUIRED_FIELD[kind]
