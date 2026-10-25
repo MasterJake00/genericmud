@@ -218,6 +218,7 @@ class SessionPanel(wx.Panel):
         self._history: list[str] = []
         self._hist_index = 0
         self._history_draft = ""  # unsent input, parked while Up browses history
+        self._input_masked = False  # the server hides typed input: keep it out of history
         self._alive = True
         self._pending: list[str] = []
         self._flush_scheduled = False
@@ -391,6 +392,8 @@ class SessionPanel(wx.Panel):
                 wx.CallLater(_FLUSH_INTERVAL_MS, self._flush_output)
         elif kind == protocol.FIND_RESULT:
             self._sync_find_caret(message)
+        elif kind == protocol.INPUT_MASKED:
+            self._input_masked = bool(message.get("masked"))
         # Sound/status messages are ignored here for now (native SFX is a follow-up).
 
     def _flush_output(self) -> None:
@@ -560,7 +563,7 @@ class SessionPanel(wx.Panel):
     def _on_send(self, _event: wx.CommandEvent) -> None:
         text = self.input.GetValue()
         self.input.SetValue("")
-        if text:
+        if text and not self._input_masked:
             self._history.append(text)
         self._hist_index = len(self._history)
         self._history_draft = ""

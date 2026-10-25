@@ -59,6 +59,14 @@ MAX_ALIAS_DEPTH = 20  # guard against an alias/trigger that re-fires itself fore
 _MAP_SAVE_INTERVAL = 25
 _PLUGIN_TICK_SECONDS = 0.25  # OnPluginTick cadence (MUSHclient ticks faster; see _arm_plugin_ticks)
 _PROMPT_IDLE_FLUSH_SECONDS = 0.25  # emit a newline-less prompt if the server sends no more data
+# Transport statuses that mean the socket went away or was replaced (transport/connection.py).
+_SOCKET_CHANGES = (
+    "disconnected",
+    "protocol error",
+    "reconnect failed",
+    "connection lost",
+    "reconnected",
+)
 # MSDP variables that mean the player's location changed; both the table and flat forms.
 _MSDP_ROOM_VARS = frozenset(
     {"ROOM", "ROOM_NAME", "ROOM_AREA", "ROOM_EXITS", "ROOM_VNUM", "AREA_NAME"}
@@ -699,8 +707,9 @@ class EngineApp:
         elif isinstance(event, T.Negotiation) and event.option == T.OPT_ECHO:
             # The server takes over echo (IAC WILL ECHO) right before a password prompt and
             # releases it (WONT) afterward. While it holds echo, the input is a secret: keep
-            # it out of the session log, the command history, and the autoretype buffer.
-            self._input_masked = event.command == T.WILL
+            # it out of the session log, the command history, and the autoretype buffer, and
+            # send it exactly as typed (_dispatch_secret).
+            self._set_input_masked(event.command == T.WILL)
 
     def _decode_server_bytes(self, data: bytes) -> str:
         """Decode server text in the world's encoding (see protocol/charset.py).
@@ -939,8 +948,11 @@ class EngineApp:
         kind = message.get("type")
         if kind == protocol.INPUT:
             text = message.get("text", "")
-            if text.strip() and not self._input_masked:
-                self._last_input = text  # never park a masked password for autoretype to resend
+            if self._input_masked:
+                self._dispatch_secret(text)
+                return
+            if text.strip():
+                self._last_input = text
             elif self.autoretype and self._last_input:
                 # A blank line normally goes to the MUD as-is (pagers use it); with
                 # autoretype on, an empty Enter repeats the last typed input instead.
@@ -1016,6 +1028,30 @@ class EngineApp:
             self._send(line)
             if self.nav.record(line):  # build the breadcrumb trail from manual walking
                 self._on_player_moved()
+
+    def _dispatch_secret(self, text: str) -> None:
+        """Send what was typed while the server hides input (a password), exactly as typed.
+
+        The normal input path would rewrite or reroute it: auto-repeat swapped it for the
+        last command (the username), the separator split "abc;def" in two, ".2news" ran as
+        a speedwalk, and aliases, client commands and the breadcrumb trail all read it.
+        """
+        if text.strip():
+            if self._login is not None and not self._login.done:
+                self._login.disarm()  # the user is answering the prompt themselves
+            self._log("> ***")
+        self._send(text)
+
+    def _set_input_masked(self, masked: bool) -> None:
+        """Track whether the server hides typed input; tell the renderer when that flips.
+
+        The renderer keeps its own Up-arrow history, so it has to know as well, or the
+        password is one keypress away for anyone at the keyboard.
+        """
+        if masked == self._input_masked:
+            return
+        self._input_masked = masked
+        self._post(protocol.input_masked(masked))
 
     def _dispatch_remote(self, text: str) -> None:
         """Deliver a command sent from ANOTHER session (mud.send_to / mud.broadcast).
@@ -1335,6 +1371,11 @@ class EngineApp:
     def on_connection_status(self, message: str) -> None:
         """Surface a transport status line (reconnecting, reconnected) to the user."""
         spoken = message
+        if message.startswith(_SOCKET_CHANGES):
+            # Echo state belongs to the socket that just went away. Left armed, every
+            # command after it would go out as a password: no client commands, aliases or
+            # speedwalks, and "***" in the log, because no WONT ECHO is ever coming.
+            self._set_input_masked(False)
         if message.startswith(("disconnected", "protocol error", "reconnect failed")):
             # A terminal drop (quit, network death we won't reconnect): silence the pack's
             # looping music/ambience -- nothing will ever stop those cues otherwise. A
@@ -1354,9 +1395,6 @@ class EngineApp:
             # A fresh socket is a fresh byte stream: drop any half-decoded multibyte tail and
             # the legacy-encoding latch, or a drop mid-character mis-decodes the whole reconnect.
             self.codec.reset()
-            # Echo state belongs to the dead socket. Left armed, every command for the rest
-            # of the session logs as "***" because the new server never sends WONT ECHO.
-            self._input_masked = False
             # A fresh socket means fresh login prompts; the old AutoLogin is marked done, so
             # re-arm it or a reconnect strands the user at the login screen.
             self.begin_login(self.name)

@@ -123,3 +123,27 @@ def test_refuses_mxp_until_it_is_parsed():
 def test_refuses_unknown_options():
     unknown = 137
     assert bytes([T.IAC, T.DONT, unknown]) in _negotiate(Negotiation(T.WILL, unknown))
+
+
+def test_accepts_the_echo_a_server_hides_a_password_with():
+    # Answering DONT made servers that track option state (FluffOS, through libtelnet)
+    # treat echo as never on, so the WONT ECHO that ends the password prompt never came.
+    assert _negotiate(Negotiation(T.WILL, T.OPT_ECHO)) == bytes([T.IAC, T.DO, T.OPT_ECHO])
+
+
+def test_acknowledges_the_end_of_the_servers_echo_once():
+    # Without the DONT, a state-tracking server waits for it forever and never sends the
+    # WILL ECHO that hides the next password (a retry, or changing it later).
+    sent = _negotiate(
+        Negotiation(T.WILL, T.OPT_ECHO),
+        Negotiation(T.WONT, T.OPT_ECHO),
+        Negotiation(T.WONT, T.OPT_ECHO),  # already off: answering again could start a loop
+        Negotiation(T.WILL, T.OPT_ECHO),  # the next password prompt
+    )
+    do_echo = bytes([T.IAC, T.DO, T.OPT_ECHO])
+    dont_echo = bytes([T.IAC, T.DONT, T.OPT_ECHO])
+    assert sent == do_echo + dont_echo + do_echo
+
+
+def test_does_not_answer_a_wont_for_an_option_that_was_never_on():
+    assert _negotiate(Negotiation(T.WONT, T.OPT_ECHO)) == b""

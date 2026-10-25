@@ -21,6 +21,7 @@ REVIEW = "review"
 CONNECTED = "connected"
 DISCONNECTED = "disconnected"
 FIND_RESULT = "find_result"  # outcome of a FIND, so the renderer can follow with its caret
+INPUT_MASKED = "input_masked"  # the server is hiding typed input (a password prompt)
 
 # Renderer -> engine
 INPUT = "input"
@@ -97,6 +98,11 @@ def connected(world: str) -> dict[str, Any]:
 
 def disconnected() -> dict[str, Any]:
     return {"type": DISCONNECTED}
+
+
+def input_masked(masked: bool) -> dict[str, Any]:
+    """Whether what the user types now is a secret the renderer must not keep in history."""
+    return {"type": INPUT_MASKED, "masked": masked}
 
 
 def input_message(text: str) -> dict[str, Any]:

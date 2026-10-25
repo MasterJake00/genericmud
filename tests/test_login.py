@@ -160,3 +160,69 @@ def test_password_input_is_masked_in_the_log_while_server_echoes(tmp_path):
     assert "hunter2" not in log_text
     assert "> ***" in log_text
     assert "> look" in log_text  # normal input still logged in the clear
+
+
+def _app_at_a_password_prompt():
+    """An engine whose server has just taken over echo, the way it does for a password."""
+    from genericmud.protocol import telnet as T
+
+    sent: list[str] = []
+    posted: list[dict] = []
+    voice = VoiceRouter(RecordingBackend(), clock=lambda: 0.0)
+    app = EngineApp(voice, send=sent.append, post=posted.append, keymap={})
+    app.on_telnet_event(T.Negotiation(T.WILL, T.OPT_ECHO))
+    return app, sent, posted
+
+
+def test_auto_repeat_never_swaps_the_password_for_the_last_command():
+    from genericmud.protocol import telnet as T
+
+    sent: list[str] = []
+    voice = VoiceRouter(RecordingBackend(), clock=lambda: 0.0)
+    app = EngineApp(voice, send=sent.append, post=[].append, keymap={})
+    app.autoretype = True
+    app.on_ws_message({"type": "input", "text": "hero"})  # the username, typed in the clear
+    app.on_telnet_event(T.Negotiation(T.WILL, T.OPT_ECHO))
+    app.on_ws_message({"type": "input", "text": "hunter2"})
+    assert sent == ["hero", "hunter2"]
+
+
+def test_a_password_goes_out_exactly_as_typed():
+    app, sent, _posted = _app_at_a_password_prompt()
+    aliased: list[str] = []
+    app.engine.add_alias("hunter*", lambda ctx: aliased.append(ctx.line.plain_text))
+    for password in ("abc;def", ".2news", "..3n", "hunter2", "n"):
+        app.on_ws_message({"type": "input", "text": password})
+    assert sent == ["abc;def", ".2news", "..3n", "hunter2", "n"]
+    assert aliased == []
+    assert app.nav.trail == []  # a password that spells a direction is not a step taken
+
+
+def test_typed_input_goes_back_through_the_pipeline_once_the_server_echoes_again():
+    from genericmud.protocol import telnet as T
+
+    app, sent, _posted = _app_at_a_password_prompt()
+    app.on_telnet_event(T.Negotiation(T.WONT, T.OPT_ECHO))
+    app.on_ws_message({"type": "input", "text": "look;.2n"})
+    assert sent == ["look", "n", "n"]
+
+
+def test_the_renderer_hears_when_input_is_hidden_and_when_it_is_not():
+    from genericmud.bridge import protocol
+    from genericmud.protocol import telnet as T
+
+    app, _sent, posted = _app_at_a_password_prompt()
+    app.on_telnet_event(T.Negotiation(T.WILL, T.OPT_ECHO))  # a repeat changes nothing
+    app.on_telnet_event(T.Negotiation(T.WONT, T.OPT_ECHO))
+    flips = [message for message in posted if message["type"] == protocol.INPUT_MASKED]
+    assert flips == [protocol.input_masked(True), protocol.input_masked(False)]
+
+
+def test_a_dropped_connection_takes_the_hidden_input_with_it():
+    from genericmud.bridge import protocol
+
+    app, sent, posted = _app_at_a_password_prompt()
+    app.on_connection_status("connection lost; reconnecting in 2s (attempt 1)")
+    app.on_ws_message({"type": "input", "text": "look;look"})
+    assert sent == ["look", "look"]  # split again: it's an ordinary command now
+    assert posted.count(protocol.input_masked(False)) == 1

@@ -275,3 +275,30 @@ def test_deferred_focus_on_a_closed_window_is_harmless(frame):
     field = wx.TextCtrl(frame)
     field.Destroy()
     _focus_if_alive(field)  # the editor closed before the deferred call ran
+
+
+def test_a_password_typed_at_a_hidden_prompt_stays_out_of_the_command_history(frame,
+                                                                             monkeypatch):
+    import asyncio
+
+    from genericmud.bridge import protocol
+    from genericmud.ui import wx_app
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+    loop = asyncio.new_event_loop()
+    panel = wx_app.SessionPanel(frame, loop, {}, World("Test", "mud.example", 4000))
+    try:
+        panel._handle_message(protocol.input_masked(True))
+        panel.input.SetValue("hunter2")
+        panel._on_send(None)
+        panel._handle_message(protocol.input_masked(False))
+        panel.input.SetValue("look")
+        panel._on_send(None)
+        assert panel._history == ["look"]
+    finally:
+        panel.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))  # let the no-op session start finish
+        loop.close()

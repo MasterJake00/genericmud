@@ -24,6 +24,7 @@ export class Input {
     this.history = [];
     this.historyIndex = 0;
     this.historyDraft = "";  // unsent input, parked while Up browses history
+    this.masked = false;  // the server hides typed input (a password): no history
     this.words = [];
     this.completion = null;
     element.closest("form").addEventListener("submit", (e) => {
@@ -36,11 +37,15 @@ export class Input {
   _submit() {
     const text = this.element.value;
     this.bridge.send({ type: "input", text });
-    if (text) this.history.push(text);
+    if (text && !this.masked) this.history.push(text);
     this.historyIndex = this.history.length;
     this.historyDraft = "";
     this.completion = null;
     this.element.value = "";
+  }
+
+  setMasked(masked) {
+    this.masked = Boolean(masked);
   }
 
   addOutput(text) {

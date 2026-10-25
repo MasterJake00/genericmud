@@ -38,6 +38,7 @@ const handlers = {
   review: () => { /* speech is native; visual reflection can be added later */ },
   connected: (m) => { announceEl.textContent = `Connected to ${m.world || "server"}`; },
   disconnected: () => { announceEl.textContent = "Disconnected"; },
+  input_masked: (m) => input.setMasked(m.masked),
 };
 
 const bridge = new Bridge(port, handlers);

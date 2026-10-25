@@ -174,3 +174,19 @@ test("completion announces the word and no-match to the screen reader", () => {
   input._onKey(keyEvent(" ", { ctrlKey: true }));
   assert.deepEqual(announced, ["goblin", "no match for zzz"]);
 });
+
+test("a password typed while the server hides input stays out of history", () => {
+  const { input, sent } = makeInput();
+  input.setMasked(true);
+  input.element.value = "hunter2";
+  input._submit();
+  input.setMasked(false);
+  input.element.value = "look";
+  input._submit();
+
+  assert.deepEqual(sent, [
+    { type: "input", text: "hunter2" },
+    { type: "input", text: "look" },
+  ]);
+  assert.deepEqual(input.history, ["look"]);
+});
