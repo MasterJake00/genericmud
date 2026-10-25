@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import tomllib
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,6 +32,11 @@ class World:
 
     def __post_init__(self) -> None:
         self.encoding = normalize_encoding(self.encoding)
+        # No real world name or host has a control character in it, and one gets in easily:
+        # a shared world zip can carry a newline, Ctrl+Backspace in a Windows edit box
+        # types a DEL. Keep them out of the name every rule, map and folder is filed under.
+        self.name = _without_control_characters(self.name)
+        self.host = _without_control_characters(self.host)
 
 
 def parse_port(value: object) -> int:
@@ -125,5 +131,28 @@ def save_worlds(worlds: list[World], path: Path | None = None) -> None:
     atomic_write_text(target, "\n\n".join(blocks) + "\n")
 
 
+def _without_control_characters(value: str) -> str:
+    """``value`` with line breaks and tabs as spaces and other control characters gone."""
+    kept = []
+    for char in value:
+        if char in "\t\n\r\x0b\x0c":
+            kept.append(" ")
+        elif unicodedata.category(char) != "Cc":
+            kept.append(char)
+    return "".join(kept).strip()
+
+
 def _quote(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """A TOML basic string. Control characters are escaped, not written raw: TOML forbids
+    them unescaped, so a single one made tomllib reject the whole file, every saved world
+    vanished from the Connect list, and the next save kept only the world being saved."""
+    out = ['"']
+    for char in value:
+        if char in '\\"':
+            out.append("\\" + char)
+        elif unicodedata.category(char) == "Cc":
+            out.append(f"\\u{ord(char):04X}")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)

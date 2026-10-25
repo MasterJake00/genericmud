@@ -55,3 +55,20 @@ def test_parse_port_rejects_invalid_values(value):
 
 def test_parse_port_accepts_numeric_text():
     assert parse_port(" 4000 ") == 4000
+
+
+def test_a_control_character_cannot_cost_the_other_saved_worlds(tmp_path):
+    # TOML forbids raw control characters; one used to make tomllib reject the whole file,
+    # so every saved world vanished and the next save kept only the world being saved.
+    path = tmp_path / "worlds.toml"
+    worlds = [
+        World("Aardwolf", "aardmud.org", 4000),
+        World("Odd", "odd.example", 23, sounds="C:/snd\x7f\tx"),
+    ]
+    save_worlds(worlds, path)
+    assert load_worlds(path) == worlds
+
+
+def test_a_world_name_or_host_drops_control_characters():
+    world = World("Friend\nMUD\x7f", " mud.example\x00 ", 4000)
+    assert (world.name, world.host) == ("Friend MUD", "mud.example")

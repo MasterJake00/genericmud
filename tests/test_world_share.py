@@ -100,3 +100,17 @@ def test_import_replaces_an_invalid_port_and_does_not_coerce_tls_strings(tmp_pat
     world = import_world(shared, tmp_path / "userpacks")
     assert world.port == 23
     assert world.tls is False
+
+
+def test_an_imported_name_with_a_line_break_keeps_every_saved_world(tmp_path):
+    from genericmud.config.worlds import load_worlds, save_worlds
+
+    archive = tmp_path / "shared.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        meta = {"name": "Friend\nMUD", "host": "mud.example", "port": 4000}
+        bundle.writestr("world.json", json.dumps(meta))
+    world = import_world(archive, tmp_path / "userpacks")
+    assert world.name == "Friend MUD"
+    path = tmp_path / "worlds.toml"
+    save_worlds([World("Aardwolf", "aardmud.org", 4000), world], path)
+    assert [saved.name for saved in load_worlds(path)] == ["Aardwolf", "Friend MUD"]
