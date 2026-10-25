@@ -47,6 +47,7 @@ class ScriptApi:
         self._sounds_index: dict[str, str] = {}  # basename(lower) -> full path under @sppath
         self._sounds_index_key: str | None = None  # the @sppath the index was built for
         self._active_timers = 0  # pending pack timers, bounded by _MAX_ACTIVE_TIMERS
+        self._timer_refusal_noted = False  # the diagnostic log hears about the first refusal
         self._execute_depth = 0
 
     @property
@@ -265,7 +266,14 @@ class ScriptApi:
 
     def add_timer(self, delay: float, callback: Callable[[], None]) -> None:
         if self._active_timers >= _MAX_ACTIVE_TIMERS:
-            return  # refuse: too many pending timers would starve the event loop (UI freeze)
+            # Refuse: too many pending timers would starve the event loop (UI freeze). A
+            # repeating timer refused here never fires again, so leave a trace of it once.
+            if not self._timer_refusal_noted and self._engine.diag is not None:
+                self._timer_refusal_noted = True
+                self._engine.diag.event(
+                    "pack.timer_refused", source=self._source or "?", limit=_MAX_ACTIVE_TIMERS
+                )
+            return
         self._active_timers += 1
         handle_box: list = []
 
