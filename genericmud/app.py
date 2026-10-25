@@ -1102,6 +1102,7 @@ class EngineApp:
             announce=self._speak_system,
             waypoints=waypoints,
             locate=lambda: self.map.here,
+            reports_rooms=self.nav.room is not None,
         )
         if announcement:
             self._speak_system(announcement)

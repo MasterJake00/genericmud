@@ -140,7 +140,8 @@ class SafeWalk:
 
     Adaptive: each step advances on a confirmed room change (``on_room_change``,
     fed from GMCP) or, failing that, a per-step timeout (so a MUD without GMCP
-    still progresses). A blocked-movement line (``on_line``) abandons the rest.
+    still progresses; a MUD that reports rooms gets a longer one, for lag). A
+    blocked-movement line (``on_line``) abandons the rest.
     Pure control logic — ``send``/``schedule``/``announce`` are injected.
     """
 
@@ -152,6 +153,8 @@ class SafeWalk:
         schedule: Callable[[float, Callable[[], None]], None],
         announce: Callable[[str], None],
         step_timeout: float = 0.5,
+        reported_step_timeout: float = 3.0,
+        reports_rooms: bool = False,
         blocked_patterns: tuple[str, ...] = DEFAULT_BLOCKED_PATTERNS,
         waypoints: list[str] | None = None,
         locate: Callable[[], str] | None = None,
@@ -161,6 +164,11 @@ class SafeWalk:
         self._schedule = schedule
         self._announce = announce
         self._timeout = step_timeout
+        # On a MUD that reports rooms the report is the real signal, so the timeout is only
+        # a safety net and has to ride out lag. Half a second sent the next step before a
+        # slow report for this one arrived, and that report then read as a wrong turn.
+        self._reported_timeout = reported_step_timeout
+        self._reports_rooms = reports_rooms
         self._blocked = [re.compile(pattern, re.IGNORECASE) for pattern in blocked_patterns]
         self._token = 0  # bumps each step so a stale timeout callback no-ops
         self._active = False
@@ -178,6 +186,10 @@ class SafeWalk:
     def on_room_change(self) -> None:
         """A confirmed move (the MUD reported a new room): send the next step now."""
         if not self._active:
+            return
+        self._reports_rooms = True  # this MUD reports rooms: wait for them from now on
+        if self._late_report():
+            self._arm_timeout()  # the step in flight gets the longer wait as well
             return
         if self._strayed():
             abandoned = len(self._remaining)
@@ -199,6 +211,17 @@ class SafeWalk:
             return False
         index = min(self._sent, len(self._waypoints)) - 1
         return self._locate() != self._waypoints[index]
+
+    def _late_report(self) -> bool:
+        """True when the room reached is the one the PREVIOUS step was heading for.
+
+        That report lost a race with the timeout, which already sent the next step; its
+        own report is still on the way. Only a mapped route can tell.
+        """
+        if not self._waypoints or self._locate is None or self._sent < 2:
+            return False
+        index = min(self._sent, len(self._waypoints)) - 2
+        return self._locate() == self._waypoints[index]
 
     def on_line(self, text: str) -> None:
         """Halt the walk if an incoming line says the move was blocked."""
@@ -223,9 +246,14 @@ class SafeWalk:
         step = self._remaining.pop(0)
         self._send(step)
         self._sent += 1
+        self._arm_timeout()
+
+    def _arm_timeout(self) -> None:
+        """Start waiting for the step in flight; any earlier wait goes stale and no-ops."""
         self._token += 1
         token = self._token
-        self._schedule(self._timeout, lambda: self._on_timeout(token))
+        timeout = self._reported_timeout if self._reports_rooms else self._timeout
+        self._schedule(timeout, lambda: self._on_timeout(token))
 
     def _on_timeout(self, token: int) -> None:
         if self._active and token == self._token:

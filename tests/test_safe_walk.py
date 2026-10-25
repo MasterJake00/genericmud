@@ -15,9 +15,11 @@ class _Scheduler:
 
     def __init__(self) -> None:
         self.calls: list = []
+        self.delays: list[float] = []
 
-    def __call__(self, _delay, callback) -> None:
+    def __call__(self, delay, callback) -> None:
         self.calls.append(callback)
+        self.delays.append(delay)
 
     def fire_last(self) -> None:
         self.calls[-1]()
@@ -99,3 +101,73 @@ def test_app_safe_walk_halts_on_blocked_then_stop_key_is_idle():
     assert sent == ["n"]
     app._handle_key("alt+s")  # nav:stop with nothing walking
     assert any("not walking" in spoken for spoken in backend.spoken)
+
+
+class _Clock:
+    """A scheduler with time in it, for lag: callbacks fire in order as time advances."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.pending: list[tuple[float, object]] = []
+
+    def __call__(self, delay, callback) -> None:
+        self.pending.append((self.now + delay, callback))
+
+    def advance_to(self, when: float) -> None:
+        while True:
+            due = [entry for entry in self.pending if entry[0] <= when]
+            if not due:
+                break
+            entry = min(due, key=lambda pair: pair[0])
+            self.pending.remove(entry)
+            self.now = entry[0]
+            entry[1]()
+        self.now = when
+
+
+def test_mapped_walk_waits_out_a_slow_room_report():
+    # Lag of 0.7 s: the half-second timeout sent step two, then step one's report arrived
+    # naming the room step one was heading for, and the walk took that as being moved off
+    # the route and gave up.
+    clock = _Clock()
+    announced: list[str] = []
+    here = {"room": "A"}
+    walk = SafeWalk(
+        ["n", "n", "n"],
+        send=lambda _direction: None,
+        schedule=clock,
+        announce=announced.append,
+        waypoints=["B", "C", "D"],
+        locate=lambda: here["room"],
+    )
+    walk.start()
+    clock.advance_to(0.7)
+    here["room"] = "B"
+    walk.on_room_change()
+    assert walk.active, announced
+    here["room"] = "C"
+    walk.on_room_change()
+    here["room"] = "D"
+    walk.on_room_change()
+    assert announced == ["arrived"]
+
+
+def test_typed_walk_does_not_say_arrived_before_the_last_step_lands():
+    clock = _Clock()
+    sent: list[str] = []
+    announced: list[str] = []
+    walk = SafeWalk(["n", "n", "n"], send=sent.append, schedule=clock, announce=announced.append)
+    walk.start()
+    clock.advance_to(0.7)
+    walk.on_room_change()  # step one's report, late: the MUD does report rooms after all
+    clock.advance_to(1.25)
+    assert "arrived" not in announced, (sent, announced)
+
+
+def test_walk_waits_longer_for_each_step_on_a_mud_that_reports_rooms():
+    app, sent, sched, _backend = _app()
+    app.on_telnet_event(Subnegotiation(OPT_GMCP, b'room.info {"num": 1}'))
+    app.on_ws_message({"type": "input", "text": "..2n"})
+    assert sent == ["n"]
+    assert sched.delays[-1] > 0.5  # the report is the signal; the timeout only rides out lag
+
