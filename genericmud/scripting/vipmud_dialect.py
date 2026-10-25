@@ -563,9 +563,40 @@ class VipMudPack:
                 flags + vip_pattern_to_regex(args[0].text), self._runner(body), regex=True
             )
         elif command == "ALIAS":
-            self._api.add_alias(vip_pattern_to_regex(args[0].text), self._runner(body), regex=True)
+            self._define_alias(args[0].text, body)
         elif command == "KEY":
             self._api.add_key(args[0].text, self._runner(body))
+
+    def _define_alias(self, name: str, body: str) -> None:
+        """``#ALIAS``: the first word of what the player types names the alias.
+
+        Real packs are written that way: ``#alias {dk} {dirtkick %1}`` expects "dk goblin" to
+        dirtkick the goblin, and Cogg's ``#Alias {reply} {tell @tellname %0}`` expects %0 to be
+        the whole message. So the alias matches only when its name is the first word, ``%0`` is
+        everything after it and ``%1``..``%9`` are those words one at a time. Matching a bare
+        prefix instead let Prometheus's one-letter fly-mode aliases ("s", "n", "e") swallow
+        "say", "north" and "exits", and dropped every argument. VIPMud is case-insensitive
+        elsewhere (variable names), so alias names are too. A name that carries wildcards
+        ("gt *") is a pattern instead, and has to match the whole command.
+        """
+        if _PATTERN_WILDCARD_RE.search(name) or name.split() != [name]:
+            pattern = f"(?i)^{vip_pattern_to_regex(name)}$"
+            self._api.add_alias(pattern, self._runner(body), regex=True)
+            return
+        pattern = rf"(?i)^{re.escape(name)}(?:\s+(.*?))?\s*$"
+        self._api.add_alias(pattern, self._alias_runner(body), regex=True)
+
+    def _alias_runner(self, body: str):
+        def run(ctx: MatchContext) -> None:
+            parameters = ctx.wildcards[1] if len(ctx.wildcards) > 1 else ""
+            # %0 is everything typed after the alias name; %1.. are its words in turn.
+            wildcards = [parameters, *parameters.split()]
+            try:
+                self._execute_body(body, wildcards, line=ctx.line)
+            except _Abort:
+                pass  # #Abort: stop this alias body early, leaving prior effects in place
+
+        return run
 
     def _runner(self, body: str):
         def run(ctx: MatchContext) -> None:

@@ -576,3 +576,23 @@ def test_stop_reaches_the_dialects_own_cues_not_the_default_channel():
     engine.process_line(Line("halt"))
     assert bus.flushes == 1
     assert sink.stopped == []  # not the old, useless stop("sound")
+
+
+def test_alias_name_is_the_first_word_and_its_words_are_the_parameters():
+    # Real packs: #alias {dk} {dirtkick %1} (Cogg) and #Alias {reply} {tell @tellname %0}.
+    sink, engine = _load(
+        "#var tellname bob\n#alias {dk} {dirtkick %1}\n#Alias {reply} {tell @tellname %0} {}"
+    )
+    engine.process_input("dk goblin")
+    engine.process_input("reply thanks for the help")
+    assert sink.sent == ["dirtkick goblin", "tell bob thanks for the help"]
+
+
+def test_short_alias_names_leave_longer_commands_alone():
+    # Prometheus's fly-mode file defines one-letter aliases s, se, n, e, w...; they used to
+    # swallow say, score, north and exits, and "s" caught "se" before its own alias.
+    sink, engine = _load("#alias s {south}\n#alias se {southeast}")
+    assert engine.process_input("say hello") == ["say hello"]
+    engine.process_input("se")
+    engine.process_input("S")  # alias names are case-insensitive, like VIPMud variables
+    assert sink.sent == ["southeast", "south"]
