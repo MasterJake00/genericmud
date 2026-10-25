@@ -350,6 +350,11 @@ class AutomationEngine:
             self._timer_handles.append((handle, source))
         return handle
 
+    def track_pending(self, handle: object, *, source: str = "") -> None:
+        """Hold other cancellable pending work (a sound still downloading) with the timers,
+        so session teardown and a source's reload cancel it the same way."""
+        self._timer_handles.append((handle, source))
+
     def discard_timer(self, handle: object) -> None:
         """Forget a handle once it has fired, so the tracking list can't grow unbounded."""
         self._timer_handles = [pair for pair in self._timer_handles if pair[0] is not handle]

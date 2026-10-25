@@ -24,6 +24,9 @@ _USER_AGENT = "genericMud-soundpack-browser"
 _DOWNLOAD_CHUNK = 65536
 _ALLOWED_SCHEMES = frozenset({"http", "https"})  # urllib also honours file://, gopher:// etc.
 _MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB default cap on any pack/source download
+# Per socket operation (connect, or one read), not the whole transfer: a slow link still
+# finishes, but a server that accepts and then goes quiet can't hold a caller forever.
+_NETWORK_TIMEOUT_SECONDS = 30
 
 
 class DownloadTooLarge(Exception):
@@ -77,6 +80,14 @@ class _ValidatingRedirectHandler(HTTPRedirectHandler):
 
 
 _OPENER = build_opener(_ValidatingRedirectHandler)
+
+
+def _open(opener, request):
+    """Open ``request``, with a timeout when it's the real network opener (test doubles
+    take the request alone)."""
+    if opener is _secure_urlopen:
+        return opener(request, timeout=_NETWORK_TIMEOUT_SECONDS)
+    return opener(request)
 
 
 def _secure_urlopen(request, *args, **kwargs):
@@ -141,7 +152,8 @@ def _text(fragment: str) -> str:
 
 
 def _fetch(url: str, opener=None) -> str:
-    with (opener or _secure_urlopen)(Request(url, headers={"User-Agent": _USER_AGENT})) as response:
+    request = Request(url, headers={"User-Agent": _USER_AGENT})
+    with _open(opener or _secure_urlopen, request) as response:
         return response.read().decode("utf-8", "replace")
 
 
@@ -263,7 +275,7 @@ def download(
     if opener is _secure_urlopen:
         _validate_url(url)
     request = Request(url, headers={"User-Agent": _USER_AGENT})
-    with opener(request) as response:
+    with _open(opener, request) as response:
         total = int(response.headers.get("Content-Length", 0) or 0)
         done = 0
         with open(dest_path, "wb") as handle:

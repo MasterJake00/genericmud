@@ -283,6 +283,13 @@ class ScriptApi:
             )
         )
 
+    def track_pending(self, handle: object) -> None:
+        """Cancel ``handle`` (anything with a cancel()) when the session or this pack ends."""
+        self._engine.track_pending(handle, source=self._source)
+
+    def forget_pending(self, handle: object) -> None:
+        self._engine.discard_timer(handle)
+
     def set_channel(
         self,
         name: str,

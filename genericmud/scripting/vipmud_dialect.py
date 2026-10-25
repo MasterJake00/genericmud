@@ -29,6 +29,7 @@ ignored, so a pack loads partially but its sound core works.
 
 from __future__ import annotations
 
+import asyncio
 import random
 import re
 import tempfile
@@ -485,6 +486,12 @@ class VipMudPack:
         self._last_handle = _MASTER_HANDLE
         self._remote_sound_base: str | None = None
         self._remote_sound_root: Path | None = None
+        # Sounds fetched in the background (see _fetch_in_background), by URL: the download
+        # in flight, the cue channels waiting on it, and URLs that already failed this session.
+        self._fetching: dict[str, asyncio.Future] = {}
+        self._waiting: dict[str, list[str]] = {}
+        self._pending_cues: dict[str, tuple[str, int, bool]] = {}  # channel -> (file, volume, loop)
+        self._failed_fetches: set[str] = set()
         # Server-controlled packs build sound paths from @sppath; the pack's own
         # settings loader (file I/O, deferred) normally sets it. Default it (and the
         # script path) to the pack dir so @sppath/x.wav resolves to bundled sounds.
@@ -673,6 +680,7 @@ class VipMudPack:
             # VIPMud #Stop halts every playing sound. The api default channel ("sound")
             # is one this dialect never plays on -- every cue goes to a per-cue vip-N
             # channel -- so a plain stop() was a no-op against our own loops.
+            self._pending_cues.clear()
             self._api.flush()
         elif command == "IF" and args:
             self._execute_if(args, wildcards, line)
@@ -821,8 +829,6 @@ class VipMudPack:
 
     def _play(self, args: list[_Tok], wildcards: list[str], *, loop: bool) -> None:
         file = _expand_sound_variant(self._subst(args[0].text, wildcards))
-        if not self._api.sound_exists(file):
-            self._fetch_remote_sound(file)
         volume = _DEFAULT_VOLUME
         if len(args) > 1:
             volume = _to_int(self._subst(args[1].text, wildcards), _DEFAULT_VOLUME)
@@ -830,10 +836,67 @@ class VipMudPack:
         self._next_handle += 1
         channel = f"vip-{handle}"  # one channel per cue so #pc can target it later
         self._handles[handle] = channel
+        if not self._api.sound_exists(file) and self._fetch_in_background(
+            file, channel, volume, loop
+        ):
+            self._last_handle = handle  # it will play once the file lands
+            return
         played = self._api.play(file, channel=channel, gain=volume / 100, loop=loop)
         # VIPMud reports a failed play as handle 0, and packs branch on it -- Cosmic
         # Rage speaks the failure and auto-downloads the missing file.
         self._last_handle = handle if played else "0"
+
+    def _fetch_in_background(self, file: str, channel: str, volume: int, loop: bool) -> bool:
+        """Start (or join) a download of a missing sound; True if the cue will play later.
+
+        The pack's installer names an online sound tree (Cosmic Rage's VIPMud pack: several GB
+        on its gitea), so a missing .wav is fetched the first time a cue wants it. That used to
+        happen right here, inside line processing, on the event loop every tab and all speech
+        share, with no timeout: each new sound froze the client while it downloaded, a
+        stalled server froze it for good, and a file the server lacked was fetched again on
+        every cue. Now the download runs on a worker thread and the cue plays when it lands,
+        unless #pc stopped it first; a URL that failed isn't tried again this session.
+        """
+        request = self._remote_sound_request(file)
+        if request is None:
+            return False
+        _destination, url = request
+        if url in self._failed_fetches:
+            return False  # play() then reports the miss as handle 0, which packs handle
+        try:
+            loop_ = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop (a headless load): fetch in place, as before, and play straight away.
+            if not self._fetch_remote_sound(file):
+                self._failed_fetches.add(url)
+            return False
+        self._pending_cues[channel] = (file, volume, loop)
+        self._waiting.setdefault(url, []).append(channel)
+        if url not in self._fetching:
+            future = loop_.run_in_executor(None, self._fetch_remote_sound, file)
+            self._fetching[url] = future
+            self._api.track_pending(future)  # closing the session cancels the late play
+            future.add_done_callback(lambda done, url=url: self._fetched(url, done))
+        return True
+
+    def _fetched(self, url: str, future: asyncio.Future) -> None:
+        """A background download finished (on the event loop): play the cues still waiting."""
+        self._fetching.pop(url, None)
+        self._api.forget_pending(future)
+        channels = self._waiting.pop(url, [])
+        landed = not future.cancelled() and future.exception() is None and bool(future.result())
+        if not landed:
+            if not future.cancelled():
+                self._failed_fetches.add(url)
+            for channel in channels:
+                self._pending_cues.pop(channel, None)
+            return
+        for channel in channels:
+            cue = self._pending_cues.pop(channel, None)
+            if cue is None:
+                continue  # stopped while it was downloading
+            file, volume, loop = cue
+            self._api.play(file, channel=channel, gain=volume / 100, loop=loop)
 
     def _execute_if(self, args: list[_Tok], wildcards: list[str], line: Line | None = None) -> None:
         branch = 1 if self._eval_condition(args[0].text, wildcards) else 2  # then : else
@@ -919,6 +982,7 @@ class VipMudPack:
         value = self._subst(args[2].text, wildcards) if len(args) > 2 else ""
         if handle == _MASTER_HANDLE:  # 0 controls all cues / the master gain
             if action == "stop":
+                self._pending_cues.clear()
                 self._api.flush()
             elif action == "volume":
                 self._api.set_master(_to_int(value, _DEFAULT_VOLUME) / 100)
@@ -927,6 +991,7 @@ class VipMudPack:
         if channel is None:
             return
         if action == "stop":
+            self._pending_cues.pop(channel, None)  # still downloading: don't start it later
             self._api.stop(channel)
         elif action == "volume":
             # Live change on the playing cue (a per-cue channel's future is one cue, so

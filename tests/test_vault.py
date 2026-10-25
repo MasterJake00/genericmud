@@ -6,6 +6,7 @@ import io
 
 import pytest
 
+from genericmud.packs import vault
 from genericmud.packs.vault import (
     BASE_URL,
     DownloadTooLarge,
@@ -154,3 +155,33 @@ def test_git_archive_urls_per_host():
     assert git_archive_urls("https://nathantech.net:3000/CosmicRage/CosmicRageSounds.git")[0] == (
         "https://nathantech.net:3000/CosmicRage/CosmicRageSounds/archive/master.zip"
     )
+
+
+def test_downloads_and_catalogue_pages_give_up_on_a_silent_server(monkeypatch, tmp_path):
+    # A pack's sounds are fetched while it plays; with no timeout a server that accepted the
+    # connection and went quiet held the caller forever.
+    timeouts = []
+
+    class Response:
+        headers: dict = {}
+
+        def read(self, *_args):
+            return b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Opener:
+        def open(self, request, timeout=None):
+            timeouts.append(timeout)
+            return Response()
+
+    monkeypatch.setattr(vault, "_OPENER", Opener())
+    monkeypatch.setattr(vault, "_validate_url", lambda _url: None)
+    vault.download("https://sounds.example/pack.zip", tmp_path / "pack.zip")
+    vault._fetch("https://sounds.example/packs.php")
+    assert len(timeouts) == 2
+    assert all(timeout and timeout > 0 for timeout in timeouts), timeouts

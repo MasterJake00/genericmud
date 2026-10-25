@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import threading
 import warnings
 from pathlib import Path
 
@@ -617,3 +619,80 @@ def test_hotkey_names_reach_the_combo_the_window_sends(pack_key, pressed):
     assert engine.press_key(pressed)
     assert sink.sent == ["score"]
 
+
+def _remote_pack(tmp_path):
+    (tmp_path / "SoundSync.exe").write_bytes(b"windows helper")
+    (tmp_path / "installer.bat").write_text(
+        'set "REPO_URL=https://gitea.example/Cosmic/Sounds"\nset "REPO_SUBFOLDER=wav"\n',
+        encoding="latin-1",
+    )
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    pack = VipMudPack(ScriptApi(engine, source="vip", base_dir=str(tmp_path)))
+    pack.load_source(SPHOOK + "\n#alias {quiet} {#pc 1 stop}")
+    return sink, engine
+
+
+async def _until(condition, timeout=5.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not condition():
+        assert asyncio.get_running_loop().time() < deadline, "timed out waiting"
+        await asyncio.sleep(0.01)
+
+
+async def test_a_missing_sound_downloads_off_the_loop_and_plays_when_it_lands(
+    tmp_path, monkeypatch
+):
+    # The download used to run inside line processing, on the loop every tab and all speech
+    # share, with no timeout: each new Cosmic Rage sound froze the whole client.
+    release = threading.Event()
+
+    def download(url, destination, **_kwargs):
+        release.wait(5)
+        destination.write_bytes(b"RIFF-fake-wave")
+
+    monkeypatch.setattr("genericmud.packs.vault.download", download)
+    sink, engine = _remote_pack(tmp_path)
+    engine.process_line(Line("$sphook play:general/misc/on:80:0:0:1"))
+    assert sink.played == []  # line processing didn't wait for the download
+    release.set()
+    await _until(lambda: sink.played)
+    assert Path(sink.played[0]["file"]).read_bytes() == b"RIFF-fake-wave"
+
+
+async def test_a_cue_stopped_or_closed_while_downloading_never_starts(tmp_path, monkeypatch):
+    release = threading.Event()
+    finished = threading.Event()
+
+    def download(url, destination, **_kwargs):
+        release.wait(5)
+        destination.write_bytes(b"RIFF")
+        finished.set()
+
+    monkeypatch.setattr("genericmud.packs.vault.download", download)
+    sink, engine = _remote_pack(tmp_path)
+    engine.process_line(Line("$sphook play:a:80:0:0:1"))
+    engine.process_input("quiet")  # #pc 1 stop while the file is still on its way
+    engine.process_line(Line("$sphook play:b:80:0:0:2"))
+    engine.cancel_timers()  # what closing the session does
+    release.set()
+    await asyncio.get_running_loop().run_in_executor(None, finished.wait, 5)
+    await asyncio.sleep(0.05)
+    assert sink.played == []
+
+
+async def test_a_sound_the_server_lacks_is_not_fetched_again_on_every_cue(tmp_path, monkeypatch):
+    calls: list[str] = []
+
+    def download(url, destination, **_kwargs):
+        calls.append(url)
+        raise OSError("404")
+
+    monkeypatch.setattr("genericmud.packs.vault.download", download)
+    sink, engine = _remote_pack(tmp_path)
+    engine.process_line(Line("$sphook play:gone:80:0:0:1"))
+    await _until(lambda: calls)
+    await asyncio.sleep(0.05)
+    for _ in range(4):
+        engine.process_line(Line("$sphook play:gone:80:0:0:1"))
+    assert len(calls) == 1
