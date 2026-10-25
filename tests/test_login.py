@@ -226,3 +226,45 @@ def test_a_dropped_connection_takes_the_hidden_input_with_it():
     app.on_ws_message({"type": "input", "text": "look;look"})
     assert sent == ["look", "look"]  # split again: it's an ordinary command now
     assert posted.count(protocol.input_masked(False)) == 1
+
+
+def test_the_server_asking_us_to_echo_leaves_a_password_hidden():
+    # DO/DONT ECHO is about whether the CLIENT echoes. Treating DO like WONT unhid the
+    # password: it was split on the separator, logged and kept for auto-repeat.
+    from genericmud.protocol import telnet as T
+
+    app, sent, _posted = _app_at_a_password_prompt()
+    app.on_telnet_event(T.Negotiation(T.DO, T.OPT_ECHO))
+    app.on_telnet_event(T.Negotiation(T.DONT, T.OPT_ECHO))
+    app.on_ws_message({"type": "input", "text": "abc;def"})
+    assert sent == ["abc;def"]
+
+
+def _server_lines(app, count):
+    from genericmud.protocol.telnet import DataReceived
+
+    for number in range(count):
+        app.on_telnet_event(DataReceived(f"Line {number} of the welcome text.\r\n".encode()))
+
+
+def test_a_server_that_hides_typing_for_good_lets_go_once_play_has_started():
+    # A server that holds WILL ECHO for the whole session would otherwise turn every
+    # command into a password: no aliases, speedwalks, separator or /commands, ever.
+    from genericmud.bridge import protocol
+
+    app, sent, posted = _app_at_a_password_prompt()
+    app.on_ws_message({"type": "input", "text": "hunter2"})
+    _server_lines(app, 41)  # the MOTD and the first room, still "hidden"
+    app.on_ws_message({"type": "input", "text": "look;look"})
+    assert sent == ["hunter2", "look", "look"]
+    assert protocol.input_masked(False) in posted  # Up-arrow history works again too
+
+
+def test_a_retyped_password_stays_hidden_through_a_few_prompts():
+    # ROM-style new character: one WILL ECHO, then the password, the retype, and a retry
+    # loop if they don't match. A few prompt lines in between must not let go.
+    app, sent, _posted = _app_at_a_password_prompt()
+    app.on_ws_message({"type": "input", "text": "abc;def"})
+    _server_lines(app, 2)  # "Passwords don't match." "Retype password:"
+    app.on_ws_message({"type": "input", "text": "abc;deg"})
+    assert sent == ["abc;def", "abc;deg"]
