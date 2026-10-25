@@ -247,17 +247,28 @@ def _server_lines(app, count):
         app.on_telnet_event(DataReceived(f"Line {number} of the welcome text.\r\n".encode()))
 
 
-def test_a_server_that_hides_typing_for_good_lets_go_once_play_has_started():
+def test_chat_while_a_password_prompt_is_open_does_not_unhide_it():
+    # Changing a password on a busy LPMud: old password typed, then channel chatter and
+    # combat keep arriving while the new-password prompt waits. Output says nothing about
+    # whether the prompt is still open, so it must not end the hiding.
+    app, sent, _posted = _app_at_a_password_prompt()
+    app.on_ws_message({"type": "input", "text": "old;pass"})
+    _server_lines(app, 60)
+    app.on_ws_message({"type": "input", "text": "new;pass"})
+    assert sent == ["old;pass", "new;pass"]
+
+
+def test_a_server_that_hides_typing_for_good_lets_go_after_a_few_commands():
     # A server that holds WILL ECHO for the whole session would otherwise turn every
     # command into a password: no aliases, speedwalks, separator or /commands, ever.
     from genericmud.bridge import protocol
 
     app, sent, posted = _app_at_a_password_prompt()
-    app.on_ws_message({"type": "input", "text": "hunter2"})
-    _server_lines(app, 41)  # the MOTD and the first room, still "hidden"
+    for answer in range(8):  # name, password, and a few commands that went out as typed
+        app.on_ws_message({"type": "input", "text": f"answer{answer}"})
     app.on_ws_message({"type": "input", "text": "look;look"})
-    assert sent == ["hunter2", "look", "look"]
-    assert protocol.input_masked(False) in posted  # Up-arrow history works again too
+    assert sent[-2:] == ["look", "look"]
+    assert posted[-1] == protocol.input_masked(False)  # Up-arrow history works again too
 
 
 def test_a_retyped_password_stays_hidden_through_a_few_prompts():

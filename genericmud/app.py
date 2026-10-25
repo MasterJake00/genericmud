@@ -59,9 +59,10 @@ MAX_ALIAS_DEPTH = 20  # guard against an alias/trigger that re-fires itself fore
 _MAP_SAVE_INTERVAL = 25
 _PLUGIN_TICK_SECONDS = 0.25  # OnPluginTick cadence (MUSHclient ticks faster; see _arm_plugin_ticks)
 _PROMPT_IDLE_FLUSH_SECONDS = 0.25  # emit a newline-less prompt if the server sends no more data
-# A password prompt waits for its answer. When the server is still hiding typed input this
-# many lines after it got one, it's holding echo for the session, not asking for a secret.
-_HIDDEN_INPUT_LINE_LIMIT = 40
+# No password exchange asks for more than a handful of secrets under one WILL ECHO: old,
+# new and confirm, plus a retry or two. A server still hiding input after this many answers
+# is holding echo for the session, so input goes back to normal.
+_HIDDEN_ANSWER_LIMIT = 8
 # Transport statuses that mean the socket went away or was replaced (transport/connection.py).
 _SOCKET_CHANGES = (
     "disconnected",
@@ -298,8 +299,7 @@ class EngineApp:
         self._user_script_generation = 0
         self._msdp_offered = False  # server sent WILL MSDP (replayed to late-loading packs)
         self._input_masked = False  # server WILL ECHO (password entry): don't log/store input
-        self._answered_while_hidden = False  # something was typed since input was hidden
-        self._lines_while_hidden = 0  # server lines since then (see _HIDDEN_INPUT_LINE_LIMIT)
+        self._answers_while_hidden = 0  # lines typed since input was hidden (see the limit)
         self._ticks_armed = False  # the OnPluginTick chain is scheduled at most once
         self._closed = False  # ends the tick chain at shutdown
         # The world's text encoding, both directions: the UI hands this same codec to the
@@ -786,7 +786,6 @@ class EngineApp:
         plain = "".join(span.text for span in spans)
         if not plain.strip():
             return  # blank line: any sound cues already fired; don't show/speak "blank"
-        self._count_line_while_hidden()
         for pack in self._mush_packs:
             pack.dispatch_line(plain)
         line = Line(plain, spans=spans)
@@ -1050,14 +1049,22 @@ class EngineApp:
             if self._login is not None and not self._login.done:
                 self._login.disarm()  # the user is answering the prompt themselves
             self._log("> ***")
-        self._answered_while_hidden = True
         self._send(text)
+        self._answers_while_hidden += 1
+        if self._answers_while_hidden >= _HIDDEN_ANSWER_LIMIT:
+            # A server that holds WILL ECHO for the whole session never sends the WONT, and
+            # every command would go out as a password for good. Counting what the user
+            # typed, not what the server sent: chatter while a prompt waits proves nothing.
+            if self._diag is not None:
+                self._diag.event("input.unhidden", answers=self._answers_while_hidden)
+            self.forget_hidden_input()
 
     def forget_hidden_input(self) -> None:
-        """Treat typing as ordinary again: the socket, and its password prompt, are gone.
+        """Treat typing as ordinary again, for when no WONT ECHO is coming.
 
-        The window's Disconnect closes quietly, so it never reaches on_connection_status;
-        it calls this instead, or commands typed in the closed tab go out as a password.
+        The socket went away; the window's Disconnect closed it, quietly, so it never
+        reaches on_connection_status; or the server hides input for the whole session
+        (the answer limit in _dispatch_secret).
         """
         self._set_input_masked(False)
 
@@ -1070,24 +1077,8 @@ class EngineApp:
         if masked == self._input_masked:
             return
         self._input_masked = masked
-        self._answered_while_hidden = False
-        self._lines_while_hidden = 0
+        self._answers_while_hidden = 0
         self._post(protocol.input_masked(masked))
-
-    def _count_line_while_hidden(self) -> None:
-        """Let go of hidden input once play has clearly started under it.
-
-        A server that holds WILL ECHO for the whole session never sends the WONT, and
-        every command would go out as a password for good. Counting only starts once
-        something was typed at the prompt, so a long banner before it can't end it early.
-        """
-        if not (self._input_masked and self._answered_while_hidden):
-            return
-        self._lines_while_hidden += 1
-        if self._lines_while_hidden > _HIDDEN_INPUT_LINE_LIMIT:
-            if self._diag is not None:
-                self._diag.event("input.unhidden", lines=self._lines_while_hidden)
-            self.forget_hidden_input()
 
     def _dispatch_remote(self, text: str) -> None:
         """Deliver a command sent from ANOTHER session (mud.send_to / mud.broadcast).
