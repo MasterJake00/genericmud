@@ -5,8 +5,10 @@ from __future__ import annotations
 import shutil
 import zipfile
 
+import pytest
+
 from genericmud.packs.setup import detect_entry, entry_problem, setup_pack, update_pack
-from genericmud.packs.store import PackStore, extract_pack
+from genericmud.packs.store import PackError, PackStore, extract_pack
 
 MCL = """<?xml version="1.0" encoding="iso-8859-1"?>
 <!DOCTYPE muclient>
@@ -210,6 +212,45 @@ def test_update_pack_refetches_from_origin_and_preserves_state(tmp_path):
     assert store.manifest("v1").origin == "https://example.test/pack.zip"  # origin kept
     assert store.is_enabled("v1", "myworld")  # enablement preserved
     assert store.is_trusted("v1")  # trust preserved
+
+
+def _installed_for_update(tmp_path):
+    store = PackStore(tmp_path / "store")
+    source = tmp_path / "mypack"
+    source.mkdir()
+    (source / "main.set").write_text("#trigger {hello} {#say hi}", encoding="utf-8")
+    setup_pack(store, source, entry="main.set", origin="https://example.test/mypack.zip")
+    return store
+
+
+def test_update_pack_opens_a_wrapper_of_nested_zips_like_the_first_install(tmp_path):
+    # Miriani's download is a zip holding Scripts.zip and Sounds.zip. Installing it opens
+    # the inner zips; updating it used a plain extract, found no script and always failed.
+    store = _installed_for_update(tmp_path)
+    inner = tmp_path / "Scripts.zip"
+    with zipfile.ZipFile(inner, "w") as scripts:
+        scripts.writestr("main.set", "#trigger {hello} {#say hi again}")
+
+    def fetch(_url, dest):
+        with zipfile.ZipFile(dest, "w") as wrapper:
+            wrapper.write(inner, "Scripts.zip")
+
+    update_pack(store, "mypack", fetch=fetch)
+
+    assert "again" in store.entry_path("mypack").read_text(encoding="utf-8")
+
+
+def test_update_pack_refuses_a_zip_bomb_like_every_other_install(tmp_path):
+    store = _installed_for_update(tmp_path)
+
+    def fetch(_url, dest):
+        with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as bomb:
+            bomb.writestr("main.set", "#trigger {x} {#say y}")
+            bomb.writestr("padding.wav", b"\x00" * (5 * 1024 * 1024))  # inflates ~1000x
+
+    with pytest.raises(PackError, match="compression ratio"):
+        update_pack(store, "mypack", fetch=fetch)
+    assert "hi}" in store.entry_path("mypack").read_text(encoding="utf-8")  # old pack intact
 
 
 def test_setup_bare_set_pack_has_no_world(tmp_path):

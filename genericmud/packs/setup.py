@@ -21,7 +21,7 @@ from genericmud.packs import manifest_sync, vault
 from genericmud.packs.git_sources import GitSource
 from genericmud.packs.manifest import CODE_EXEC_DIALECTS, DIALECT_BY_SUFFIX, PackManifest
 from genericmud.packs.manifest_sources import ManifestSource
-from genericmud.packs.store import PackError, PackStore
+from genericmud.packs.store import PackError, PackStore, extract_pack
 from genericmud.packs.world_import import world_from_pack
 
 _GIT_ARCHIVE_MAX_BYTES = 3 * 1000 * 1000 * 1000  # a full pack repo (Erion ~1 GB); generous cap
@@ -231,8 +231,14 @@ def update_pack(
         archive = Path(tmp) / "update.zip"
         fetch(manifest.origin, archive)
         extracted = Path(tmp) / pack_id  # same id -> install replaces in place
-        with zipfile.ZipFile(archive) as bundle:
-            bundle.extractall(extracted)
+        # The guarded extractor, like the first install: it refuses a zip bomb and opens the
+        # nested zips some packs ship (Miriani: Scripts.zip and Sounds.zip in a wrapper).
+        try:
+            extract_pack(archive, extracted)
+        except zipfile.BadZipFile as exc:
+            raise PackError(
+                f"the update for {pack_id} wasn't a ZIP (the site may have served a web page)"
+            ) from exc
         entry = detect_entry(extracted)
         if entry is None:
             raise PackError(f"the updated download for {pack_id} has no load script")
