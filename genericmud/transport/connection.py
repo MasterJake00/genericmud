@@ -374,5 +374,7 @@ class MudConnection:
             except OSError:
                 attempt += 1
                 continue
+            if self._closing:  # user disconnected mid-handshake; connect() dropped the socket
+                return
             self._status("reconnected")
             return

@@ -124,3 +124,52 @@ async def test_reconnect_loop_gives_up_after_max(monkeypatch):
 
     await conn._reconnect_loop()
     assert any("giving up" in status for status in statuses)
+
+
+class _ClosingWriter(_FakeWriter):
+    def __init__(self):
+        self.closed = False
+
+    def is_closing(self):
+        return self.closed
+
+    def close(self):
+        self.closed = True
+
+
+class _IdleReader:
+    async def read(self, _n):
+        await asyncio.Event().wait()  # a live socket with nothing to say
+        return b""
+
+
+async def test_disconnect_during_the_reconnect_handshake_is_not_announced(monkeypatch):
+    # connect() already drops a socket that finishes opening after Disconnect. The loop
+    # still said "reconnected", so the engine marked itself connected, spoke it, and
+    # re-armed auto-login for a session the user had just closed.
+    statuses: list[str] = []
+    handshake_started = asyncio.Event()
+    release_handshake = asyncio.Event()
+    writer = _ClosingWriter()
+
+    async def slow_open_connection(host, port, ssl=None):
+        handshake_started.set()
+        await release_handshake.wait()
+        return _IdleReader(), writer
+
+    monkeypatch.setattr(asyncio, "open_connection", slow_open_connection)
+    monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+    conn = MudConnection()
+    conn.on_status = statuses.append
+    conn.auto_reconnect = True
+    conn._target = ("host", 23, False, None)
+    loop_task = asyncio.create_task(conn._reconnect_loop())
+    await handshake_started.wait()
+    conn.auto_reconnect = False  # what the window's Disconnect does first
+    await conn.close()
+    release_handshake.set()
+    await loop_task
+
+    assert writer.closed
+    assert not conn.connected
+    assert "reconnected" not in statuses
