@@ -189,3 +189,13 @@ def test_lua_set_volume_and_mute():
     assert engine.sound.effective_gain("ambient") == 0.0
     runtime.run_source('mud.mute("ambient", false)')
     assert engine.sound.effective_gain("ambient") == 0.5
+
+
+def test_alias_without_a_wildcard_is_the_whole_command():
+    # The scripting guide's first example: mud.alias("sc", ...) makes sc send score. It
+    # must not also take over "scan" because scan happens to start with sc.
+    sink, engine, runtime = _runtime()
+    runtime.run_source('mud.alias("sc", function() mud.send("score") end)')
+    assert engine.process_input("scan") == ["scan"]
+    assert engine.process_input("sc") == []
+    assert sink.sent == ["score"]

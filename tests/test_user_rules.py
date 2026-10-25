@@ -334,3 +334,16 @@ def test_malformed_keymap_recall_count_is_ignored_not_fatal():
     app._handle_key("recall:oops")
     app._handle_key("chan:recall:")
     app._handle_key("chan:recall:notnum")  # no exception = pass
+
+
+def test_alias_without_a_wildcard_is_the_whole_command(tmp_path):
+    # An alias "k" is the command k. It used to match any input that merely started with
+    # the letter, so "kick door" sent "kill rat" and "laugh" vanished into a "look" alias.
+    rules = UserRules(aliases=[
+        UserAlias(pattern="k", send="kill rat"), UserAlias(pattern="l", send="look"),
+    ])
+    sink, engine = _register(rules, tmp_path)
+    assert engine.process_input("kick door") == ["kick door"]
+    assert engine.process_input("laugh") == ["laugh"]
+    assert engine.process_input("k") == []
+    assert sink.sent == ["kill rat"]

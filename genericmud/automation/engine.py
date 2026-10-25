@@ -63,15 +63,13 @@ class EngineSink:
     def schedule(self, delay: float, callback: Callable[[], None]) -> object | None: ...
 
 
-def compile_pattern(pattern: str, regex: bool) -> re.Pattern[str]:
-    """Compile a trigger/alias pattern.
+def wildcard_regex(pattern: str) -> str:
+    """The regex a wildcard pattern stands for: ``*`` captures any run, ``?`` one char.
 
-    ``regex=True`` is used verbatim. Otherwise it's a wildcard pattern where
-    ``*`` captures any run and ``?`` captures one char (VIPMud/MUSHclient
-    convention); each wildcard becomes a numbered capture group.
+    Each wildcard becomes a numbered capture group; everything else is literal. The
+    MUSHclient and VIPMud front-ends translate their own pattern syntax themselves and
+    register real regexes, so this is the native (Lua, Automation Manager) convention.
     """
-    if regex:
-        return _matcher.compile(pattern)
     out: list[str] = []
     for ch in pattern:
         if ch == "*":
@@ -80,7 +78,24 @@ def compile_pattern(pattern: str, regex: bool) -> re.Pattern[str]:
             out.append("(.)")
         else:
             out.append(re.escape(ch))
-    return _matcher.compile("".join(out))
+    return "".join(out)
+
+
+def compile_pattern(pattern: str, regex: bool, *, whole: bool = False) -> re.Pattern[str]:
+    """Compile a trigger/alias pattern.
+
+    ``regex=True`` is used verbatim. Otherwise it's a wildcard pattern (see
+    :func:`wildcard_regex`). ``whole=True`` makes a wildcard pattern match the entire
+    text rather than a prefix of it: an alias "sc" is the command sc, not every command
+    that happens to start with sc ("scan"), and "combo *" still takes the rest as its
+    capture.
+    """
+    if regex:
+        return _matcher.compile(pattern)
+    body = wildcard_regex(pattern)
+    if whole:
+        body += r"\Z"
+    return _matcher.compile(body)
 
 
 @dataclass
@@ -184,9 +199,12 @@ class AutomationEngine:
         keep_evaluating: bool = False,
         source: str = "",
     ) -> None:
+        # process_input anchors every alias at the start; a wildcard alias is anchored at the
+        # end too, so it has to be the whole command. Regex aliases keep whatever their
+        # author wrote.
         self._aliases.append(
-            _Rule(compile_pattern(pattern, regex), callback, priority, name, True, source=source,
-                  keep_evaluating=keep_evaluating)
+            _Rule(compile_pattern(pattern, regex, whole=True), callback, priority, name, True,
+                  source=source, keep_evaluating=keep_evaluating)
         )
         self._aliases.sort(key=lambda r: -r.priority)
 
