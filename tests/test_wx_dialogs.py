@@ -302,3 +302,33 @@ def test_a_password_typed_at_a_hidden_prompt_stays_out_of_the_command_history(fr
         panel.Destroy()
         loop.run_until_complete(asyncio.sleep(0.01))  # let the no-op session start finish
         loop.close()
+
+
+def test_disconnecting_at_a_password_prompt_makes_typing_ordinary_again(frame, monkeypatch):
+    import asyncio
+
+    from genericmud.app import EngineApp
+    from genericmud.bridge import protocol
+    from genericmud.protocol import telnet as T
+    from genericmud.ui import wx_app
+    from genericmud.voice.router import VoiceRouter
+    from tests.helpers import RecordingBackend
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+    loop = asyncio.new_event_loop()
+    panel = wx_app.SessionPanel(frame, loop, {}, World("Test", "mud.example", 4000))
+    posted: list[dict] = []
+    try:
+        voice = VoiceRouter(RecordingBackend(), clock=lambda: 0.0)
+        panel.app = EngineApp(voice, post=posted.append, keymap={})
+        panel.app.on_telnet_event(T.Negotiation(T.WILL, T.OPT_ECHO))
+        panel._do_disconnect()  # closes quietly: no connection status reaches the engine
+        assert posted[-1] == protocol.input_masked(False)
+    finally:
+        panel.app = None
+        panel.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()

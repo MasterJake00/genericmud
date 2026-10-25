@@ -744,6 +744,7 @@ class SessionPanel(wx.Panel):
             self.app.engine.connected = False
             self.app.engine.cancel_timers()
             self.app.sound.flush()
+            self.app.forget_hidden_input()  # no WONT ECHO will come from a closed socket
 
 
 class FindDialog(wx.Dialog):

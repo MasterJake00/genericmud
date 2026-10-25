@@ -1042,6 +1042,14 @@ class EngineApp:
             self._log("> ***")
         self._send(text)
 
+    def forget_hidden_input(self) -> None:
+        """Treat typing as ordinary again: the socket, and its password prompt, are gone.
+
+        The window's Disconnect closes quietly, so it never reaches on_connection_status;
+        it calls this instead, or commands typed in the closed tab go out as a password.
+        """
+        self._set_input_masked(False)
+
     def _set_input_masked(self, masked: bool) -> None:
         """Track whether the server hides typed input; tell the renderer when that flips.
 
@@ -1375,7 +1383,7 @@ class EngineApp:
             # Echo state belongs to the socket that just went away. Left armed, every
             # command after it would go out as a password: no client commands, aliases or
             # speedwalks, and "***" in the log, because no WONT ECHO is ever coming.
-            self._set_input_masked(False)
+            self.forget_hidden_input()
         if message.startswith(("disconnected", "protocol error", "reconnect failed")):
             # A terminal drop (quit, network death we won't reconnect): silence the pack's
             # looping music/ambience -- nothing will ever stop those cues otherwise. A
