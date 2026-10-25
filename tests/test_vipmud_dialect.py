@@ -629,7 +629,9 @@ def _remote_pack(tmp_path):
     sink = RecordingSink()
     engine = AutomationEngine(sink)
     pack = VipMudPack(ScriptApi(engine, source="vip", base_dir=str(tmp_path)))
-    pack.load_source(SPHOOK + "\n#alias {quiet} {#pc 1 stop}")
+    pack.load_source(
+        SPHOOK + "\n#alias {quiet} {#pc 1 stop}\n#alias {place} {#pc 1 volume 30;#pc 1 pan -50}"
+    )
     return sink, engine
 
 
@@ -696,3 +698,41 @@ async def test_a_sound_the_server_lacks_is_not_fetched_again_on_every_cue(tmp_pa
     for _ in range(4):
         engine.process_line(Line("$sphook play:gone:80:0:0:1"))
     assert len(calls) == 1
+
+
+async def test_volume_and_pan_set_while_a_sound_downloads_are_kept(tmp_path, monkeypatch):
+    # Packs place a cue right after #play. While the file was still downloading, #pc
+    # adjusted a channel with nothing on it, and the cue then started at its old volume,
+    # centred.
+    release = threading.Event()
+
+    def download(url, destination, **_kwargs):
+        release.wait(5)
+        destination.write_bytes(b"RIFF")
+
+    monkeypatch.setattr("genericmud.packs.vault.download", download)
+    sink, engine = _remote_pack(tmp_path)
+    engine.process_line(Line("$sphook play:a:80:0:0:1"))
+    engine.process_input("place")  # #pc 1 volume 30 and #pc 1 pan -50, before it lands
+    release.set()
+    await _until(lambda: sink.played)
+    assert (sink.played[0]["gain"], sink.played[0]["pan"]) == (0.3, -0.5)
+
+
+async def test_a_sound_that_failed_to_download_is_tried_again_later(tmp_path, monkeypatch):
+    # One timeout on a multi-gigabyte sound tree shouldn't silence that sound until restart.
+    calls: list[str] = []
+
+    def download(url, destination, **_kwargs):
+        calls.append(url)
+        raise OSError("timed out")
+
+    monkeypatch.setattr("genericmud.packs.vault.download", download)
+    monkeypatch.setattr("genericmud.scripting.vipmud_dialect._FETCH_RETRY_SECONDS", 0.0)
+    sink, engine = _remote_pack(tmp_path)
+    engine.process_line(Line("$sphook play:flaky:80:0:0:1"))
+    await _until(lambda: calls)
+    await asyncio.sleep(0.05)
+    engine.process_line(Line("$sphook play:flaky:80:0:0:1"))
+    await _until(lambda: len(calls) == 2)
+

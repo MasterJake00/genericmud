@@ -33,6 +33,7 @@ import asyncio
 import random
 import re
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -87,6 +88,9 @@ _KEY_NAMES = {
     "return": "enter", "esc": "escape", "spacebar": "space",
 }
 _REMOTE_SOUND_MAX_BYTES = 32 * 1024 * 1024
+# A sound that failed to download is left alone this long before a cue tries it again, so a
+# file the server lacks isn't fetched on every cue but one timeout doesn't silence it for good.
+_FETCH_RETRY_SECONDS = 300.0
 
 
 @dataclass
@@ -462,6 +466,16 @@ def _serialize_vip_settings(values: list[str]) -> bytes:
 
 
 @dataclass
+class _PendingCue:
+    """A cue waiting for its sound to download; #pc volume and pan land here until it plays."""
+
+    file: str
+    gain: float
+    loop: bool
+    pan: float = 0.0
+
+
+@dataclass
 class _VipFile:
     path: Path | None  # where to flush on #Close (None if unresolved)
     values: list[str]  # one entry per record, addressed 1-based by #Read/#Write
@@ -490,8 +504,8 @@ class VipMudPack:
         # in flight, the cue channels waiting on it, and URLs that already failed this session.
         self._fetching: dict[str, asyncio.Future] = {}
         self._waiting: dict[str, list[str]] = {}
-        self._pending_cues: dict[str, tuple[str, int, bool]] = {}  # channel -> (file, volume, loop)
-        self._failed_fetches: set[str] = set()
+        self._pending_cues: dict[str, _PendingCue] = {}  # channel -> cue waiting on a download
+        self._failed_fetches: dict[str, float] = {}  # url -> when it failed (time.monotonic)
         # Server-controlled packs build sound paths from @sppath; the pack's own
         # settings loader (file I/O, deferred) normally sets it. Default it (and the
         # script path) to the pack dir so @sppath/x.wav resolves to bundled sounds.
@@ -861,16 +875,17 @@ class VipMudPack:
         if request is None:
             return False
         _destination, url = request
-        if url in self._failed_fetches:
+        failed_at = self._failed_fetches.get(url)
+        if failed_at is not None and time.monotonic() - failed_at < _FETCH_RETRY_SECONDS:
             return False  # play() then reports the miss as handle 0, which packs handle
         try:
             loop_ = asyncio.get_running_loop()
         except RuntimeError:
             # No event loop (a headless load): fetch in place, as before, and play straight away.
             if not self._fetch_remote_sound(file):
-                self._failed_fetches.add(url)
+                self._failed_fetches[url] = time.monotonic()
             return False
-        self._pending_cues[channel] = (file, volume, loop)
+        self._pending_cues[channel] = _PendingCue(file, gain=volume / 100, loop=loop)
         self._waiting.setdefault(url, []).append(channel)
         if url not in self._fetching:
             future = loop_.run_in_executor(None, self._fetch_remote_sound, file)
@@ -887,7 +902,7 @@ class VipMudPack:
         landed = not future.cancelled() and future.exception() is None and bool(future.result())
         if not landed:
             if not future.cancelled():
-                self._failed_fetches.add(url)
+                self._failed_fetches[url] = time.monotonic()
             for channel in channels:
                 self._pending_cues.pop(channel, None)
             return
@@ -895,8 +910,7 @@ class VipMudPack:
             cue = self._pending_cues.pop(channel, None)
             if cue is None:
                 continue  # stopped while it was downloading
-            file, volume, loop = cue
-            self._api.play(file, channel=channel, gain=volume / 100, loop=loop)
+            self._api.play(cue.file, channel=channel, gain=cue.gain, pan=cue.pan, loop=cue.loop)
 
     def _execute_if(self, args: list[_Tok], wildcards: list[str], line: Line | None = None) -> None:
         branch = 1 if self._eval_condition(args[0].text, wildcards) else 2  # then : else
@@ -996,10 +1010,18 @@ class VipMudPack:
         elif action == "volume":
             # Live change on the playing cue (a per-cue channel's future is one cue, so
             # the old category-policy set_volume adjusted nothing anyone would hear).
-            self._api.adjust(channel, gain=_to_int(value, _DEFAULT_VOLUME) / 100)
+            gain = _to_int(value, _DEFAULT_VOLUME) / 100
+            if channel in self._pending_cues:
+                self._pending_cues[channel].gain = gain  # still downloading: start at this
+            else:
+                self._api.adjust(channel, gain=gain)
         elif action == "pan":
             # VIPMud pan is -100..100; the bus wants -1..1.
-            self._api.adjust(channel, pan=max(-1.0, min(1.0, _to_int(value, 0) / 100)))
+            pan = max(-1.0, min(1.0, _to_int(value, 0) / 100))
+            if channel in self._pending_cues:
+                self._pending_cues[channel].pan = pan
+            else:
+                self._api.adjust(channel, pan=pan)
         # frequency: no live pitch control in the bus — accepted, ignored.
 
     def _subst(self, text: str, wildcards: list[str]) -> str:
