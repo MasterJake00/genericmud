@@ -31,14 +31,35 @@ from urllib.request import Request
 from uuid import uuid4
 
 from genericmud.automation.engine import MatchContext
+from genericmud.navigation import expand_speedwalk
 from genericmud.scripting.api import ScriptApi
 from genericmud.scripting.guard import ScriptGuard
 from genericmud.scripting.lua_runtime import install_pack_require, make_sandboxed_runtime
 from genericmud.scripting.sqlite_compat import make_sqlite_bridge
 
-_WILDCARD_RE = re.compile(r"%(\d)")
+# What MUSHclient replaces in a rule's send text before using it, scripts included: %0-%9,
+# a named capture %<name>, and %% for a literal percent sign.
+_WILDCARD_RE = re.compile(r"%(?:(\d)|<(\w+)>|(%))")
 _SEND_TO_SCRIPT = "12"
+# MUSHclient's send_to codes (its OtherTypes.h eSendTo*): what a trigger, alias, timer or
+# DoAfterSpecial does with its text. The others (1 command window, 3 status line, 4, 5 and 7
+# notepads, 6 log file, 15 pane) are MUSHclient windows genericMud doesn't have, so that text
+# is dropped. It used to go to the MUD as if the player had typed it, Lua source included.
+_SEND_TO_WORLD_CODE = 0
+# world, command queue, immediate
+_SEND_TO_WORLD_CODES = frozenset({_SEND_TO_WORLD_CODE, 8, 13})
+_SEND_TO_OUTPUT_CODE = 2
+_SEND_TO_VARIABLE_CODE = 9
+_SEND_TO_EXECUTE_CODE = 10
+_SEND_TO_SPEEDWALK_CODE = 11
+_SEND_TO_SCRIPT_CODES = frozenset({12, 14})  # script, and script after omitting the line
 _DEFAULT_TRIGGER_SEQUENCE = "100"
+_NO_SOUND = "(No sound)"  # what MUSHclient writes in a trigger's sound attribute when it has none
+# A repeating timer can't fire faster than this, so a zero or tiny interval from a pack can't
+# turn into a busy loop on the event loop every session shares.
+_MIN_TIMER_INTERVAL = 0.1
+# MUSHclient answers a bad or missing timer with a nonzero code; packs rarely check it.
+_TIMER_ERROR = 1
 
 _SOUND_CHANNEL = "sound"  # MUSHclient Sound() is a single-voice channel
 _SOUND_BUFFERS = 10  # MUSHclient PlaySound offers buffers 1..10; 0 = first free
@@ -119,6 +140,17 @@ _TRIGGER_FLAGS = {
     "Temporary": 16384,
     "OneShot": 32768,
 }
+# MUSHclient's AddTimer flag bits (exposed to packs as `timer_flag`).
+_TIMER_FLAGS = {
+    "Enabled": 1,
+    "AtTime": 2,
+    "OneShot": 4,
+    "TimerSpeedWalk": 8,
+    "TimerNote": 16,
+    "ActiveWhenClosed": 32,
+    "Replace": 1024,
+    "Temporary": 16384,
+}
 _SCRIPT_ERROR_OK = 0  # MUSHclient eOK; nonzero = failure (packs rarely check)
 _MOD_ORDER = ("ctrl", "alt", "shift")  # canonical combo order, matching the UI's _key_combo
 
@@ -146,7 +178,36 @@ _HOST_PLUGIN_REPLACEMENTS = {
     "universal_text_to_speech.xml": "genericMud owns automatic speech output",
 }
 _NON_LUA_SCRIPT_SUFFIXES = frozenset({".js", ".pl", ".pys", ".vbs"})
+# The speech plugins above also give packs a small command language, which packs drive with
+# Execute or send_to 10: Erion's channel history and output review say everything through
+# "tts_interrupt <text>", Cosmic Rage reads its $buffer lines that way, and Materia Magica its
+# health with "sapi interrupt <text>". Skipping the plugin without answering those commands
+# sent them to the MUD. (regex, interrupt first, speak the capture)
+_SPEECH_PLUGINS = frozenset({
+    "lua_sapi.xml", "mushreader.xml", "sapi_speaker.xml", "text_to_speech.xml",
+    "universal_text_to_speech.xml",
+})
+_SPEECH_COMMANDS = (
+    (r"^tts_interrupt (.*)$", True, True),
+    (r"^tts_note (.*)$", False, True),
+    (r"^tts_stop$", True, False),
+    (r"^sapi interrupt (.*)$", True, True),
+    (r"^sapi say (.*)$", False, True),
+    (r"^sapi (?:stop|skip|clear)$", True, False),
+)
+_SPEECH_COMMAND_PRIORITY = -1_000_000  # after every alias of the pack's own
 _GMCP_HANDLER_ID = "3e7dedbe37e44942dd46d264"  # GMCP_handler_NJG broadcast identity
+
+
+_XML_TRUE = frozenset({"y", "yes", "1", "-1", "true", "t"})
+
+
+def _xml_flag(attrs: dict[str, str], name: str, default: bool = False) -> bool:
+    """A boolean attribute the way MUSHclient's xmlparse.cpp reads it: y, yes, 1, true..."""
+    value = attrs.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in _XML_TRUE
 
 
 def _reduce_ints(args: tuple, op) -> int:
@@ -223,6 +284,11 @@ class MushclientPack:
         self._file_index: dict[str, list[Path]] | None = None
         self._hooks: dict[str, dict[str, object]] = {}  # plugin id -> {hook name -> Lua fn}
         self._arrays: dict[str, dict[str, str]] = {}  # MUSHclient Array* API backing store
+        self._timers: dict[str, dict] = {}  # AddTimer / XML <timer> state, by timer name
+        self._speech_commands_installed = False
+        self._plain_include_depth = 0  # >0 while a non-plugin <include> loads
+        # Tell/ColourTell text waiting for the note that ends its line
+        self._pending_tell = ""
         self._gmcp_values: dict[str, object] = {}
         self._options: dict[str, object] = {
             "enable_aliases": 1,
@@ -762,15 +828,32 @@ class MushclientPack:
             api.delete_var(str(name))
             return _SCRIPT_ERROR_OK
 
+        # MUSHclient's Note, Send, SendNoEcho and Tell take any number of arguments and join
+        # them with Lua's tostring (lua_methods.cpp concatArgs), so Note("HP: ", hp) is one
+        # line. Built in Lua so the joining is Lua's own tostring, nil and numbers included.
+        joined = self._lua.eval(
+            "function(fn, separator)\n"
+            "  return function(...)\n"
+            "    local parts = {}\n"
+            "    for index = 1, select('#', ...) do\n"
+            "      parts[index] = tostring((select(index, ...)))\n"
+            "    end\n"
+            "    return fn(table.concat(parts, separator))\n"
+            "  end\n"
+            "end"
+        )
+
         funcs = {
-            "Send": api.send,
-            "SendNoEcho": api.send,
+            "Send": joined(self._send_text, ""),
+            "SendNoEcho": joined(self._send_text, ""),
             # Execute = "as if typed": aliases match first (Erion's historyadd Executes
             # history_add, which its own channel_history alias consumes); send-through only
             # for what no alias claims.
             "Execute": api.execute,
-            "Note": api.echo,
+            "Note": joined(self._note, ""),
+            "Tell": joined(self._tell, ""),
             "ColourNote": self._colour_note,
+            "ColourTell": self._colour_tell,
             # nil (not "") for an unset variable -- MUSHclient semantics. Erion's
             # OnPluginInstall does `if GetVariable(...) ~= nil` to keep saved toggle
             # settings; an ""-for-unset answer makes it adopt "" and every toggle-gated
@@ -827,19 +910,28 @@ class MushclientPack:
             "EnableAlias": self._enable_alias,
             "EnableAliasGroup": self._enable_alias_group,
             "EnableGroup": self._enable_group,
-            "EnableTimer": lambda *_a: _SCRIPT_ERROR_OK,
             "AddTimer": self._add_timer_api,
+            "EnableTimer": self._enable_timer,
+            "DeleteTimer": self._delete_timer,
+            "ResetTimer": self._reset_timer,
             "Hyperlink": lambda *_a: None,
             "GetSoundKeyword": lambda *_a: "",
             "PlaySound": self._play_sound,
             "StopSound": self._stop_sound,
             "Sound": self._sound,
             "GetInfo": self._get_info,
+            "DoAfter": self._do_after,
+            "DoAfterNote": self._do_after_note,
+            "DoAfterSpeedWalk": self._do_after_speedwalk,
             "DoAfterSpecial": self._do_after_special,
         }
         g = self._lua.globals()
         for name, fn in funcs.items():
             g[name] = fn
+        # MUSHclient points Lua's print at the output window, joining its arguments with
+        # spaces. Packs rely on it: Empire's "omit and reprint" triggers hide a line and
+        # print a reworded copy, which would otherwise go to a console nobody can see.
+        g["print"] = joined(self._note, " ")
         # Packs call both bare (Sound(...)) and through the world object
         # (world.Sound(...), world.getvariable(...)). Mirror funcs onto a world
         # table, with lowercase aliases for the world.lowercase() callers.
@@ -875,12 +967,8 @@ class MushclientPack:
         sendto.script = int(_SEND_TO_SCRIPT)
         g.sendto = sendto
         timer_flag = self._lua.table()
-        timer_flag.Enabled = 1
-        timer_flag.AtTime = 2
-        timer_flag.OneShot = 4
-        timer_flag.ActiveWhenClosed = 32
-        timer_flag.Replace = 1024
-        timer_flag.Temporary = 16384
+        for flag_name, value in _TIMER_FLAGS.items():
+            timer_flag[flag_name] = value
         g.timer_flag = timer_flag
         error_code = self._lua.table()
         error_code.eOK = _SCRIPT_ERROR_OK
@@ -1104,10 +1192,65 @@ class MushclientPack:
         utils.readdir = readdir
         self._lua.globals().utils = utils
 
+    def _send_text(self, text: object = "") -> int:
+        self._api.send(str(text))
+        return _SCRIPT_ERROR_OK  # MUSHclient's Send answers eOK, and some packs Note() it
+
+    def _note(self, text: object = "") -> None:
+        """A finished output line: whatever Tell/ColourTell started, then ``text``.
+
+        Spoken as well as shown. genericMud stands in for MushReader, the screen-reader plugin
+        these packs are written for, and its OnPluginScreendraw reads a note (type 1) just as
+        it reads the MUD's own lines (type 0), blank ones excepted. Without that, a pack that
+        hides a line and prints a reworded copy (Empire's death message) would go silent.
+        """
+        line = self._pending_tell + str(text)
+        self._pending_tell = ""
+        self._api.echo(line)
+        if line.strip():
+            self._api.speak(line)
+
+    def _tell(self, text: object = "") -> None:
+        """MUSHclient Tell: output with no line break; the next note finishes the line."""
+        self._pending_tell += str(text)
+
+    def _flush_tell(self) -> None:
+        if self._pending_tell:
+            self._note()
+
     def _colour_note(self, *args: object) -> None:
         # ColourNote(fg, bg, text [, fg, bg, text]...) — concatenate the text parts.
         texts = [str(args[i]) for i in range(2, len(args), 3)]
-        self._api.echo("".join(texts))
+        self._note("".join(texts))
+
+    def _colour_tell(self, *args: object) -> None:
+        # ColourTell(fg, bg, text [, fg, bg, text]...): Materia Magica's helper plugins build
+        # whole report lines out of these and finish them with ColourNote or Note.
+        texts = [str(args[i]) for i in range(2, len(args), 3)]
+        self._tell("".join(texts))
+
+    def _deliver(self, send_to: int, text: str, *, variable: str = "") -> None:
+        """Do with ``text`` what MUSHclient's send_to code says (see _SEND_TO_*)."""
+        if send_to in _SEND_TO_SCRIPT_CODES:
+            # Compiled here, inside the guard, so a syntax error is reported, not raised
+            # into whatever line or timer happened to fire it.
+            self._guard.run(lambda: self._compile(text)())
+        elif send_to in _SEND_TO_WORLD_CODES:
+            for command in _command_lines(text):
+                self._api.send(command)
+        elif send_to == _SEND_TO_OUTPUT_CODE:
+            for line in text.splitlines() or [""]:
+                self._note(line)
+        elif send_to == _SEND_TO_EXECUTE_CODE:
+            for command in _command_lines(text):
+                self._api.execute(command)
+        elif send_to == _SEND_TO_VARIABLE_CODE:
+            if variable:
+                self._api.set_var(variable, text)
+        elif send_to == _SEND_TO_SPEEDWALK_CODE:
+            steps = expand_speedwalk(text.replace(" ", ""))
+            for command in steps or _command_lines(text):
+                self._api.send(command)
 
     def _array_create(self, name: object = "") -> None:
         self._arrays.setdefault(str(name), {})
@@ -1127,35 +1270,178 @@ class MushclientPack:
 
     def _add_timer_api(
         self,
-        _name: object = "",
+        name: object = "",
         hours: object = 0,
         minutes: object = 0,
         seconds: object = 0,
         response: object = "",
-        _flags: object = 0,
+        flags: object = 0,
         script_name: object = "",
         *_args: object,
     ) -> int:
-        delay = (
+        """MUSHclient ``AddTimer``: a timer repeats every interval unless it is OneShot.
+
+        Toastush's one-second heartbeat (roundtime and stun countdowns, the roundtime sound)
+        and wait.lua's one-shot resumes both come through here or through an XML <timer>.
+        """
+        flag_bits = int(_to_float(flags) or 0)
+        if flag_bits & _TIMER_FLAGS["TimerNote"]:
+            send_to = _SEND_TO_OUTPUT_CODE
+        elif flag_bits & _TIMER_FLAGS["TimerSpeedWalk"]:
+            send_to = _SEND_TO_SPEEDWALK_CODE
+        else:
+            send_to = _SEND_TO_WORLD_CODE
+        interval = (
             (_to_float(hours) or 0.0) * 3600
             + (_to_float(minutes) or 0.0) * 60
             + (_to_float(seconds) or 0.0)
         )
-        script = str(script_name or "")
-        text = str(response or "")
+        return self._define_timer(
+            str(name or ""),
+            interval=interval,
+            text=str(response or ""),
+            send_to=send_to,
+            script=str(script_name or ""),
+            enabled=bool(flag_bits & _TIMER_FLAGS["Enabled"]),
+            one_shot=bool(flag_bits & _TIMER_FLAGS["OneShot"]),
+            at_time=bool(flag_bits & _TIMER_FLAGS["AtTime"]),
+            active_closed=bool(flag_bits & _TIMER_FLAGS["ActiveWhenClosed"]),
+            replace=bool(flag_bits & _TIMER_FLAGS["Replace"]),
+        )
+
+    def _register_timer(self, element: ET.Element, *, defaults: bool = False) -> None:
+        """An XML <timer> from a world or plugin file, defined like AddTimer."""
+        attrs = element.attrib
+        send_element = element.find("send")
+        interval = (
+            (_to_float(attrs.get("hour")) or 0.0) * 3600
+            + (_to_float(attrs.get("minute")) or 0.0) * 60
+            + (_to_float(attrs.get("second")) or 0.0)
+        )
+        self._define_timer(
+            attrs.get("name", ""),
+            interval=interval,
+            text=(send_element.text or "") if send_element is not None else "",
+            send_to=int(_to_float(attrs.get("send_to")) or 0),
+            script=attrs.get("script", ""),
+            enabled=_xml_flag(attrs, "enabled", defaults),
+            one_shot=_xml_flag(attrs, "one_shot"),
+            at_time=_xml_flag(attrs, "at_time"),
+            active_closed=_xml_flag(attrs, "active_closed"),
+            replace=True,
+            variable=attrs.get("variable", ""),
+        )
+
+    def _define_timer(
+        self,
+        name: str,
+        *,
+        interval: float,
+        text: str,
+        send_to: int,
+        script: str,
+        enabled: bool,
+        one_shot: bool,
+        at_time: bool,
+        active_closed: bool,
+        replace: bool,
+        variable: str = "",
+    ) -> int:
+        if at_time:
+            # A timer that fires at a time of day: one place in all the vault's packs uses
+            # it. Firing it every N hours instead would be wrong, so it isn't scheduled.
+            if self._api.diag is not None:
+                self._api.diag.event(
+                    "pack.timer", source=self._api.source or "?", name=name,
+                    status="skipped", reason="time-of-day timers aren't supported",
+                )
+            return _TIMER_ERROR
+        if interval <= 0:
+            return _TIMER_ERROR
+        if name and name in self._timers and not replace:
+            return _TIMER_ERROR  # MUSHclient's eTimerAlreadyExists
+        if not name:
+            name = f"*timer{self._get_unique_number()}"
+        state = {
+            "interval": max(interval, _MIN_TIMER_INTERVAL),
+            "text": text,
+            "send_to": send_to,
+            "script": script,
+            "variable": variable,
+            "enabled": enabled,
+            "one_shot": one_shot,
+            "active_closed": active_closed,
+            "generation": 0,
+        }
+        self._timers[name] = state  # a replaced timer's pending fire sees it isn't current
+        if enabled:
+            self._schedule_timer(name, state)
+        return _SCRIPT_ERROR_OK
+
+    def _timer_is_current(self, name: str, state: dict, generation: int) -> bool:
+        """Whether a scheduled fire still belongs to a live, enabled, unreset timer."""
+        return (
+            self._timers.get(name) is state
+            and state["generation"] == generation
+            and state["enabled"]
+        )
+
+    def _schedule_timer(self, name: str, state: dict) -> None:
+        generation = state["generation"]
 
         def fire() -> None:
-            target: object = self._lua.globals()
-            for part in script.split(".") if script else ():
-                target = target[part]
-                if target is None:
-                    break
-            if target is not None and script:
-                self._guard.run(target, str(_name or ""))
-            elif text:
-                self._api.send(text)
+            if not self._timer_is_current(name, state, generation):
+                return  # deleted, replaced, reset or disabled since this was scheduled
+            if state["one_shot"]:
+                del self._timers[name]  # before running, so the script can re-add the name
+            if state["active_closed"] or self._api.is_connected():
+                self._run_timer(name, state)
+            if not state["one_shot"] and self._timer_is_current(name, state, generation):
+                self._schedule_timer(name, state)
 
-        self._api.add_timer(max(delay, 0.0), fire)
+        self._api.add_timer(state["interval"], fire)
+
+    def _run_timer(self, name: str, state: dict) -> None:
+        if state["text"]:
+            self._deliver(state["send_to"], state["text"], variable=state["variable"])
+        script = state["script"]
+        if not script:
+            return
+        # Dotted names reach into tables: wait.lua's timers call "wait.timer_resume".
+        target: object = self._lua.globals()
+        for part in script.split("."):
+            target = target[part]
+            if target is None:
+                return
+        self._guard.run(target, name)
+
+    def _enable_timer(self, name: object = "", enabled: object = True, *_args: object) -> int:
+        state = self._timers.get(str(name or ""))
+        if state is None:
+            return _TIMER_ERROR
+        wanted = bool(_to_float(enabled)) if enabled is not None else True
+        if wanted != state["enabled"]:
+            state["enabled"] = wanted
+            state["generation"] += 1  # a pending fire from before the change no-ops
+            if wanted:
+                self._schedule_timer(str(name), state)
+        return _SCRIPT_ERROR_OK
+
+    def _delete_timer(self, name: object = "", *_args: object) -> int:
+        state = self._timers.pop(str(name or ""), None)
+        if state is None:
+            return _TIMER_ERROR
+        state["generation"] += 1
+        return _SCRIPT_ERROR_OK
+
+    def _reset_timer(self, name: object = "", *_args: object) -> int:
+        """Start the timer's interval over from now."""
+        state = self._timers.get(str(name or ""))
+        if state is None:
+            return _TIMER_ERROR
+        state["generation"] += 1
+        if state["enabled"]:
+            self._schedule_timer(str(name), state)
         return _SCRIPT_ERROR_OK
 
     def _set_option(self, name: object = "", value: object = 0, *_args: object) -> int:
@@ -1414,6 +1700,7 @@ class MushclientPack:
         state = {
             "active": bool(flag_bits & _TRIGGER_FLAGS["Enabled"]),
             "one_shot": bool(flag_bits & _TRIGGER_FLAGS["OneShot"]),
+            "omit": bool(flag_bits & _TRIGGER_FLAGS["OmitFromOutput"]),
             "handler": handler,
             "body": str(response or ""),
             "send_to": int(_to_float(send_to) or 0),
@@ -1445,6 +1732,9 @@ class MushclientPack:
             live = self._dynamic_triggers.get(trigger_name, state) if trigger_name else state
             if live is not state or not live["active"]:
                 return  # replaced by a different rule shape, deleted, or disabled
+            if live["omit"]:
+                ctx.line.gagged = True
+                ctx.line.display_when_gagged = False
             if live["one_shot"]:
                 live["active"] = False
                 live["retired"] = True
@@ -1456,11 +1746,7 @@ class MushclientPack:
                 self._guard.run(live["handler"], live["name"], ctx.line.plain_text, wildcards)
             body = live["body"]
             if body:
-                text = _substitute(body, ctx.wildcards)
-                if live["send_to"] == int(_SEND_TO_SCRIPT):
-                    self._guard.run(lambda: self._compile(text)())
-                else:
-                    self._api.send(text)
+                self._deliver(live["send_to"], _substitute(body, ctx.wildcards, ctx.named))
 
         self._api.add_trigger(
             pattern, fire, regex=True, priority=-int(_to_float(sequence) or 100),
@@ -1527,9 +1813,37 @@ class MushclientPack:
         self._guard.run(fn, *args)
         return _SCRIPT_ERROR_OK
 
-    def _do_after_special(self, delay: float, code: str, sendto: object = _SEND_TO_SCRIPT) -> None:
-        deferred = self._compile(str(code))
-        self._api.add_timer(float(delay), lambda: self._guard.run(deferred))
+    def _do_after_special(
+        self, seconds: object = 0, text: object = "", _sendto: object = _SEND_TO_SCRIPT,
+        *_rest: object,
+    ) -> int:
+        """MUSHclient ``DoAfterSpecial``, simplified on purpose: the text always runs as Lua.
+
+        That's the soundpack-standard send-to-script case (see the module docstring), and
+        plugins written against genericMud lean on it: the Erion gathering plugin passes
+        sendto 1 and expects its Send(...) to run.
+        """
+        return self._do_after_as(seconds, text, int(_SEND_TO_SCRIPT))
+
+    def _do_after(self, seconds: object = 0, text: object = "", *_rest: object) -> int:
+        """MUSHclient ``DoAfter``: send ``text`` to the MUD after ``seconds``."""
+        return self._do_after_as(seconds, text, _SEND_TO_WORLD_CODE)
+
+    def _do_after_note(self, seconds: object = 0, text: object = "", *_rest: object) -> int:
+        return self._do_after_as(seconds, text, _SEND_TO_OUTPUT_CODE)
+
+    def _do_after_speedwalk(self, seconds: object = 0, text: object = "", *_rest: object) -> int:
+        return self._do_after_as(seconds, text, _SEND_TO_SPEEDWALK_CODE)
+
+    def _do_after_as(self, seconds: object, text: object, send_to: int) -> int:
+        delay = _to_float(seconds)
+        if delay is None or delay < 0:
+            return _TIMER_ERROR
+        content = str(text or "")
+        # Compiled when it fires, inside the guard (see _deliver), so a syntax error in the
+        # deferred text is reported then instead of raising into the script that queued it.
+        self._api.add_timer(delay, lambda: self._deliver(send_to, content))
+        return _SCRIPT_ERROR_OK
 
     def _compile(self, code: str):
         """Host-side compile of a Lua chunk into a zero-arg callable."""
@@ -1697,6 +2011,28 @@ class MushclientPack:
                 "path": path,
                 "enabled": True,
             }
+        if path.name.casefold() in _SPEECH_PLUGINS:
+            self._install_speech_commands()
+
+    def _install_speech_commands(self) -> None:
+        """Answer the skipped speech plugin's commands with genericMud's own speech."""
+        if self._speech_commands_installed:
+            return
+        self._speech_commands_installed = True
+        for pattern, interrupt, speaks in _SPEECH_COMMANDS:
+            self._api.add_alias(
+                pattern, self._speech_command(interrupt, speaks), regex=True,
+                priority=_SPEECH_COMMAND_PRIORITY,
+            )
+
+    def _speech_command(self, interrupt: bool, speaks: bool):
+        def run(ctx: MatchContext) -> None:
+            if interrupt:
+                self._api.stop_speech()
+            if speaks and len(ctx.wildcards) > 1:
+                self._api.speak(ctx.wildcards[1], channel="pack")  # where nvda.say goes too
+
+        return run
 
     def _skip_plugin(self, name: str, reason: str) -> None:
         item = (name, reason)
@@ -1740,10 +2076,13 @@ class MushclientPack:
             for include in root.iter("include"):
                 name = include.get("name")
                 if name and include.get("plugin", "n").lower() != "y":
+                    self._plain_include_depth += 1
                     try:
                         self._load_included(name)
                     except Exception as exc:  # noqa: BLE001 - account for one bad fragment
                         self._include_errors.append((name, f"{type(exc).__name__}: {exc}"))
+                    finally:
+                        self._plain_include_depth -= 1
             world = next(root.iter("world"), None)
             if world is not None:
                 self._world_id = world.get("id") or self._world_id
@@ -1770,12 +2109,24 @@ class MushclientPack:
             script = "\n".join((el.text or "") for el in root.iter("script"))
             if script.strip():
                 self._guard.run_strict(self._execute_lua, script)
-            for is_alias, tag in ((False, "trigger"), (True, "alias")):
-                for element in root.iter(tag):
+            for is_alias, group_tag, tag in (
+                (False, "triggers", "trigger"), (True, "aliases", "alias"),
+            ):
+                for container in root.iter(group_tag):
+                    for element in container.iter(tag):
+                        defaults = self._uses_defaults(container, element)
+                        try:
+                            self._register(element, is_alias=is_alias, defaults=defaults)
+                        except Exception as exc:  # noqa: BLE001 - one malformed rule is not the pack
+                            label = element.get("name") or element.get("match") or "(unnamed)"
+                            self._rule_errors.append((label, f"{type(exc).__name__}: {exc}"))
+            for container in root.iter("timers"):
+                for element in container.iter("timer"):
+                    defaults = self._uses_defaults(container, element)
                     try:
-                        self._register(element, is_alias=is_alias)
-                    except Exception as exc:  # noqa: BLE001 - one malformed rule is not the pack
-                        label = element.get("name") or element.get("match") or "(unnamed)"
+                        self._register_timer(element, defaults=defaults)
+                    except Exception as exc:  # noqa: BLE001 - one malformed timer is not the pack
+                        label = element.get("name") or "(unnamed timer)"
                         self._rule_errors.append((label, f"{type(exc).__name__}: {exc}"))
             self._capture_hooks()
         finally:
@@ -1869,6 +2220,8 @@ class MushclientPack:
         self.dispatch("OnPluginConnect")
 
     def dispatch_line(self, line: str) -> None:
+        # A Tell that nothing finished still reaches the output, ahead of the MUD's line.
+        self._flush_tell()
         self.dispatch("OnPluginLineReceived", line)
 
     def dispatch_gmcp(self, package: str, value: object) -> None:
@@ -1900,30 +2253,55 @@ class MushclientPack:
             "OnPluginTelnetSubnegotiation", option, table, caller=self._payload_caller
         )
 
-    def _register(self, element: ET.Element, *, is_alias: bool) -> None:
+    def _uses_defaults(self, container: ET.Element, element: ET.Element) -> bool:
+        """MUSHclient's "defaults" switch for one rule.
+
+        MUSHclient only writes a boolean attribute when it's true, so a missing one reads as
+        false: a trigger with no ``enabled`` is a disabled one (Materia Magica keeps 211
+        capture-mode rules that way and switches their groups on when needed). With the
+        switch on, missing attributes take the class defaults instead, enabled included.
+        It's on for a plain (non-plugin) <include> and wherever a container or the rule
+        itself says defaults="y" (xml_load_world.cpp GET_VERSION_AND_DEFAULTS).
+        """
+        if self._plain_include_depth > 0:
+            return True
+        return _xml_flag(element.attrib, "defaults", _xml_flag(container.attrib, "defaults"))
+
+    def _register(self, element: ET.Element, *, is_alias: bool, defaults: bool = False) -> None:
         attrs = element.attrib
         pattern = attrs.get("match", "")
-        if attrs.get("regexp", "n") != "y":
+        if not _xml_flag(attrs, "regexp"):
             pattern = mushclient_pattern(pattern)
-        if attrs.get("ignore_case", "n") == "y":
+        if _xml_flag(attrs, "ignore_case"):
             pattern = "(?i)" + pattern  # MUSHclient compiles these with PCRE_CASELESS
         try:  # a malformed sequence attribute must not abort the whole world load
             priority = -int(attrs.get("sequence", _DEFAULT_TRIGGER_SEQUENCE))
         except ValueError:
             priority = -int(_DEFAULT_TRIGGER_SEQUENCE)
         keep_default = "n" if is_alias else "y"  # aliases consume by default
+        # Triggers keep evaluating unless told otherwise, which is not MUSHclient's default:
+        # here every pack and the player's own rules share one trigger list, and a pack's
+        # trigger stopping it would silence other packs' triggers and the player's.
         keep = attrs.get("keep_evaluating", keep_default) == "y"
+        # omit_from_output hides the matched line, and so keeps it from being read out. Packs
+        # lean on it hard (447 of Materia Magica's 803 triggers), often hiding the line and
+        # printing a reworded copy. Applied here rather than as an engine gag so a trigger
+        # the pack has disabled stops hiding lines too.
+        omit = not is_alias and _xml_flag(attrs, "omit_from_output")
         callback = self._make_callback(element, attrs)
         state: dict[str, object] = {
             "kind": "alias" if is_alias else "trigger",
             "name": attrs.get("name", ""),
             "group": attrs.get("group", ""),
-            "enabled": attrs.get("enabled", "y") == "y",
+            "enabled": _xml_flag(attrs, "enabled", defaults),
         }
         self._xml_rules.append(state)
 
         def gated(ctx: MatchContext) -> None:
             if state["enabled"]:
+                if omit:
+                    ctx.line.gagged = True
+                    ctx.line.display_when_gagged = False
                 callback(ctx)
 
         if is_alias:
@@ -1936,46 +2314,49 @@ class MushclientPack:
             )
 
     def _make_callback(self, element: ET.Element, attrs: dict[str, str]):
+        """What a fired XML trigger or alias does, in MUSHclient's order: play its sound, do
+        what its send_to says with its send text, then call its named script function."""
         lua = self._lua
-        api = self._api
         name = attrs.get("name", "")
-
-        script_name = attrs.get("script")
-        if script_name:
-            handler = lua.globals()[script_name]
-
-            def call_named(ctx: MatchContext) -> None:
-                if handler is not None:
-                    wildcards = lua.table_from(ctx.wildcards[1:])
-                    self._guard.run(handler, name, ctx.line.plain_text, wildcards)
-
-            return call_named
-
+        sound = attrs.get("sound", "")
+        if sound == _NO_SOUND:
+            sound = ""
         send_element = element.find("send")
         body = (send_element.text or "") if send_element is not None else ""
-        if body.strip():
-            if attrs.get("send_to", "0") == _SEND_TO_SCRIPT:
-                if _WILDCARD_RE.search(body):
-                    # MUSHclient substitutes %1.. into send-to-script text per match, then
-                    # runs it. Can't precompile: a bare %1 (e.g. `for i=1,%1`) isn't valid Lua.
-                    def call_script(ctx: MatchContext) -> None:
-                        # Compile inside the guard: a syntax error from substituted MUD text
-                        # must be contained, not raised into line processing.
-                        self._guard.run(lambda: self._compile(_substitute(body, ctx.wildcards))())
-                else:
-                    compiled = self._compile(body)  # no wildcards: compile once at registration
+        send = self._send_action(body, attrs) if body.strip() else None
+        script_name = attrs.get("script")
+        handler = lua.globals()[script_name] if script_name else None
 
-                    def call_script(_ctx: MatchContext) -> None:
-                        self._guard.run(compiled)
+        def fire(ctx: MatchContext) -> None:
+            if sound:
+                self._api.play(sound)
+            if send is not None:
+                send(ctx)
+            if handler is not None:
+                wildcards = lua.table_from(ctx.wildcards[1:])
+                self._guard.run(handler, name, ctx.line.plain_text, wildcards)
 
-                return call_script
+        return fire
 
-            def call_send(ctx: MatchContext) -> None:
-                api.send(_substitute(body, ctx.wildcards))
+    def _send_action(self, body: str, attrs: dict[str, str]):
+        send_to = int(_to_float(attrs.get("send_to")) or 0)
+        variable = attrs.get("variable", "")
+        if send_to in _SEND_TO_SCRIPT_CODES and not _WILDCARD_RE.search(body):
+            compiled = self._compile(body)  # no wildcards: compile once at registration
 
-            return call_send
+            def run_compiled(_ctx: MatchContext) -> None:
+                self._guard.run(compiled)
 
-        return lambda _ctx: None
+            return run_compiled
+
+        def deliver(ctx: MatchContext) -> None:
+            # MUSHclient substitutes %1.. into the text per match before using it, scripts
+            # included: a bare %1 (Repeat_Command's `for i=1,%1`) isn't valid Lua until then.
+            self._deliver(
+                send_to, _substitute(body, ctx.wildcards, ctx.named), variable=variable
+            )
+
+        return deliver
 
 
 _CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
@@ -2013,8 +2394,25 @@ def _escape_attr_values(segment: str) -> str:
     return _ATTR_VALUE_RE.sub(fix, segment)
 
 
-def _substitute(text: str, wildcards: list[str]) -> str:
+def _command_lines(text: str) -> list[str]:
+    """The commands in a send body: one per line, blank lines left out."""
+    return [line.rstrip("\r") for line in text.split("\n") if line.strip()]
+
+
+def _substitute(
+    text: str, wildcards: list[str], named: dict[str, str] | None = None
+) -> str:
+    """Fill a rule's send text the way MUSHclient does: %1, %<name>, and %% for "%".
+
+    Materia Magica's health trigger sends "sapi interrupt %1%%", which has to say "85%",
+    not "85%%".
+    """
+
     def replace(match: re.Match[str]) -> str:
+        if match.group(3) is not None:
+            return "%"
+        if match.group(2) is not None:
+            return (named or {}).get(match.group(2), "")
         index = int(match.group(1))
         return wildcards[index] if index < len(wildcards) else ""
 

@@ -585,7 +585,8 @@ def test_standard_error_codes_and_variable_mutations_return_ok(tmp_path):
     pack.load_source(
         "<muclient><script><![CDATA["
         "Send(tostring(error_code.eOK)); Send(tostring(SetVariable('x', '1'))); "
-        "Send(tostring(DeleteVariable('x'))); Send(tostring(EnableTimer('t', true)))"
+        "Send(tostring(DeleteVariable('x'))); "
+        "AddTimer('t', 0, 0, 5, '', 0, ''); Send(tostring(EnableTimer('t', true)))"
         "]]></script></muclient>"
     )
     assert sink.sent == ["0", "0", "0", "0"]
@@ -1514,3 +1515,184 @@ def test_add_trigger_ex_plain_pattern_is_the_whole_line():
     engine.process_line(Line("Bob shouts: 12 hit points left!"))
     engine.process_line(Line("40 hit points"))
     assert sink.sent == ["hp 40"]
+
+
+def _rules(rules: str) -> tuple[RecordingSink, AutomationEngine, MushclientPack]:
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(f'<?xml version="1.0"?><muclient>{rules}</muclient>')
+    return sink, engine, pack
+
+
+def test_send_to_codes_do_what_mushclient_does_not_send_everything_to_the_mud():
+    # Empire MUD's area-ambience triggers are send_to 14 (script after omit); Cosmic Rage's
+    # $buffer trigger is send_to 10 (execute); SquareSoft's greeting credits are send_to 2.
+    # All of it used to go to the MUD as typed commands, Lua source included.
+    sink, engine, _pack = _rules(
+        '<aliases><alias match="tts_interrupt *" enabled="y" send_to="12">'
+        '<send>SetVariable("spoken", "%1")</send></alias></aliases>'
+        "<triggers>"
+        '<trigger match="^You died\\.$" regexp="y" enabled="y" send_to="14">'
+        '<send>SetVariable("deaths", "1")</send></trigger>'
+        '<trigger match="^\\$buffer (.*?)$" regexp="y" enabled="y" send_to="10">'
+        "<send>tts_interrupt %1</send></trigger>"
+        '<trigger match="Welcome to the MUD" enabled="y" send_to="2">'
+        "<send>Soundpack by Someone</send></trigger>"
+        '<trigger match="Status *" enabled="y" send_to="3"><send>status text</send></trigger>'
+        "</triggers>"
+    )
+    for text in ("You died.", "$buffer hello there", "Welcome to the MUD", "Status 5"):
+        engine.process_line(Line(text))
+    assert sink.sent == []
+    assert engine.get_var("deaths") == "1"
+    assert engine.get_var("spoken") == "hello there"
+    assert ("Soundpack by Someone", "main") in sink.echoed
+
+
+def test_send_to_variable_and_world_still_work():
+    sink, engine, _pack = _rules(
+        "<triggers>"
+        '<trigger match="You see *" enabled="y" send_to="9" variable="seen">'
+        "<send>%1</send></trigger>"
+        '<trigger match="You are hungry." enabled="y"><send>eat bread</send></trigger>'
+        "</triggers>"
+    )
+    engine.process_line(Line("You see a rat"))
+    engine.process_line(Line("You are hungry."))
+    assert engine.get_var("seen") == "a rat"
+    assert sink.sent == ["eat bread"]
+
+
+def test_omit_from_output_hides_the_line_and_print_shows_the_reworded_copy():
+    # Empire's "omit and reprint" pattern: hide the MUD's line, print a speech-friendly one.
+    sink, engine, pack = _rules(
+        '<triggers><trigger match="Lie still; you are DEAD!!!" enabled="y" name="dead"'
+        ' omit_from_output="y" send_to="14"><send>print("Lie still: you are DEAD!!!")</send>'
+        "</trigger></triggers>"
+    )
+    line = engine.process_line(Line("Lie still; you are DEAD!!!"))
+    assert line.gagged and not line.display_when_gagged
+    assert sink.echoed == [("Lie still: you are DEAD!!!", "main")]
+    # Spoken too, as MushReader (the pack's screen-reader plugin) speaks every note it draws.
+    assert sink.spoken == [("Lie still: you are DEAD!!!", "main", False)]
+    pack._enable_trigger("dead", 0)  # a disabled trigger stops hiding the line too
+    assert not engine.process_line(Line("Lie still; you are DEAD!!!")).gagged
+
+
+def test_note_send_and_tell_join_their_arguments_like_mushclient():
+    sink, engine, _pack = _rules(
+        '<aliases><alias match="hp" enabled="y" send_to="12"><send>'
+        'Note("HP: ", 42, "/", 50) Send("say ", "hi") '
+        'ColourTell("white", "black", "MP: ") Tell(7) ColourNote("white", "black", "!")'
+        "</send></alias></aliases>"
+    )
+    engine.process_input("hp")
+    assert sink.echoed == [("HP: 42/50", "main"), ("MP: 7!", "main")]
+    assert sink.sent == ["say hi"]
+
+
+def test_do_after_family_sends_and_notes_later():
+    sink, engine, _pack = _rules(
+        '<aliases><alias match="later" enabled="y" send_to="12"><send>'
+        'DoAfter(2, "look") DoAfterNote(1, "noted") DoAfterSpecial(1, "Send(\'scripted\')", 1)'
+        "</send></alias></aliases>"
+    )
+    engine.process_input("later")
+    assert [delay for delay, _callback in sink.scheduled] == [2, 1, 1]
+    sink.run_pending()
+    assert sink.sent == ["look", "scripted"]  # DoAfterSpecial text always runs as Lua
+    assert sink.echoed == [("noted", "main")]
+
+
+def test_add_timer_repeats_unless_one_shot_and_obeys_enable_delete_and_reset():
+    sink, engine, pack = _rules(
+        '<aliases><alias match="go" enabled="y" send_to="12"><send>'
+        'AddTimer("beat", 0, 0, 1, "ping", timer_flag.Enabled, "") '
+        'AddTimer("once", 0, 0, 1, "pong", timer_flag.Enabled + timer_flag.OneShot, "")'
+        "</send></alias></aliases>"
+    )
+    engine.process_input("go")
+    sink.run_pending()
+    assert sorted(sink.sent) == ["ping", "pong"]
+    sink.run_pending()  # only the repeating timer re-armed
+    assert sorted(sink.sent) == ["ping", "ping", "pong"]
+    pack._enable_timer("beat", False)
+    sink.run_pending()  # the fire scheduled before the disable does nothing
+    assert sink.scheduled == []
+    pack._enable_timer("beat", True)
+    pack._reset_timer("beat")
+    assert len(sink.scheduled) == 2  # enable and reset each scheduled; only the newest counts
+    sink.run_pending()
+    assert sink.sent.count("ping") == 3
+    pack._delete_timer("beat")
+    sink.run_pending()
+    assert sink.sent.count("ping") == 3
+
+
+def test_xml_timer_repeats_and_waits_while_disconnected():
+    # Toastush's one-second heartbeat plays the roundtime sound; XML timers used to be ignored.
+    sink, engine, _pack = _rules(
+        '<timers><timer name="heartbeat" enabled="y" second="1" send_to="12">'
+        '<send>Send("tick")</send></timer></timers>'
+    )
+    assert [delay for delay, _callback in sink.scheduled] == [1.0]
+    sink.run_pending()
+    engine.connected = False  # not active_closed: skip the action, keep the schedule
+    sink.run_pending()
+    engine.connected = True
+    sink.run_pending()
+    assert sink.sent == ["tick", "tick"]
+
+
+def test_a_skipped_speech_plugins_commands_are_spoken_not_sent(tmp_path):
+    # genericMud stands in for MushReader.xml, so its "tts_interrupt <text>" command has to
+    # be answered here; Erion's channel history and Cosmic Rage's $buffer lines say things
+    # that way. Skipping the plugin used to send those commands to the MUD.
+    worlds = tmp_path / "worlds"
+    (worlds / "plugins").mkdir(parents=True)
+    (worlds / "plugins" / "MushReader.xml").write_text(
+        '<muclient><plugin id="reader" name="MushReader" language="Lua"/></muclient>',
+        encoding="latin-1",
+    )
+    (worlds / "w.MCL").write_text(
+        '<muclient><world site="x" port="1" name="W"/>'
+        '<include name="MushReader.xml" plugin="y"/>'
+        '<triggers><trigger match="^\\$buffer (.*?)$" regexp="y" enabled="y" send_to="10">'
+        "<send>tts_interrupt %1</send></trigger></triggers></muclient>",
+        encoding="latin-1",
+    )
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path))).load_file(
+        str(worlds / "w.MCL")
+    )
+    engine.process_line(Line("$buffer incoming transmission"))
+    assert sink.sent == []
+    assert sink.speech_stops == 1
+    assert ("incoming transmission", "pack", False) in sink.spoken
+
+
+def test_a_rule_with_no_enabled_attribute_starts_disabled():
+    # MUSHclient writes a boolean only when it's true, so no "enabled" means disabled; Materia
+    # Magica keeps 211 capture-mode rules that way. defaults="y" restores the class defaults.
+    sink, engine, _pack = _rules(
+        "<triggers>"
+        '<trigger match="spam" send_to="0"><send>off</send></trigger>'
+        '<trigger match="spam" enabled="1" send_to="0"><send>on</send></trigger>'
+        "</triggers>"
+        '<triggers defaults="y"><trigger match="spam" send_to="0"><send>default</send></trigger>'
+        "</triggers>"
+    )
+    engine.process_line(Line("spam"))
+    assert sorted(sink.sent) == ["default", "on"]
+
+
+def test_send_text_takes_percent_escapes_and_named_captures():
+    sink, engine, _pack = _rules(
+        "<triggers>"
+        '<trigger match="^(?P&lt;pct&gt;\\d+)% (.+) HP\\.$" regexp="y" enabled="y">'
+        "<send>say %1%% of %2, %&lt;pct&gt;</send></trigger></triggers>"
+    )
+    engine.process_line(Line("85% 140 HP."))
+    assert sink.sent == ["say 85% of 140, 85"]
