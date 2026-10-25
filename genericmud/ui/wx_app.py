@@ -2513,12 +2513,9 @@ class AutomationManagerDialog(wx.Dialog):
                 if dialog.ShowModal() != wx.ID_OK:
                     return None
                 result = dialog.result()
-                if (
-                    self._complete(kind, result)
-                    and self._valid_rule(kind, result)
-                    and self._key_is_free(kind, result)
-                ):
-                    return result
+                if self._complete(kind, result) and self._valid_rule(kind, result):
+                    if self._key_is_free(kind, result):
+                        return result
         finally:
             dialog.Destroy()
 
