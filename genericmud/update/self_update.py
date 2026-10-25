@@ -396,6 +396,7 @@ def download_and_replace(update_info: dict, progress_cb=None) -> Path:
     zip_path = workdir / "genericMud-windows.zip"
     extracted = workdir / "extracted"
     flat_zip = workdir / "genericMud-flat.zip"
+    armed = False  # the rollback marker is written; from here a failure must take it back
 
     try:
         _download(
@@ -416,6 +417,7 @@ def download_and_replace(update_info: dict, progress_cb=None) -> Path:
         upgrade_manager.prepare_for_upgrade(
             install_dir, flat_zip, update_info.get("tag", "unknown"), exe_name=current_exe.name
         )
+        armed = True
 
         # Copy the helper out of the install dir so it isn't locked when it overwrites its
         # own binary there, and re-hash source vs copy immediately before an elevated spawn:
@@ -431,6 +433,8 @@ def download_and_replace(update_info: dict, progress_cb=None) -> Path:
 
         _spawn_extractor(extractor_tmp, flat_zip, install_dir, current_exe)
     except Exception:
+        if armed:  # the helper never started (ShellExecuteW raises only when it didn't)
+            upgrade_manager.abandon_upgrade(install_dir)
         shutil.rmtree(workdir, ignore_errors=True)
         raise
 

@@ -69,6 +69,24 @@ def _recover_pending_upgrade():
         return None
 
 
+def _sweep_update_leftovers() -> None:
+    """Delete the temp folders earlier in-app updates left behind (a day old or more).
+
+    Each update leaves its download and a copy of the helper there. Frozen build only, and
+    never raises: tidying up must not stop the app from starting.
+    """
+    import sys
+
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        from genericmud.update.self_update import cleanup_stale_workdirs
+
+        cleanup_stale_workdirs()
+    except Exception:  # noqa: BLE001 - best effort, like the recovery above
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     from genericmud.session.crashlog import install_crash_handlers
 
@@ -80,6 +98,7 @@ def main(argv: list[str] | None = None) -> None:
         run(args)
     else:
         recovery = _recover_pending_upgrade()  # before importing wx: roll back a bad swap first
+        _sweep_update_leftovers()
         from genericmud.ui.wx_app import run
 
         run(args, recovery=recovery)

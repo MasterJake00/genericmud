@@ -160,6 +160,15 @@ def prepare_for_upgrade(
     )
 
 
+def abandon_upgrade(install_dir: Path) -> None:
+    """Forget an upgrade that was prepared but never started: the helper didn't launch.
+
+    Nothing in the install changed, so there is nothing to verify or roll back. Left in
+    place, the marker makes the next launch announce a failed update that never ran.
+    """
+    _clear_state(Path(install_dir))
+
+
 def recover_pending_upgrade(install_dir: Path) -> RecoveryResult | None:
     """Verify a pending upgrade at startup; roll back from the snapshot on failure.
 

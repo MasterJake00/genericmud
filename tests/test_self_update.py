@@ -152,3 +152,68 @@ def test_current_version_survives_missing_dist_metadata(monkeypatch):
 
     monkeypatch.setattr(self_update, "_pkg_version", _raise)
     assert self_update.current_version() == genericmud.__version__  # source wins, metadata unused
+
+
+def _release_zip(path, exe_bytes):
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("genericMud/genericMud.exe", exe_bytes)
+        archive.writestr("genericMud/_internal/lib.pyd", b"new library")
+
+
+def test_a_helper_that_never_launched_leaves_no_failed_update_behind(tmp_path, monkeypatch):
+    # The rollback marker is written just before the helper starts. When antivirus or a
+    # declined prompt stops the helper, nothing was installed, yet the next launch read
+    # the marker and announced "Update failed, genericMud was restored".
+    from genericmud.update import upgrade_manager
+
+    install = tmp_path / "install"
+    install.mkdir()
+    (install / "genericMud.exe").write_bytes(b"old exe")
+    (install / "ZipExtractor.exe").write_bytes(b"helper")
+    monkeypatch.setattr(self_update.sys, "executable", str(install / "genericMud.exe"))
+    monkeypatch.setattr(self_update, "can_self_replace", lambda: True)
+
+    def fake_download(_url, dest, progress_cb=None, expected_size=0):
+        _release_zip(dest, b"new exe")
+
+    def blocked_spawn(*_args):
+        raise RuntimeError("ShellExecuteW failed (code 5) launching ZipExtractor.exe")
+
+    monkeypatch.setattr(self_update, "_download", fake_download)
+    monkeypatch.setattr(self_update, "_spawn_extractor", blocked_spawn)
+    with pytest.raises(RuntimeError):
+        self_update.download_and_replace({"download_url": "https://x/y.zip", "tag": "v9.9.9"})
+
+    assert upgrade_manager.recover_pending_upgrade(install) is None
+    assert (install / "genericMud.exe").read_bytes() == b"old exe"
+
+
+def test_startup_clears_out_old_update_folders(tmp_path, monkeypatch):
+    # Every in-app update leaves its download (about 50 MB) and a helper copy in a temp
+    # folder; the sweep that removes them existed but nothing ever called it.
+    import os
+    import sys
+    import time
+    import types
+
+    import genericmud.__main__ as entry
+
+    old = tmp_path / "genericmud-update-old"
+    old.mkdir()
+    two_days_ago = time.time() - 2 * 24 * 3600
+    os.utime(old, (two_days_ago, two_days_ago))
+    fresh = tmp_path / "genericmud-update-fresh"  # may still be in use by a running update
+    fresh.mkdir()
+    monkeypatch.setattr(self_update.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(entry, "_recover_pending_upgrade", lambda: None)
+    monkeypatch.setattr("genericmud.session.crashlog.install_crash_handlers", lambda: None)
+    opened: list[bool] = []
+    window = types.SimpleNamespace(run=lambda _args, recovery=None: opened.append(True))
+    monkeypatch.setitem(sys.modules, "genericmud.ui.wx_app", window)
+
+    entry.main([])
+
+    assert opened == [True]
+    assert not old.exists()
+    assert fresh.exists()
