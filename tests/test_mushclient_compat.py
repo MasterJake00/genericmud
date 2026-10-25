@@ -899,7 +899,7 @@ def test_trusted_pack_resolves_and_plays_a_getinfo_anchored_sound(tmp_path):
         ScriptApi(engine, source="erion", base_dir=str(tmp_path)), full_stdlib=True
     ).load_file(str(world_file))
     assert engine.get_var("sppath") == str(tmp_path)  # sppath defaulted to the pack dir
-    engine.process_line(Line("You are hit hard!"))
+    engine.process_line(Line("You are hit"))  # a plain trigger is the whole line
     assert len(sink.played) == 1
     # Compare as Path, not string: the engine builds sound paths with forward slashes on every OS
     # (it deliberately avoids os.path.normpath), so an os.path.join here would mismatch on Windows.
@@ -949,7 +949,7 @@ def test_audio_play_via_ppi_chain_reaches_the_sink(tmp_path):
     MushclientPack(
         ScriptApi(engine, source="erion", base_dir=str(tmp_path)), full_stdlib=True
     ).load_file(str(world))
-    engine.process_line(Line("You are hit for 10 damage"))
+    engine.process_line(Line("You are hit"))  # a plain trigger is the whole line
     assert len(sink.played) == 1
     assert Path(sink.played[0]["file"]) == tmp_path / "sounds" / "hit.ogg"
     assert sink.played[0]["gain"] == 0.8  # vol 80 -> gain 0.8
@@ -1472,3 +1472,45 @@ def test_dynamic_triggers_do_not_leak_dead_engine_rules(tmp_path):
     assert len(engine._triggers) == 1
     pack._lua.execute('DeleteTrigger("keep")')
     assert len(engine._triggers) == 0
+
+
+WHOLE_LINE = """<?xml version="1.0"?>
+<muclient>
+<aliases>
+ <alias match="sc" enabled="y" send_to="12"><send>Send("score")</send></alias>
+</aliases>
+<triggers>
+ <trigger match="You are hungry." enabled="y" regexp="n" send_to="12">
+  <send>Send("eat bread")</send></trigger>
+ <trigger match="Ready? *" enabled="y" regexp="n" send_to="12">
+  <send>Send("go %1")</send></trigger>
+ <trigger match="you feel thirsty" enabled="y" ignore_case="y" send_to="12">
+  <send>Send("drink water")</send></trigger>
+</triggers>
+</muclient>"""
+
+
+def test_plain_patterns_follow_mushclients_whole_line_rule():
+    # MUSHclient wraps a plain pattern in ^...$ and keeps "?" literal (its own
+    # ConvertToRegularExpression). Erion's alias "vol" used to catch voldown and voltoggle.
+    sink, engine = _load(WHOLE_LINE)
+    assert engine.process_input("scan") == ["scan"]
+    engine.process_line(Line('Bob says, "You are hungry."'))
+    assert sink.sent == []
+    engine.process_line(Line("You are hungry."))
+    engine.process_line(Line("Ready? north"))
+    engine.process_line(Line("YOU FEEL THIRSTY"))
+    assert sink.sent == ["eat bread", "go north", "drink water"]
+
+
+def test_add_trigger_ex_plain_pattern_is_the_whole_line():
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    MushclientPack(ScriptApi(engine, source="m")).load_source(
+        '<muclient><script><![CDATA[\n'
+        'AddTriggerEx("hp", "* hit points", "hp %1", trigger_flag.Enabled, -1, 0, "", "", 0, 100)\n'
+        "]]></script></muclient>"
+    )
+    engine.process_line(Line("Bob shouts: 12 hit points left!"))
+    engine.process_line(Line("40 hit points"))
+    assert sink.sent == ["hp 40"]

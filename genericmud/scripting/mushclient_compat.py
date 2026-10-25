@@ -157,6 +157,23 @@ def _reduce_ints(args: tuple, op) -> int:
     return result
 
 
+def mushclient_pattern(text: str) -> str:
+    """The regex MUSHclient matches a plain (non-regex) trigger or alias against.
+
+    MUSHclient never matches the text as written: ``ConvertToRegularExpression`` (its
+    Utilities.cpp, called with ``bWholeLine`` true for every trigger and alias it loads)
+    wraps it in ``^...$`` so it has to be the whole line or the whole command, turns ``*``
+    into a non-greedy ``(.*?)``, and treats everything else as a literal, ``?`` included.
+    Packs are written for that: a plain trigger on "You are hungry." must not fire on
+    someone saying the words, and an alias "vol" must not also catch "voldown".
+    """
+    parts = ["^"]
+    for char in text:
+        parts.append("(.*?)" if char == "*" else re.escape(char))
+    parts.append("$")
+    return "".join(parts)
+
+
 def _normalize_key_spec(spec: object) -> str:
     """MUSHclient accelerator syntax -> a keymap combo, or "" when unusable.
 
@@ -1386,11 +1403,12 @@ class MushclientPack:
         """
         flag_bits = int(_to_float(flags) or 0)
         trigger_name = str(name or "")
-        pattern = str(match or "")
-        if not pattern:
+        match_text = str(match or "")
+        if not match_text:
             return 1  # nonzero = MUSHclient error; packs rarely check
         regex = bool(flag_bits & _TRIGGER_FLAGS["RegularExpression"])
-        if flag_bits & _TRIGGER_FLAGS["IgnoreCase"] and regex:
+        pattern = match_text if regex else mushclient_pattern(match_text)
+        if flag_bits & _TRIGGER_FLAGS["IgnoreCase"]:
             pattern = "(?i)" + pattern
         handler = self._lua.globals()[str(script_name)] if str(script_name or "") else None
         state = {
@@ -1445,7 +1463,7 @@ class MushclientPack:
                     self._api.send(text)
 
         self._api.add_trigger(
-            pattern, fire, regex=regex, priority=-int(_to_float(sequence) or 100),
+            pattern, fire, regex=True, priority=-int(_to_float(sequence) or 100),
             name=engine_name,
         )
         return _SCRIPT_ERROR_OK
@@ -1885,7 +1903,10 @@ class MushclientPack:
     def _register(self, element: ET.Element, *, is_alias: bool) -> None:
         attrs = element.attrib
         pattern = attrs.get("match", "")
-        regex = attrs.get("regexp", "n") == "y"
+        if attrs.get("regexp", "n") != "y":
+            pattern = mushclient_pattern(pattern)
+        if attrs.get("ignore_case", "n") == "y":
+            pattern = "(?i)" + pattern  # MUSHclient compiles these with PCRE_CASELESS
         try:  # a malformed sequence attribute must not abort the whole world load
             priority = -int(attrs.get("sequence", _DEFAULT_TRIGGER_SEQUENCE))
         except ValueError:
@@ -1907,11 +1928,11 @@ class MushclientPack:
 
         if is_alias:
             self._api.add_alias(
-                pattern, gated, regex=regex, priority=priority, keep_evaluating=keep
+                pattern, gated, regex=True, priority=priority, keep_evaluating=keep
             )
         else:
             self._api.add_trigger(
-                pattern, gated, regex=regex, priority=priority, keep_evaluating=keep
+                pattern, gated, regex=True, priority=priority, keep_evaluating=keep
             )
 
     def _make_callback(self, element: ET.Element, attrs: dict[str, str]):
