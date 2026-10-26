@@ -1809,9 +1809,11 @@ class MushclientPack:
             "ActivateNotepad": self._activate_notepad,
             "CloseNotepad": self._close_notepad,
             "GetNotepadList": lambda *_a: self._lua_list(list(self._notepads)),
-            "GetNotepadText": lambda title="", *_a: self._notepads.get(_dialog_text(title), ""),
+            "GetNotepadText": lambda title="", *_a: self._notepads.get(
+                self._notepad_title(title), ""
+            ),
             "GetNotepadLength": lambda title="", *_a: len(
-                self._notepads.get(_dialog_text(title), "")
+                self._notepads.get(self._notepad_title(title), "")
             ),
             "NotepadReadOnly": self._notepad_exists,
             "NotepadSaveMethod": self._notepad_exists,
@@ -2409,10 +2411,21 @@ class MushclientPack:
             return E_OK
         return ERROR_CODES["eCouldNotOpenFile"]
 
+    def _notepad_title(self, title: object) -> str:
+        """The title a pack's notepad is kept under: an existing one's, whatever the case.
+        MUSHclient's FindNotepad compares titles ignoring case, and Toastush fills its
+        "Changelog" notepad and then opens "changelog"."""
+        name = _dialog_text(title)
+        wanted = name.casefold()
+        for existing in self._notepads:
+            if existing.casefold() == wanted:
+                return existing
+        return name
+
     def _notepad_write(self, title: object, text: str, *, replace: bool) -> bool:
         """Add to (or replace) a pack's notepad. Nothing is shown: Mush-Z appends every
         channel message to one, and only ActivateNotepad puts a notepad in front."""
-        name = _dialog_text(title)
+        name = self._notepad_title(title)
         combined = text if replace else self._notepads.get(name, "") + text
         self._notepads[name] = combined[-_NOTEPAD_LIMIT:]
         return True
@@ -2422,19 +2435,19 @@ class MushclientPack:
         return dict(self._notepads)
 
     def _activate_notepad(self, title: object = "", *_args: object) -> bool:
-        name = _dialog_text(title)
+        name = self._notepad_title(title)
         if name not in self._notepads:
             return False
         self._window().show_notepad(name, self._notepads[name])
         return True
 
     def _close_notepad(self, title: object = "", *_args: object) -> int:
-        return 1 if self._notepads.pop(_dialog_text(title), None) is not None else 0
+        return 1 if self._notepads.pop(self._notepad_title(title), None) is not None else 0
 
     def _notepad_exists(self, title: object = "", *_args: object) -> int:
         """Read-only, save method, colour, font and window position: genericMud's notepad
         window has none of these to set, so they answer whether the notepad exists."""
-        return 1 if _dialog_text(title) in self._notepads else 0
+        return 1 if self._notepad_title(title) in self._notepads else 0
 
     # --- arrays: MUSHclient's named string maps, kept in key order like its std::map ---
 

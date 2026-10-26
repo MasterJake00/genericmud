@@ -171,6 +171,25 @@ def test_notepads_collect_text_and_show_only_when_asked():
     assert window.notepads == [("comlog", "Bob: hi\r\nAnn: hello\r\n")]
 
 
+def test_notepad_titles_match_whatever_their_case():
+    # MUSHclient's FindNotepad compares titles ignoring case. Toastush fills "Changelog" and
+    # then opens "changelog", so its changelog never came up.
+    window = _Window()
+    sink, _engine, _pack_ = _pack(
+        "AppendToNotepad('Changelog', 'v1', '\\r\\n')\n"
+        "AppendToNotepad('CHANGELOG', 'v2', '\\r\\n')\n"
+        "Send(tostring(ActivateNotepad('changelog')))\n"
+        "Send(GetNotepadText('changelog'))\n"
+        "Send(tostring(GetNotepadLength('changeLOG')))\n"
+        "Send(table.concat(GetNotepadList(), ','))\n"
+        "Send(tostring(NotepadReadOnly('changelog', true)))\n"
+        "Send(tostring(CloseNotepad('changelog')))\n",
+        window=window,
+    )
+    assert sink.sent == ["true", "v1\r\nv2\r\n", "8", "Changelog", "1", "1"]
+    assert window.notepads == [("Changelog", "v1\r\nv2\r\n")]
+
+
 def test_a_trigger_can_send_to_a_notepad():
     sink, engine, pack = _pack(
         rules="<triggers><trigger name='log' match='^(.+) tells you (.+)$' regexp='y' "
