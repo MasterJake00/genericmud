@@ -28,6 +28,9 @@ class Line:
     ts: float = field(default_factory=time.time)
     spans: list[Span] = field(default_factory=list)  # colour runs; empty if unparsed
     seq: int = -1  # monotonic all-time position, stamped by Buffer.append (-1 = unbuffered)
+    # A pack's replacement (VIPMud #Sub), shown and spoken instead once every trigger has
+    # seen the line the MUD sent.
+    substitute: str | None = None
 
 
 class Buffer:

@@ -172,6 +172,10 @@ class AppSink(EngineSink):
     def file_line(self, text: str, channel: str) -> None:
         self._buffer.append(Line(text, channel=channel))
 
+    def recent_lines(self, count: int) -> list[str]:
+        start = max(0, len(self._buffer) - count)
+        return [self._buffer[index].plain_text for index in range(start, len(self._buffer))]
+
     def speak(self, text: str, channel: str = "main", interrupt: bool = False) -> None:
         self._voice.speak(text, channel, interrupt)
 
@@ -842,11 +846,17 @@ class EngineApp:
             pack.dispatch_line(plain)
         line = Line(plain, spans=spans)
         self.engine.process_line(line)  # may set line.channel and gag flags
-        self._log(line.plain_text)  # full session log, including gagged-from-speech
         if self._login is not None and not self._login.done:
             self._login.feed(line.plain_text)  # answer name/password prompts
         if self._walk is not None and self._walk.active:
             self._walk.on_line(line.plain_text)  # halt the walk if a step was blocked
+        if line.substitute is not None:
+            # A pack replaced the line (VIPMud #Sub). Login and the walker still read what
+            # the MUD sent; the player sees and hears the replacement.
+            line.plain_text, line.spans = line.substitute, []
+            if not line.plain_text.strip():
+                return
+        self._log(line.plain_text)  # full session log, including gagged-from-speech
         policy = self.channels.policy(line.channel)
         if policy.speak and not line.gagged and self.engine.line_speech:
             self.voice.speak(

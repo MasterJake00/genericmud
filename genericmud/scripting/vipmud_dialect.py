@@ -83,6 +83,10 @@ _LOOP_LIMIT = 10_000
 _STEP_LIMIT = 50_000
 _REPEAT_LIMIT = 32_767  # #N {commands}: the manual's range is 1 to 32767
 _MIN_REPEATING_ALARM = 0.1  # seconds; "#alarm -0 {...}" must not spin
+_FIND_LINES = 5000  # how far back #Find and %LastLine look in the output
+# #Say's voice types other than Incoming (its default) and Output, which #SetSpeech
+# Incoming Off silences.
+_OTHER_VOICES = {"voiceonly", "entry", "edit", "system"}
 _MASTER_HANDLE = "0"  # VIPMud handle 0 == all cues / master volume
 _MAX_EXEC_DEPTH = 20  # bare-text alias expansion recursion cap (self-invoking alias)
 _VIPMUD_VERSION = "200000"  # %Version: VIPMud 2.0.0 as xyyzzz
@@ -885,6 +889,10 @@ class VipMudPack:
         self._alarms: dict[int, _Alarm] = {}  # by the number #Alarm hands its variable
         self._alarm_count = 0
         self._run_depth = 0  # scripts running inside one another (an alias calling an alias)
+        self._found_line = ""  # %FoundLine, from #Find
+        self._find_index: int | None = None  # where #Find last found, for "next"
+        self._gagging_all = False  # between #GagOn All and #UnGagOn
+        self._gag_rule: object | None = None
         self._steps = 0  # commands the outermost running script has used of _STEP_LIMIT
         # Classes start switched off; a rule in a class works only while it's enabled.
         self._enabled_classes: set[str] = set()
@@ -1267,7 +1275,23 @@ class VipMudPack:
         elif command in ("CLASS", "GCLASS", "UNCLASS", "DELCLASS") and args:
             self._execute_class(command, args, scope)
         elif command == "SAY" and args:
-            self._api.speak(self._expand(args[0].text, scope))
+            self._execute_say(args, scope)
+        elif command in ("SUB", "SUBSTITUTE") and args and scope.line is not None:
+            # Shown and spoken in place of the line; triggers after this one still see the
+            # line as the MUD sent it, so the packs' sounds on it still play.
+            scope.line.substitute = self._expand(args[0].text, scope)
+        elif command == "SETSPEECH" and len(args) > 1:
+            self._execute_setspeech(args, scope)
+        elif command == "GAGON":
+            self._execute_gagon(args, scope)
+        elif command == "UNGAGON":
+            self._gagging_all = False
+            self._api.set_line_speech(True)
+        elif command == "UNGAGLINE" and scope.line is not None:
+            scope.line.gagged = False
+            scope.line.display_when_gagged = False
+        elif command == "FIND" and args:
+            self._execute_find(args, scope)
         elif command in ("PLAY", "PLAYLOOP") and args:
             self._play(args, scope, loop=command == "PLAYLOOP")
         elif command in ("VAR", "GVAR") and args:
@@ -1331,6 +1355,80 @@ class VipMudPack:
             if way and back:
                 self._directions[way] = back
         # Unknown #commands are ignored rather than sent to the MUD (Phase 2 features).
+
+    def _options(self, args: list[_Tok], scope: _Scope) -> set[str]:
+        """Option words like "NoDisplay|Current", lowercased, from every parameter given."""
+        return {
+            word.strip().lower()
+            for arg in args for word in self._expand(arg.text, scope).split("|") if word.strip()
+        }
+
+    def _execute_say(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#Say text [VoiceOnly|NoDisplay|NoVoice|...]``: speak the text and show it in the
+        output, unless an option says otherwise (manual 5.2.47)."""
+        text = self._expand(args[0].text, scope)
+        if not text.strip():
+            return
+        options = self._options(args[1:], scope)
+        incoming = not options & _OTHER_VOICES  # the Incoming voice, which #SetSpeech can mute
+        if "novoice" not in options and (not incoming or self._api.line_speech()):
+            self._api.speak(text)
+        if not options & {"nodisplay", "voiceonly"}:
+            self._api.echo(text)
+
+    def _execute_setspeech(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#SetSpeech voice-type On|Off|Stop``. The incoming voice reads the MUD's lines,
+        so switching it off and on is the speech mute; Stop flushes speech. Voices and rates
+        are genericMud's to choose, so the SAPI settings are ignored."""
+        voice = self._expand(args[0].text, scope).strip().lower()
+        mode = self._expand(args[1].text, scope).strip().lower()
+        if mode == "stop":
+            self._api.stop_speech()
+        elif voice == "incoming" and mode in ("off", "none"):
+            self._api.set_line_speech(False)
+        elif voice == "incoming" and mode in ("on", "sapi", "screenreader"):
+            self._api.set_line_speech(True)
+
+    def _execute_gagon(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#GagOn [Voice|Display|All]``: keep the MUD's lines from being spoken (Voice) or
+        from being shown and spoken (All, the default) until #UnGagOn. A line can't be hidden
+        from the screen and still spoken here, so Display alone changes nothing."""
+        mode = (self._options(args, scope) & {"voice", "display", "all"} or {"all"}).pop()
+        if mode == "display":
+            return
+        self._api.set_line_speech(False)
+        if mode == "all":
+            self._gagging_all = True
+            if self._gag_rule is None:
+                # After every other trigger, so an #UnGagOn on this very line wins.
+                self._gag_rule = self._api.add_trigger(
+                    r".", self._gag_everything, regex=True, priority=-1,
+                    name=self._engine_name(),
+                )
+
+    def _gag_everything(self, ctx: MatchContext) -> None:
+        if self._gagging_all:
+            ctx.line.gagged = True
+            ctx.line.display_when_gagged = False
+
+    def _execute_find(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#Find text [First|Next|Forward|Reverse]``: look through the output for a line
+        with the text in it and put the line in %FoundLine (empty when there's none)."""
+        needle = self._expand(args[0].text, scope).strip().casefold()
+        options = self._options(args[1:], scope)
+        lines = self._api.recent_lines(_FIND_LINES)
+        reverse = "reverse" in options
+        again = "next" in options and self._find_index is not None
+        if reverse:
+            start = self._find_index - 1 if again else len(lines) - 1
+            order = range(min(start, len(lines) - 1), -1, -1)
+        else:
+            order = range(self._find_index + 1 if again else 0, len(lines))
+        self._found_line, self._find_index = "", None
+        for index in order:
+            if needle and needle in lines[index].casefold():
+                self._found_line, self._find_index = lines[index], index
+                return
 
     def _resolve_in_pack(self, reference: str, *, must_exist: bool) -> Path | None:
         """Resolve a pack-relative path: an exact file under the pack dir, else the first match
@@ -1806,6 +1904,8 @@ class VipMudPack:
             return "1" if self._api.is_connected() else "0"
         if name == "clipboard":
             return self._clipboard
+        if name == "foundline":
+            return self._found_line
         if name == "volume":
             return str(self._master_volume)
         if name == "socket":
@@ -2021,7 +2121,11 @@ class VipMudPack:
         return "1" if _number(self._text_argument(args, 0, scope)) is not None else "0"
 
     def _function_lastline(self, args: list[str], scope: _Scope) -> str:
-        return ""
+        count = int(self._number_argument(args, 0, scope, 1))
+        if not 1 <= count <= _FIND_LINES:
+            return ""
+        lines = self._api.recent_lines(count)
+        return lines[0] if len(lines) == count else ""  # the count-th line from the bottom
 
     def _function_left(self, args: list[str], scope: _Scope) -> str:
         count = max(0, int(self._number_argument(args, 1, scope, 0)))

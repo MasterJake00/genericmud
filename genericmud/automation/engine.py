@@ -63,6 +63,9 @@ class EngineSink:
     def stop(self, channel: str) -> None: ...
     def music(self, file: str, channel: str = "music") -> None: ...
     def schedule(self, delay: float, callback: Callable[[], None]) -> object | None: ...
+    def recent_lines(self, count: int) -> list[str]:
+        """The last ``count`` lines of the output, oldest first."""
+        return []
 
 
 def wildcard_regex(pattern: str) -> str:

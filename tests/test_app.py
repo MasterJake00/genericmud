@@ -397,3 +397,18 @@ def test_a_line_filed_under_a_channel_shows_up_in_channel_review():
     assert app.buffer.lines()[-1].plain_text == "a line the pack built"
     assert app.buffer.lines()[-1].channel == "tell"
     assert "tell" in app.chan_review.channels()
+
+
+def test_a_substituted_line_is_shown_and_spoken_instead_of_the_original():
+    # VIPMud's #Sub: the line the trigger fired on is replaced by its text.
+    from genericmud.scripting.api import ScriptApi
+    from genericmud.scripting.vipmud_dialect import VipMudPack
+
+    app, backend, _sent, _posted = _app()
+    VipMudPack(ScriptApi(app.engine, source="vip")).load_source(
+        "#trigger {* tells you '*'} {#sub {%1: %2}}"
+    )
+    app.on_telnet_event(DataReceived(b"james tells you 'hi'\r\n"))
+    assert "james: hi" in backend.spoken
+    assert "james tells you 'hi'" not in backend.spoken
+    assert app.buffer.lines()[-1].plain_text == "james: hi"

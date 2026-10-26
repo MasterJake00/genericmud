@@ -23,6 +23,7 @@ class RecordingSink(EngineSink):
     musics: list[str] = field(default_factory=list)
     scheduled: list[tuple[float, Callable[[], None]]] = field(default_factory=list)
     speech_stops: int = 0
+    lines: list[str] = field(default_factory=list)  # the output window, oldest first
 
     def send(self, text: str) -> None:
         self.sent.append(text)
@@ -62,6 +63,9 @@ class RecordingSink(EngineSink):
 
     def schedule(self, delay: float, callback: Callable[[], None]) -> None:
         self.scheduled.append((delay, callback))
+
+    def recent_lines(self, count: int) -> list[str]:
+        return self.lines[-count:] if count > 0 else []
 
     def run_pending(self) -> None:
         """Fire all scheduled callbacks (ignoring delay) and clear the queue."""

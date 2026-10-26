@@ -195,6 +195,10 @@ class ScriptApi:
             return
         self._engine.sink.file_line(text, channel)
 
+    def recent_lines(self, count: int) -> list[str]:
+        """The last ``count`` lines of the output window, oldest first."""
+        return self._engine.sink.recent_lines(max(0, count))
+
     def is_connected(self) -> bool:
         return self._engine.connected
 

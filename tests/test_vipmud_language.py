@@ -783,3 +783,96 @@ def test_a_wildcard_number_can_come_from_a_variable():
     sink, engine, _pack = _load("#trigger {* and *} {#var which 2; #say {%{@which}}}")
     engine.process_line(Line("salt and pepper"))
     assert _said(sink) == ["pepper"]
+
+
+# --- output (manual 5.2.22, 5.2.24, 5.2.25, 5.2.47, 5.2.49, 5.2.51, 5.2.58, 5.3.16) ---
+
+
+def test_sub_replaces_the_line_and_other_triggers_still_see_the_original():
+    sink, engine, _pack = _load(
+        "#trigger {* tells you '*'} {#sub {%1: %2}}\n"
+        "#trigger {* tells you *} {#say told}\n"
+    )
+    line = engine.process_line(Line("james tells you 'hi'"))
+    assert line.substitute == "james: hi"
+    assert _said(sink) == ["told"]
+
+
+def test_say_shows_and_speaks_unless_told_otherwise():
+    sink, _engine, _pack = _load(
+        "#say {both}\n#say {heard} NoDisplay\n#say {seen} NoVoice\n"
+        "#say {voice} VoiceOnly|current\n#say {}\n"
+    )
+    assert _said(sink) == ["both", "heard", "voice"]
+    assert [text for text, _channel in sink.echoed] == ["both", "seen"]
+
+
+def test_setspeech_switches_incoming_speech_and_stops_speech():
+    sink, engine, _pack = _load(
+        "#key f10 {#SetSpeech Incoming Off}\n#key f11 {#SetSpeech Incoming On}\n"
+        "#key f12 {#setspeech all stop}\n"
+        "#key f1 {#say {said}}\n#key f2 {#say {quiet} VoiceOnly}\n"
+    )
+    engine.press_key("f10")
+    assert engine.line_speech is False
+    engine.press_key("f1")  # #say speaks in the Incoming voice, which is off
+    engine.press_key("f2")
+    engine.press_key("f11")
+    assert engine.line_speech is True
+    engine.press_key("f12")
+    assert _said(sink) == ["quiet"]
+    assert [text for text, _channel in sink.echoed] == ["said"]
+    assert sink.speech_stops == 1
+
+
+def test_gagon_voice_quiets_lines_until_ungagon():
+    # The manual's xp example: speech is gagged while the score scrolls past, and the last
+    # line gags itself because #UnGagOn ungags from the start of its own line.
+    _sink, engine, _pack = _load(
+        "#alias {xp} {#gagon voice;score}\n"
+        "#Trigger {You are a protected citizen.} {#ungagon;#gagline voice}\n"
+    )
+    engine.process_input("xp")
+    assert engine.line_speech is False
+    line = engine.process_line(Line("You are a protected citizen."))
+    assert engine.line_speech is True
+    assert line.gagged
+
+
+def test_gagon_all_hides_lines_until_ungagon():
+    _sink, engine, _pack = _load("#alias hush {#gagon all}\n#alias talk {#ungagon}\n")
+    engine.process_input("hush")
+    hidden = engine.process_line(Line("spam spam"))
+    engine.process_input("talk")
+    shown = engine.process_line(Line("hello"))
+    assert hidden.gagged and not hidden.display_when_gagged
+    assert not shown.gagged
+
+
+def test_ungagline_takes_back_a_gagline():
+    _sink, engine, _pack = _load("#trigger {spam} {#gagline all; #if {1} {#ungagline}}")
+    assert not engine.process_line(Line("spam")).gagged
+
+
+def test_lastline_reads_the_output_window_from_the_bottom():
+    sink, engine, _pack = _load(
+        "#key Control-1 {#say %lastline(1) NoDisplay}\n"
+        "#key Control-2 {#say {%lastline(2)} NoDisplay}\n"
+    )
+    sink.lines.extend(["first", "second", "third"])
+    engine.press_key("ctrl+1")
+    engine.press_key("ctrl+2")
+    assert _said(sink) == ["third", "second"]
+
+
+def test_find_puts_the_matching_line_in_foundline():
+    # Cosmic Rage's find keys: Control+F searches back from the bottom, F3 finds the next.
+    sink, engine, _pack = _load(
+        "#var temp {dragon}\n"
+        "#key f1 {#find {@temp} FIRST|Reverse ; #say {%foundline} NoDisplay}\n"
+        "#key f3 {#find {@temp} reverse|next ; #say {%foundline} NoDisplay}\n"
+    )
+    sink.lines.extend(["a red dragon", "a goblin", "the Dragon roars"])
+    for key in ("f1", "f3", "f3"):
+        engine.press_key(key)
+    assert _said(sink) == ["the Dragon roars", "a red dragon"]
