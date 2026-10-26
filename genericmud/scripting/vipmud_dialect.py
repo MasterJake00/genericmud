@@ -11,15 +11,14 @@ substitution inserts is not expanded again in the same pass, which is how packs 
 literal ``@``: ``~@`` comes through one pass as ``@``, and ``#Exec`` runs its expanded text
 as commands, a second pass.
 
-Conditions (``#If``, ``#Math``, ``%Eval``) are expressions with the manual's operators.
-Variables, wildcards and function results are single values there, so a value with an
-operator character in it stays one value; other text is a string operand.
+Conditions (``#If``, ``#While``, ``#Math``, ``%Eval``) are expressions with the manual's
+operators. A variable or wildcard goes into one as its text, quotes and all, as VIPMud
+substitutes before it evaluates; a function's result is one value; other text is a string.
 
-Definition commands (load time):
-    #TRIGGER <pat> {body}  / #TR <pat> {body}  / #GTRIGGER <pat> {body}  [{} AnyCase]
-    #ALIAS <pat> {body}    #KEY <key> {body}
-Patterns use VIPMud wildcards: ``*`` (any run), ``?`` (one char), and named
-wildcards ``&{name}`` / ``&name`` exposed at fire time as ``@name``.
+Triggers (``#Trigger {pattern} {commands} [class] [AnyCase]``) match the whole line: ``*``
+takes any run and numbers it, ``&{name}`` takes one into a variable, ``?`` is one
+character, ``[...]`` a character class. Aliases take the first word typed and keys a key
+name. A rule in a class works only while the class is enabled; classes start off.
 
 Server-controlled packs (e.g. Cosmic Rage) run through this: the MUD streams a
 ``$sphook play:path:vol:...`` line, the trigger captures the fields as ``@action``
