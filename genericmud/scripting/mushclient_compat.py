@@ -2909,17 +2909,13 @@ class MushclientPack:
             return 0
         return None
 
-    def _accelerator(self, key: object = "", send: object = "", *_rest: object) -> None:
+    def _accelerator(self, key: object = "", send: object = "", *_rest: object) -> int:
         """MUSHclient ``Accelerator(key, send)``: bind a hotkey that runs ``send`` as if
         typed. This is how a pack ships its keyboard UI -- Erion binds 54 of these
         (F1 hp report, F7 recall, the whole alt+arrows history browser) -- so a black
         hole here meant a pack loaded with zero working hotkeys (``pack.counts keys=0``).
         """
-        combo = _normalize_key_spec(key)
-        command = str(send or "")
-        if not combo or not command:
-            return
-        self._api.add_key(combo, lambda _ctx, cmd=command: self._api.execute(cmd))
+        return self._accelerator_to(key, send, _SEND_TO_EXECUTE_CODE)
 
     def _accelerator_to(
         self,
@@ -2928,12 +2924,24 @@ class MushclientPack:
         destination: object = 0,
         *_rest: object,
     ) -> int:
-        """Bind a key to Lua when ``sendto.script`` is requested, else typed input."""
+        """Bind a key to Lua when ``sendto.script`` is requested, else typed input.
+
+        Answers as MUSHclient's methods_accelerators.cpp does: eOK, eBadParameter for a key
+        it can't read, eOptionOutOfRange for a send-to code that doesn't exist. Materia
+        Magica's accelerators plugin reports every key it loads as failed unless it hears 0.
+        Nothing to send takes the key's binding away, as in MUSHclient.
+        """
+        target = int(_to_float(destination) or 0)
+        if not 0 <= target <= _SEND_TO_LAST_CODE:
+            return ERROR_CODES["eOptionOutOfRange"]
         combo = _normalize_key_spec(key)
+        if not combo:
+            return ERROR_CODES["eBadParameter"]
         command = str(send or "")
-        if not combo or not command:
-            return 1
-        if int(_to_float(destination) or 0) == int(_SEND_TO_SCRIPT):
+        if not command:
+            self._api.remove_key(combo)
+            return _SCRIPT_ERROR_OK
+        if target == int(_SEND_TO_SCRIPT):
             callback = self._compile(command)
             plugin = self._current_plugin
             self._api.add_key(

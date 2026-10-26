@@ -1209,6 +1209,24 @@ def test_accelerator_to_binds_script_hotkey(tmp_path):
     assert sink.sent == ["status"]
 
 
+def test_accelerator_answers_like_mushclient_and_unbinds(tmp_path):
+    # Materia Magica's accelerators plugin checks for 0 after each Accelerator call and
+    # announced every key it bound as an error when it got nothing back.
+    sink, engine, _pack = _make_pack(
+        tmp_path,
+        "<muclient><script><![CDATA["
+        "Send(Accelerator('ctrl + f12', 'look'))\n"
+        "Send(Accelerator('ctrl+alt', 'look'))\n"
+        "Send(AcceleratorTo('f8', 'look', 99))\n"
+        "Send(Accelerator('f7', 'score'))\n"
+        "Send(Accelerator('f7', ''))\n"
+        "]]></script></muclient>",
+    )
+    assert sink.sent == ["0", "30046", "30026", "0", "0"]
+    assert engine.press_key("ctrl+f12")
+    assert not engine.press_key("f7")  # an empty command takes the key away
+
+
 def test_addtriggerex_oneshot_and_replace(tmp_path):
     """Erion's F-key reports: the hotkey alias AddTriggerEx's a OneShot+Replace trigger
     (flags built with bit.bor over trigger_flag constants -- all previously black-holed)
