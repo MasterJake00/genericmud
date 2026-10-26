@@ -7,6 +7,22 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.18.1 — 2026-10-26
+
+**MUSHclient soundpacks**
+
+* Each plugin in a MUSHclient pack keeps its own functions and settings
+  tables, as in MUSHclient. Plugins that used the same names, like the V.I.
+  Mush bundle's init_stuff and save_config, ran each other's code instead of
+  their own.
+* The V.I. Mush bundle no longer sends a line of junk to Materia Magica each
+  time the MUD updates your room or character.
+* Materia Magica's accelerators plugin binds its hotkeys without announcing
+  an error for each one.
+* yugioh's volume keys, F9 to F12, and its volume commands work. A pack's
+  world script now hears the world open, connect, disconnect and close.
+* Mush-Z's logging commands, like mushz logging debug, work.
+
 ## 0.18.0 — 2026-10-26
 
 **MUSHclient soundpacks**
