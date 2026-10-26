@@ -39,9 +39,9 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
-from genericmud.automation.engine import MatchContext
+from genericmud.automation.engine import _MATCH_KWARGS, MatchContext, _matcher, _MatchTimeout
 from genericmud.model.buffer import Line
-from genericmud.safepath import confine
+from genericmud.safepath import confine, is_absolute, within
 from genericmud.scripting.api import ScriptApi
 
 # VIPMud's commands, by full name. A pack may write any start of a name (#Tr, #Exec, #For,
@@ -71,6 +71,7 @@ _UNKEY_COMMANDS = {"UNKEY", "GUNKEY"}
 _SEQUENTIAL_HANDLES = frozenset("12345")  # #File handles 1-5 are text files; 6-10 records
 _SEND_LIMIT = 1000  # lines #Send sends from one file
 _PROTECTED_SUFFIXES = (".exe", ".dll", ".ini", ".cfg", ".hlp")  # #DelFile won't (manual)
+_WRITES_FILES_RE = re.compile(r"#write\b", re.IGNORECASE)
 
 
 @lru_cache(maxsize=512)
@@ -82,10 +83,14 @@ def _command_name(written: str) -> str:
 _CLASS_ON = {"enable", "enabled", "on"}
 _CLASS_OFF = {"disable", "disabled", "off"}
 _SOUND_VARIANT_RE = re.compile(r"\*(\d+)(\.\w+)$")  # "name*N.ext": one random variant of 1..N
-# Named/positional wildcards inside a .set pattern: &{name}, &name, *, ?
-_PATTERN_WILDCARD_RE = re.compile(r"&\{(\w+)\}|&(\w+)|(\*)|(\?)")
+# The wildcards that take any run in a .set pattern (&{name}, &name, *), and the ones that
+# take one character each, a run of them making one wildcard.
+_PATTERN_WILDCARD_RE = re.compile(r"&\{(\w+)\}|&(\w+)|(\*)")
+_SINGLE_WILDCARDS = {"?": ".", "#": "[0-9]", "%": "[A-Za-z]"}
+# What makes an alias name a pattern rather than a word.
+_ALIAS_PATTERN_RE = re.compile(r"&\{\w+\}|&\w+|[*?]")
 # A bare "@name = value" statement is an assignment, not text to send.
-_ASSIGN_RE = re.compile(r"^@(\w+)\s*=\s*(.*)$")
+_ASSIGN_RE = re.compile(r"^@(\w+)\s*=\s*(.*)$", re.DOTALL)
 
 
 def _fold(name: str) -> str:
@@ -107,6 +112,9 @@ _DEFAULT_VOLUME = 100
 # times, and one script (with everything it calls) runs at most this many commands.
 _LOOP_LIMIT = 10_000
 _STEP_LIMIT = 50_000
+# And it gets this many seconds: a rule's script or a resumed #Wait two, a file loading ten.
+_SCRIPT_SECONDS = 2.0
+_LOAD_SECONDS = 10.0
 _REPEAT_LIMIT = 32_767  # #N {commands}: the manual's range is 1 to 32767
 # Function calls nest this deep at most; deeper ones are left as written. Packs nest a few
 # levels, and text a MUD can get run through #Exec would otherwise cost the client its stack,
@@ -260,6 +268,11 @@ def tokenize_statements(source: str) -> list[tuple[str | None, list[_Tok]]]:
                     while i < n and source[i] != "\n":
                         i += 1
                     break
+                if source[i] == "{":
+                    # A braced parameter runs to its closing brace, over lines and semicolons:
+                    # Miriani's spabout prints a credits block written over eight lines.
+                    _inner, i = _scan_block(source, i)
+                    continue
                 i += 2 if source[i] == _ESCAPE else 1
             text = source[line_start : i if line_end is None else line_end].strip()
             if text:
@@ -291,6 +304,39 @@ def linked_vipmud_scripts(pack_dir: str | Path) -> Path | None:
         return None
     mains = [path for path in sorted(scripts.iterdir()) if path.name.lower() == "main.set"]
     return mains[0] if mains else None
+
+
+def _read_script(path: Path) -> str:
+    """A .set file's text with every line ending CRLF, as VIPMud on Windows reads it. Packs
+    split multi-line values on %CRLF (Miriani's option tables), and a pack checked out by
+    git on Linux or macOS has bare newlines."""
+    text = path.read_bytes().decode("latin-1")
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+
+def _split_parameters(text: str) -> list[str]:
+    """What was typed after an alias, as VIPMud numbers it: each word is a parameter, and a
+    {braced} one keeps its spaces and loses its braces ("{} {Quiet}" is an empty first
+    parameter and "Quiet")."""
+    parameters: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] in " \t\r\n":
+            i += 1
+            continue
+        if text[i] == "{":
+            inner, i = _scan_block(text, i)
+            parameters.append(inner)
+            continue
+        start = i
+        while i < n and text[i] not in " \t\r\n":
+            if text[i] == "{" and text[i - 1] in "@%":
+                _inner, i = _scan_block(text, i)  # @{name} belongs to the word
+                continue
+            i += 2 if text[i] == _ESCAPE else 1
+        parameters.append(text[start:i])
+    return parameters
 
 
 def _scan_char_class(pattern: str, start: int) -> int | None:
@@ -342,13 +388,15 @@ def _char_class(source: str) -> str:
 
 
 def vip_pattern_to_regex(pattern: str) -> str:
-    """Convert a VIPMud wildcard pattern to a regex with named/numbered captures.
+    """Convert a VIPMud pattern to a regex, numbering wildcards for %1 to %99 in order.
 
-    ``&{name}``/``&name`` -> a named group (read at fire time as ``@name``); ``*`` ->
-    a numbered group; ``?`` -> any one character, without a number of its own (only the
-    asterisks number the wildcards); ``~`` makes the next character literal. A wildcard at
-    the very end takes the rest (greedy); a bounded one is non-greedy so the following
-    literal delimits it.
+    ``*`` takes any run (all the rest at the very end, otherwise up to the next literal);
+    ``&{name}``/``&name`` the same into @name; a run of ``?`` (any character), ``#`` (a
+    digit) or ``%`` (a letter) is one wildcard; a ``[...]`` class is one character
+    (``[!...]`` for "not these"). Miriani's history trigger ``[[]##/##/#### - *:* [ap].m.]
+    (*) *`` reads them back as %1 to %8. A class of one character is how packs write a
+    wildcard character literally (``[[]``, ``[%]``, ``[#]``), so it takes no number, and
+    neither does a character after ``~``.
 
     ``[...]`` is a character class and passes through, because that is what VIPMud does and
     packs depend on it: channel triggers are written ``[[]*] * *`` to match a line like
@@ -373,8 +421,22 @@ def vip_pattern_to_regex(pattern: str) -> str:
                 i += 1
                 continue
             out.append(re.escape(pattern[literal_start:i]))
-            out.append(_char_class(pattern[i:close]))
+            group = pattern[i:close]
+            if len(group) == 3:  # [[] [%] [#]: one character, written literally
+                out.append(re.escape(group[1]))
+            else:
+                regex = _char_class(group)
+                out.append(f"({regex})" if regex.startswith("[") else regex)
             i = literal_start = close
+            continue
+        if pattern[i] in _SINGLE_WILDCARDS:
+            run = i
+            while run < end and pattern[run] == pattern[i]:
+                run += 1
+            out.append(re.escape(pattern[literal_start:i]))
+            unit = _SINGLE_WILDCARDS[pattern[i]]
+            out.append(f"({unit}{{{run - i}}})" if run - i > 1 else f"({unit})")
+            i = literal_start = run
             continue
         match = _PATTERN_WILDCARD_RE.match(pattern, i)
         if match is None:
@@ -386,21 +448,20 @@ def vip_pattern_to_regex(pattern: str) -> str:
         if name and name.isidentifier() and name not in names:
             names.add(name)
             out.append(f"(?P<{name}>{body})")
-        elif name or match.group(3):  # * (or a name a regex group can't carry)
+        else:  # * (or a name a regex group can't carry)
             out.append(f"({body})")
-        else:  # ?
-            out.append(".")
         i = literal_start = match.end()
     out.append(re.escape(pattern[literal_start:]))
     return "".join(out)
 
 
 @lru_cache(maxsize=256)
-def _wildcard_compare_regex(pattern: str) -> re.Pattern[str] | None:
-    """The ``=*`` operator's pattern: a whole-value match, the way a trigger matches a line."""
+def _wildcard_compare_regex(pattern: str):
+    """The ``=*`` operator's pattern: a whole-value match, the way a trigger matches a line,
+    on the engine's matcher with its time limit (both sides can come from the MUD)."""
     try:
-        return re.compile(f"^{vip_pattern_to_regex(pattern)}$", re.IGNORECASE | re.DOTALL)
-    except re.error:
+        return _matcher.compile(f"^{vip_pattern_to_regex(pattern)}$", re.IGNORECASE | re.DOTALL)
+    except Exception:  # noqa: BLE001 - re.error or regex.error: a bad pattern matches nothing
         return None
 
 
@@ -704,14 +765,18 @@ class _ExpressionParser:
     def _compare(operator: str, left: _Value, right: _Value) -> str:
         if operator == "=*":
             regex = _wildcard_compare_regex(right.text)
-            return "1" if regex is not None and regex.match(left.text) else "0"
+            try:
+                matched = regex is not None and regex.match(left.text, **_MATCH_KWARGS)
+            except _MatchTimeout:
+                matched = False
+            return "1" if matched else "0"
         a, b = _number(left.text), _number(right.text)
-        if operator in ("<", ">", "<=", ">="):
-            # An unset variable is zero next to a number, as with VIPMud's Explicit off.
-            if a is None and not left.text.strip() and b is not None:
-                a = 0
-            if b is None and not right.text.strip() and a is not None:
-                b = 0
+        # An unset variable is zero next to a number, as with VIPMud's Explicit off: the
+        # manual's prompt example compares @endurFlag with 0 before ever setting it.
+        if a is None and not left.text.strip() and b is not None:
+            a = 0
+        if b is None and not right.text.strip() and a is not None:
+            b = 0
         if a is not None and b is not None:
             x: object = a
             y: object = b
@@ -960,6 +1025,8 @@ class VipMudPack:
         self._alarms: dict[int, _Alarm] = {}  # by the number #Alarm hands its variable
         self._alarm_count = 0
         self._run_depth = 0  # scripts running inside one another (an alias calling an alias)
+        self._deadline = 0.0  # when the outermost running script runs out of time
+        self._budget_noted = False  # the diagnostic log has heard about this script stopping
         self._call_depth = 0  # %functions being evaluated inside one another
         self._found_line = ""  # %FoundLine, from #Find
         self._find_index: int | None = None  # where #Find last found, for "next"
@@ -986,9 +1053,12 @@ class VipMudPack:
         # script path) to the pack dir so @sppath/x.wav resolves to bundled sounds.
         # Default @sppath/@scpath to the pack dir, but don't clobber a value the session
         # pre-set from world.sounds (so a world can point at its own sound folder).
-        # Names this pack has set. VIPMud starts every session without them; the app keeps
-        # them out of what it saves for the next session.
+        # Names this pack has set, and whether the pack saves what it wants in files of its
+        # own. VIPMud starts a session without variables unless the player keeps them, so the
+        # app leaves out a pack's variables when it saves its own settings (Miriani warns
+        # when variables were kept) and keeps them when it doesn't (COGG's volume).
         self.written_variables: set[str] = set()
+        self.saves_its_own_settings = False
         self._entry: Path | None = None  # the start-up script, for #Reload
         base = api.base_dir
         if base:
@@ -1259,7 +1329,7 @@ class VipMudPack:
         """Run commands as one script (a rule firing, an alarm, a file loading): an #Abort
         of either kind ends it here."""
         if self._run_depth == 0:
-            self._steps = 0  # the budget covers this script and everything it calls
+            self._start_budget(_SCRIPT_SECONDS)  # covers this script and everything it calls
         self._run_depth += 1
         try:
             self._execute_body(body, scope)
@@ -1294,11 +1364,11 @@ class VipMudPack:
         ("gt *") is a pattern instead, and has to match the whole command.
         """
         engine_name = self._engine_name()
-        if _PATTERN_WILDCARD_RE.search(name) or name.split() != [name]:
-            pattern = f"(?i)^{vip_pattern_to_regex(name)}$"
+        if _ALIAS_PATTERN_RE.search(name) or name.split() != [name]:
+            pattern = f"(?is)^{vip_pattern_to_regex(name)}$"
             rule = self._api.add_alias(pattern, self._runner(body), regex=True, name=engine_name)
         else:
-            pattern = rf"(?i)^{re.escape(name)}(?:\s+(.*?))?\s*$"
+            pattern = rf"(?is)^{re.escape(name)}(?:\s+(.*?))?\s*$"
             rule = self._api.add_alias(
                 pattern, self._alias_runner(body), regex=True, name=engine_name
             )
@@ -1310,8 +1380,8 @@ class VipMudPack:
     def _alias_runner(self, body: str):
         def run(ctx: MatchContext) -> None:
             parameters = ctx.wildcards[1] if len(ctx.wildcards) > 1 else ""
-            # %0 is everything typed after the alias name; %1.. are its words in turn.
-            self._run_rule(body, _Scope([parameters, *parameters.split()], ctx.line))
+            # %0 is everything typed after the alias name; %1.. are its parameters in turn.
+            self._run_rule(body, _Scope([parameters, *_split_parameters(parameters)], ctx.line))
 
         return run
 
@@ -1326,17 +1396,29 @@ class VipMudPack:
     def _execute_body(self, body: str, scope: _Scope) -> None:
         self._run_statements(tokenize_statements(body), 0, scope)
 
+    def _start_budget(self, seconds: float) -> None:
+        self._steps = 0
+        self._deadline = time.monotonic() + seconds
+        self._budget_noted = False
+
+    def _tick(self) -> None:
+        """Count a command or a loop's pass against the running script's budget. Text a pack
+        runs with #Exec can come from the MUD, so no script gets to keep the client busy."""
+        self._steps += 1
+        if self._steps <= _STEP_LIMIT and time.monotonic() <= self._deadline:
+            return
+        if not self._budget_noted and self._api.diag is not None:
+            self._budget_noted = True
+            self._api.diag.event("vipmud.script_stopped", source=self._api.source,
+                                 reason="ran too long", commands=self._steps)
+        raise _AbortScript
+
     def _run_statements(
         self, statements: list[tuple[str | None, list[_Tok]]], start: int, scope: _Scope
     ) -> None:
         for index in range(start, len(statements)):
             command, args = statements[index]
-            self._steps += 1
-            if self._steps > _STEP_LIMIT:
-                if self._steps == _STEP_LIMIT + 1 and self._api.diag is not None:
-                    self._api.diag.event("vipmud.script_stopped", source=self._api.source,
-                                         reason="ran too many commands")
-                raise _AbortScript
+            self._tick()
             if command == "WAIT":
                 # #Wait holds the rest of these commands for a while. Only this list waits:
                 # whatever called it carries on, which is all the packs' #Waits need.
@@ -1352,22 +1434,35 @@ class VipMudPack:
     def _resume(
         self, statements: list[tuple[str | None, list[_Tok]]], start: int, scope: _Scope
     ) -> None:
-        self._steps = 0
+        """The rest of a script after its #Wait: a script of its own, with its own budget,
+        which whatever it calls shares."""
+        self._start_budget(_SCRIPT_SECONDS)
+        self._run_depth += 1
         try:
             self._run_statements(statements, start, scope)
         except _ABORTS:
             pass
+        except Exception as error:  # noqa: BLE001 - as in _run_rule
+            if self._api.diag is not None:
+                self._api.diag.event(
+                    "script.error", source=self._api.source or "?",
+                    error=f"{type(error).__name__}: {error}"[:300],
+                )
+        finally:
+            self._run_depth -= 1
 
     def _delay(self, args: list[_Tok], scope: _Scope) -> float | None:
-        """Seconds for #Wait and #Alarm. Packs build them with the decimal separator their
-        system uses ("0,50"), so a comma is a decimal point here; "(0.1)" works too."""
+        """Seconds for #Wait and #Alarm, worked out once from what the script wrote (a time
+        from the MUD stays text). Packs build them with the decimal separator their system
+        uses ("0,50"), so a comma is a decimal point here; "(0.1)" works too."""
         if not args:
             return None
-        text = self._expand(args[0].text, scope).strip().replace(",", ".")
-        number = _number(text)
+        value = self._evaluate(args[0].text, scope)
+        if value is None:
+            return None
+        number = _number(value)
         if number is None:
-            value = self._evaluate(text, scope)
-            number = _number(value) if value is not None else None
+            number = _number(value.replace(",", "."))
         return float(number) if number is not None else None
 
     def _execute_statement(self, command: str | None, args: list[_Tok], scope: _Scope) -> None:
@@ -1423,8 +1518,10 @@ class VipMudPack:
                 self._api.set_gvar(name, value)
             else:
                 self._set_var(name, value)
-        elif command in ("UNVARIABLE", "GUNVARIABLE") and args:
+        elif command == "UNVARIABLE" and args:
             self._api.delete_var(_fold(self._expand(args[0].text, scope)))
+        elif command == "GUNVARIABLE" and args:
+            self._api.delete_gvar(_fold(self._expand(args[0].text, scope)))
         elif command in ("MATH", "GMATH") and len(args) > 1:
             self._execute_math(args, scope)
         elif command in ("ADDITEM", "GADDITEM") and len(args) > 1:
@@ -1626,7 +1723,7 @@ class VipMudPack:
         linked = linked_vipmud_scripts(self._base_dir) if self._base_dir else None
         real = (linked or Path(path)).resolve()
         self._entry = real
-        self._load_path(real, keep=False, source=real.read_text(encoding="latin-1"))
+        self._load_path(real, keep=False, source=_read_script(real))
 
     def _reload(self) -> None:
         """``#Reload`` (manual 5.2.44): remove every trigger, alias, key and variable the
@@ -1669,20 +1766,24 @@ class VipMudPack:
             return
         if source is None:
             try:
-                source = real.read_text(encoding="latin-1", errors="ignore")
+                source = _read_script(real)
             except OSError:
                 return
+        if _WRITES_FILES_RE.search(source):
+            self.saves_its_own_settings = True
         if key in self._loaded and not keep:
             self._unload(key)
         self._loaded.add(key)
         self._loading.append(key)
-        steps = self._steps
-        self._steps = 0  # each file has its own budget: a big pack is many commands
+        budget = (self._steps, self._deadline, self._budget_noted)
+        self._start_budget(_LOAD_SECONDS)  # each file has its own: a big pack is many commands
+        self._run_depth += 1  # so the file's own script doesn't start a smaller budget
         try:
             self._run_rule(source, _Scope([]))
         finally:
+            self._run_depth -= 1
             self._loading.pop()
-            self._steps = steps
+            self._steps, self._deadline, self._budget_noted = budget
 
     def _unload(self, key: str) -> None:
         """``#UnLoad``: remove the triggers, aliases and keys a file defined."""
@@ -1790,7 +1891,12 @@ class VipMudPack:
         Not a same-named file somewhere else in the pack, which reading can fall back on."""
         if not self._base_dir:
             return None
-        return confine(Path(self._base_dir).resolve(), reference.strip())
+        base = Path(self._base_dir).resolve()
+        reference = reference.strip()
+        if is_absolute(reference):  # built from %HomeFolder, say
+            path = Path(reference.replace("\\", "/") if os.sep == "/" else reference)
+            return path.resolve() if within(base, path) and path.resolve() != base else None
+        return confine(base, reference)
 
     def _close_file(self, handle: str) -> None:
         """``#Close handle``: flush a written record file back to disk and drop the handle."""
@@ -1939,6 +2045,7 @@ class VipMudPack:
         body = args[1].text
         items = [item.strip() for item in self._expand(args[0].text, scope).split("|")]
         for number, item in enumerate([item for item in items if item][:_LOOP_LIMIT], 1):
+            self._tick()
             try:
                 self._execute_body(body, scope.looping(item, number))
             except _AbortLevel:
@@ -1950,6 +2057,7 @@ class VipMudPack:
         if not args:
             return
         for number in range(1, min(count, _REPEAT_LIMIT) + 1):
+            self._tick()
             try:
                 self._execute_body(args[0].text, scope.looping(str(number), number))
             except _AbortLevel:
@@ -1959,6 +2067,7 @@ class VipMudPack:
         """``#While {condition} {commands}`` runs while the condition holds; ``#Until``
         runs the commands first and stops once it holds."""
         for _ in range(_LOOP_LIMIT):
+            self._tick()
             if not until and not self._condition(args[0].text, scope):
                 return
             try:
@@ -2232,27 +2341,31 @@ class VipMudPack:
 
     # --- expressions ---
 
-    def _evaluate(self, expression: str, scope: _Scope) -> str | None:
-        """The value of a VIPMud expression, or None when it can't be evaluated."""
+    def _evaluate(self, expression: str, scope: _Scope, *, as_text: bool = False) -> str | None:
+        """The value of a VIPMud expression, or None when it can't be evaluated; with
+        ``as_text``, its expanded text instead of None. Either way it's worked out once:
+        expanding it again would run its functions a second time."""
         if len(expression) > _EXPRESSION_MAX_LENGTH:
             return None
         try:
-            return _ExpressionParser(self._expression_tokens(expression, scope)).parse()
+            tokens = self._expression_tokens(expression, scope)
         except (_ExpressionError, RecursionError):
             return None
+        try:
+            return _ExpressionParser(tokens).parse()
+        except (_ExpressionError, RecursionError):
+            return "".join(token.source for token in tokens).strip() if as_text else None
 
     def _condition(self, expression: str, scope: _Scope) -> bool:
         value = self._evaluate(expression, scope)
         return value is not None and _truthy(value)
 
-    def _expression_tokens(
-        self, text: str, scope: _Scope, *, data: bool = False
-    ) -> list[_ExpressionToken]:
-        """Tokens of an expression. A variable or wildcard goes in as its text, so quotes
-        and operators in it count, the way VIPMud substitutes before it evaluates (Cosmic
-        Rage stores "enabled" with its quotes and compares it to "enabled"). That text is
-        ``data``: an @, % or ~ in it stays an ordinary character. A function's result is
-        one value whatever it contains."""
+    def _expression_tokens(self, text: str, scope: _Scope) -> list[_ExpressionToken]:
+        """Tokens of an expression. A variable, wildcard or function is one value whatever
+        it holds, so MUD text with "and", "or" or parentheses in it can't change what a
+        condition means (Miriani compares camera feeds like "(Bridge) (Bob) says hi" with
+        =*). A value that is all one quoted string counts without its quotes: Cosmic Rage
+        stores its settings with them and compares @intromusic = "enabled"."""
         tokens: list[_ExpressionToken] = []
         depth = 0
         i = 0
@@ -2266,7 +2379,7 @@ class VipMudPack:
                 tokens.append(_ExpressionToken("space", text[i:j]))
                 i = j
                 continue
-            if c == _ESCAPE and i + 1 < n and not data:
+            if c == _ESCAPE and i + 1 < n:
                 tokens.append(_ExpressionToken("value", text[i + 1]))
                 i += 2
                 continue
@@ -2274,28 +2387,22 @@ class VipMudPack:
                 end = _skip_quoted(text, i)
                 closed = end - 1 > i and text[end - 1] == '"'
                 inner = text[i + 1 : end - 1] if closed else text[i + 1 :]
-                value = inner if data else self._expand(inner, scope)
-                tokens.append(_ExpressionToken("value", value, quoted=True))
+                tokens.append(_ExpressionToken("value", self._expand(inner, scope), quoted=True))
                 i = end
                 continue
-            if c in "@%" and not data:
-                if c == "@":
-                    found = self._scan_variable(text, i, scope)
-                    substituted = True
-                else:
-                    substituted = i + 1 < n and (text[i + 1].isdigit() or text[i + 1] == "{")
-                    found = self._scan_percent(text, i, scope)
-                if found is not None:
-                    value, i = found
-                    if substituted:  # a variable or wildcard: its text joins the expression
-                        text_tokens = self._expression_tokens(value, scope, data=True)
-                        if all(token.kind == "space" for token in text_tokens):
-                            # Unset or blank is still an operand: "" and 0 in arithmetic.
-                            text_tokens = [_ExpressionToken("value", "")]
-                        tokens.extend(text_tokens)
-                    else:  # a function or system variable: one value
-                        tokens.append(_ExpressionToken("value", value))
-                    continue
+            found = None
+            if c == "@":
+                found = self._scan_variable(text, i, scope)
+            elif c == "%":
+                found = self._scan_percent(text, i, scope)
+            if found is not None:
+                value, i = found
+                stripped = value.strip()
+                quoted = len(stripped) >= 2 and stripped[0] == stripped[-1] == '"'
+                tokens.append(
+                    _ExpressionToken("value", stripped[1:-1] if quoted else stripped, quoted)
+                )
+                continue
             if c in "()":
                 depth = depth + 1 if c == "(" else max(0, depth - 1)
                 if depth > _EXPRESSION_MAX_DEPTH:
@@ -2413,9 +2520,7 @@ class VipMudPack:
         return "1" if opened.position >= len(self._text_lines(opened)) else "0"
 
     def _function_eval(self, args: list[str], scope: _Scope) -> str:
-        expression = ",".join(args)
-        value = self._evaluate(expression, scope)
-        return value if value is not None else self._expand(expression, scope)
+        return self._evaluate(",".join(args), scope, as_text=True) or ""
 
     def _function_expand(self, args: list[str], scope: _Scope) -> str:
         return self._expand(",".join(args), scope)

@@ -191,7 +191,11 @@ def test_a_vipmud_packs_variables_start_fresh_each_session(tmp_path):
     # were kept; genericMud kept them all.
     store = PackStore(tmp_path / "store")
     src = tmp_path / "pack.set"
-    src.write_text("#if {%defined(aaah)=1} {#say kept} {#var aaah 0}\n", encoding="latin-1")
+    src.write_text(
+        "#if {%defined(aaah)=1} {#say kept} {#var aaah 0}\n"
+        "#alias spsave {#file 6 {settings.set};#write 6 {1} 1;#close 6}\n",  # saves its own
+        encoding="latin-1",
+    )
     store.install(src, world="miriani", trust=True)
 
     def session():
@@ -207,3 +211,28 @@ def test_a_vipmud_packs_variables_start_fresh_each_session(tmp_path):
     second.on_connect("miriani")
     assert "kept" not in backend.spoken
     assert second.engine.get_var("UserSetting") == "kept by genericMud"
+
+
+def test_a_vipmud_pack_that_keeps_no_files_keeps_its_variables(tmp_path):
+    # COGG keeps its volume in @vol and never writes a file; VIP Mud's Simple mode and Keep
+    # Variables saved that for it, and genericMud does the same.
+    store = PackStore(tmp_path / "store")
+    src = tmp_path / "cogg.set"
+    src.write_text(
+        "#if {%defined(vol)=0} {#var vol 10}\n#key F10 {#math vol {@vol + 5}}\n",
+        encoding="latin-1",
+    )
+    store.install(src, world="cogg", trust=True)
+
+    def session():
+        voice = VoiceRouter(RecordingBackend(), clock=lambda: 0.0)
+        return EngineApp(voice, packs=store, name="cogg")
+
+    first = session()
+    first.on_connect("cogg")
+    first.engine.press_key("f10")
+    first.shutdown()
+    second = session()
+    second.on_connect("cogg")
+    second.engine.press_key("f10")
+    assert second.engine.get_var("vol") == "20"

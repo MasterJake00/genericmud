@@ -121,6 +121,7 @@ def test_scriptapi_resolve_unsafe_falls_back_to_sounds_dir(tmp_path):
     (sounds / "hit.wav").write_bytes(b"x")
     engine = AutomationEngine()
     engine.set_var("sppath", str(sounds))
+    engine.sounds_dir = str(sounds)  # the player's sounds folder, as the window sets it
     api = ScriptApi(engine, base_dir=str(tmp_path / "pack"))
     (tmp_path / "pack").mkdir()
     assert api._resolve("C:/anywhere/hit.wav")[0] == str(sounds / "hit.wav")

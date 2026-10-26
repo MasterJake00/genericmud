@@ -22,6 +22,13 @@ def _api(base_dir: str) -> ScriptApi:
     return ScriptApi(AutomationEngine(RecordingSink()), base_dir=base_dir)
 
 
+def _use_sounds_folder(api: ScriptApi, folder) -> None:
+    """Point @sppath at the player's own sounds folder, as the window does from the world's
+    settings: the variable, and the engine's record that the folder is the player's."""
+    api.set_var("sppath", str(folder))
+    api._engine.sounds_dir = str(folder)
+
+
 def test_resolve_keeps_existing_pack_path(tmp_path):
     sound = tmp_path / "beep.wav"
     sound.write_bytes(b"RIFF")
@@ -35,7 +42,7 @@ def test_resolve_falls_back_to_sounds_folder_by_basename(tmp_path):
     real = sounds / "fx" / "boom.wav"
     real.write_bytes(b"RIFF")
     api = _api(str(pack))
-    api.set_var("sppath", str(sounds))
+    _use_sounds_folder(api, sounds)
     # The pack points at <pack>/boom.wav (missing); the Sounds folder rescues it by basename.
     assert api._resolve("boom.wav")[0] == str(real)
 
@@ -47,7 +54,7 @@ def test_resolve_tolerates_an_upstream_doubled_extension(tmp_path):
     real = sounds / "CrossbowFire2.wav.wav"
     real.write_bytes(b"RIFF")
     api = _api(str(pack))
-    api.set_var("sppath", str(sounds))
+    _use_sounds_folder(api, sounds)
     resolved, exists = api._resolve("Cogg\\Combat\\CrossbowFire2.wav")
     assert exists
     assert resolved == str(real)
@@ -59,7 +66,7 @@ def test_resolve_finds_windows_authored_path_by_basename(tmp_path):
     sounds.mkdir()
     (sounds / "boom.wav").write_bytes(b"RIFF")
     api = _api(str(pack))
-    api.set_var("sppath", str(sounds))
+    _use_sounds_folder(api, sounds)
     # A MUSHclient/VIPMud pack may reference sounds with backslashes; the leaf must still
     # resolve via the Sounds folder on Linux, where "\" isn't a path separator.
     assert api._resolve("sub\\boom.wav")[0] == str(sounds / "boom.wav")
@@ -89,7 +96,7 @@ def test_resolve_traces_the_sppath_fallback(tmp_path):
     engine = AutomationEngine(RecordingSink())
     engine.diag = RecordingDiag()
     api = ScriptApi(engine, base_dir=str(pack))
-    api.set_var("sppath", str(sounds))
+    _use_sounds_folder(api, sounds)
     api._resolve("boom.wav")  # missing in pack, rescued from the Sounds folder
     fields = engine.diag.fields("play.resolve")
     assert fields["fallback"] == "sppath" and fields["exists"] is True
@@ -126,7 +133,7 @@ def test_sounds_folder_fallback_prefers_the_relative_path_over_the_basename(tmp_
     real = sounds / "social" / "hit.wav"
     real.write_bytes(b"RIFF")
     api = _api(str(pack))
-    api.set_var("sppath", str(sounds))
+    _use_sounds_folder(api, sounds)
     # Wrong-case, backslash-separated, and missing from the pack dir: the relative
     # index must still pick social/, not combat/'s identically-named leaf.
     assert _resolves_to(api._resolve("Social\\Hit.wav")[0], real)
@@ -143,5 +150,5 @@ def test_sounds_folder_fallback_reduces_an_absolute_request_to_its_relative_form
     real = sounds / "comm" / "beep.wav"
     real.write_bytes(b"RIFF")
     api = _api(str(pack))
-    api.set_var("sppath", str(sounds))
+    _use_sounds_folder(api, sounds)
     assert _resolves_to(api._resolve(str(sounds) + "/Comm/Beep.wav")[0], real)

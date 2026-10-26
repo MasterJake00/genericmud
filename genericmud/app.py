@@ -686,9 +686,11 @@ class EngineApp:
         if path is None:
             return
         # sppath is wiring (where THIS install keeps its sounds), not a user setting;
-        # persisting it would pin a moved/reinstalled pack to its old location. VIPMud packs
-        # start each session without their variables and save what they want themselves.
-        transient = {"sppath"}.union(*(pack.written_variables for pack in self._vip_packs))
+        # persisting it would pin a moved/reinstalled pack to its old location. A VIPMud pack
+        # that saves its settings in its own files starts each session without its variables.
+        transient = {"sppath"}.union(*(
+            pack.written_variables for pack in self._vip_packs if pack.saves_its_own_settings
+        ))
         data = {k: v for k, v in self.engine.all_vars().items() if k not in transient}
         try:
             atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True))
@@ -848,17 +850,17 @@ class EngineApp:
             pack.dispatch_line(plain)
         line = Line(plain, spans=spans)
         self.engine.process_line(line)  # may set line.channel and gag flags
+        self._log(line.plain_text)  # full session log, including gagged-from-speech
         if self._login is not None and not self._login.done:
             self._login.feed(line.plain_text)  # answer name/password prompts
         if self._walk is not None and self._walk.active:
             self._walk.on_line(line.plain_text)  # halt the walk if a step was blocked
         if line.substitute is not None:
-            # A pack replaced the line (VIPMud #Sub). Login and the walker still read what
+            # A pack replaced the line (VIPMud #Sub). The log, login and the walker keep what
             # the MUD sent; the player sees and hears the replacement.
             line.plain_text, line.spans = line.substitute, []
             if not line.plain_text.strip():
                 return
-        self._log(line.plain_text)  # full session log, including gagged-from-speech
         policy = self.channels.policy(line.channel)
         if policy.speak and not line.gagged and self.engine.line_speech:
             self.voice.speak(

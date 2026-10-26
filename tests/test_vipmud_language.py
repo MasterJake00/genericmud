@@ -7,6 +7,8 @@ genericMud than in VIPMud.
 
 from __future__ import annotations
 
+import time
+
 from genericmud.automation.engine import AutomationEngine
 from genericmud.model.buffer import Line
 from genericmud.scripting.api import ScriptApi
@@ -430,11 +432,10 @@ def test_anycase_makes_a_trigger_ignore_case():
     assert _said(sink) == ["shout from Bob"]
 
 
-def test_a_question_mark_matches_one_character_and_doesnt_take_a_wildcard_number():
-    # Only the asterisks number the wildcards (manual 5.2.54).
-    sink, engine, _pack = _load("#trigger {?ou hit *} {#say {%1}}")
+def test_a_question_mark_matches_one_character_and_takes_a_wildcard_number():
+    sink, engine, _pack = _load("#trigger {?ou hit *} {#say {%1 / %2}}")
     engine.process_line(Line("You hit the orc"))
-    assert _said(sink) == ["the orc"]
+    assert _said(sink) == ["Y / the orc"]
 
 
 def test_an_exclamation_mark_negates_a_character_class():
@@ -1091,3 +1092,178 @@ def test_reload_starts_the_pack_again_from_its_entry(tmp_path):
     assert engine.get_var("loads") == "1"
     assert engine.get_var("leftover", None) is None
     assert engine.get_var("usersetting") == "mine"
+
+
+# --- from the review of this release, each reproduced against the real packs ---
+
+
+def test_lines_in_a_script_file_keep_their_crlf_so_crlf_splits_them(tmp_path):
+    # Miriani splits its option tables on %CRLF. Reading the file turned its line breaks into
+    # plain newlines, so every table was one item long and Miriani played at volume 0.
+    (tmp_path / "table.set").write_bytes(b"#var table {first\r\nsecond\r\nthird}\r\n")
+    (tmp_path / "unix.set").write_bytes(b"#var unix {one\ntwo}\n")  # a git checkout on Linux
+    sink, _engine, _pack = _load(
+        "#load {table.set}\n#load {unix.set}\n"
+        "#say {%word(@table,%crlf,2) %numwords(@unix,%crlf)}",
+        base_dir=str(tmp_path),
+    )
+    assert _said(sink) == ["second 2"]
+
+
+def test_braced_parameters_stay_together_when_an_alias_is_called():
+    # About 140 of Miriani's sound calls look like MirianiSoundPlay {Startup Music} {...}, and
+    # its ConfSave {} {Quiet} means "no name, quietly".
+    sink, engine, _pack = _load(
+        "#alias snd {#say {[%1] [%2] [%3]}}\n"
+        "#alias save {#if {%length(%1)>0} {#say {to %1}} {#say {default}};"
+        " #if {%ifword(Quiet,%2,|)=0} {#say saved}}\n"
+    )
+    engine.process_input("snd {Startup Music} {Music\\x.wav}")
+    engine.process_input("save {} {Quiet}")
+    assert _said(sink) == ["[Startup Music] [Music\\x.wav] []", "default"]
+
+
+def test_a_braced_parameter_can_run_over_several_lines_of_a_script():
+    # Miriani's spabout alias prints its credits from a block written over several lines;
+    # read as separate lines of text, most of them went to the MUD.
+    sink, engine, _pack = _load(
+        "#alias ConfPrint {#say {%1}}\n"
+        "#alias spabout {\n Speech Stop;\n ConfPrint {Miriani Soundpack, version 5.\n"
+        "Originally written by Cory Martin.\n  Credits: someone; and others}\n}\n"
+        "#alias Speech {#say {speech %1}}\n"
+    )
+    engine.process_input("spabout")
+    assert sink.sent == []
+    assert _said(sink)[0] == "speech Stop"
+    assert "Originally written by Cory Martin." in _said(sink)[1]
+
+
+def test_a_variable_in_a_condition_is_one_value_even_with_and_or_parentheses_in_it():
+    sink, _engine, _pack = _load(
+        '#var song {rock and roll}\n#if {@song = "rock and roll"} {#say same}\n'
+        '#var feed {(Bridge) (Captain Bob) says hello}\n#if {@feed=*"(*) *"} {#say camera}\n'
+    )
+    assert _said(sink) == ["same", "camera"]
+
+
+def test_text_from_the_mud_cant_steer_a_condition():
+    sink, engine, _pack = _load(
+        "#trigger {* says '*'} {#if {%2 = \"hello\"} {#say greeted} {#say other}}"
+    )
+    engine.process_line(Line("Mallory says '1 or 1'"))
+    assert _said(sink) == ["other"]
+
+
+def test_digit_runs_and_real_classes_are_numbered_wildcards():
+    # Miriani's history trigger reads them back: #Sub {%8  [%4:%5 %6.m. - %1/%2/%3]}.
+    sink, engine, _pack = _load(
+        "#Trigger {[[]##/##/#### - *:* [ap].m.] (*) *} {#Sub {%8  [%4:%5 %6.m. - %1/%2/%3]}}\n"
+        "#Trigger {#} {#say {digit %1}}\n"
+    )
+    line = engine.process_line(Line("[10/25/2026 - 3:45 p.m.] (Bob) hello there"))
+    assert line.substitute == "hello there  [3:45 p.m. - 10/25/2026]"
+    engine.process_line(Line("7"))
+    engine.process_line(Line("#"))
+    assert _said(sink) == ["digit 7"]
+
+
+def test_a_percent_sign_in_a_pattern_is_a_letter_unless_it_is_escaped():
+    sink, engine, _pack = _load(
+        "#trigger {HULL: *[%]*} {#say {hull %1}}\n#trigger {Grade %} {#say {grade %1}}\n"
+    )
+    for text in ("HULL: 85% intact", "Grade A", "Grade 5"):
+        engine.process_line(Line(text))
+    assert _said(sink) == ["hull 85", "grade A"]
+
+
+def test_an_unset_variable_equals_zero_next_to_a_number():
+    # The manual's own prompt example: @endurFlag is never set before it's compared with 0.
+    sink, _engine, _pack = _load(
+        "#var endurance 40\n#if {@endurance < 50 and @endurFlag = 0} {#say Endurance}\n"
+        "#if {@unset <> 0} {#say wrong}\n"
+    )
+    assert _said(sink) == ["Endurance"]
+
+
+def test_gunvar_deletes_a_global_variable():
+    sink, _engine, _pack = _load("#GVar x 1\n#GUnVar x\n#say {%defined(x)}")
+    assert _said(sink) == ["0"]
+
+
+def test_an_alarm_time_from_the_mud_is_expanded_only_once():
+    sink, engine, _pack = _load(
+        "#var secret {42|7}\n#trigger {Remind me in * seconds} {#alarm %1 {#say ding}}"
+    )
+    engine.process_line(Line("Remind me in %pop(secret) seconds"))
+    assert sink.scheduled == []
+    assert engine.get_var("secret") == "42|7"
+
+
+def test_a_pack_can_write_and_delete_by_absolute_path_inside_its_own_folder(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    _sink, _engine, _pack = _load(
+        "#file 1 {%HomeFolder~notes.txt}\n#write 1 {hi}\n#close 1\n"
+        "#file 2 {%HomeFolder~gone.txt}\n#write 2 {bye}\n#close 2\n"
+        "#delfile {%HomeFolder~gone.txt}\n"
+        f"#file 3 {{{outside}}}\n#write 3 {{no}}\n",
+        base_dir=str(tmp_path),
+    )
+    assert (tmp_path / "notes.txt").read_bytes() == b"hi\r\n"
+    assert not (tmp_path / "gone.txt").exists()
+    assert not outside.exists()
+
+
+def test_empty_loops_still_count_against_a_scripts_budget():
+    # Text a pack runs with #Exec can be this; it ran for about 19 minutes.
+    _sink, engine, _pack = _load("#alias spin {#32767 {#32767 {}}}")
+    started = time.monotonic()
+    engine.process_input("spin")
+    assert time.monotonic() - started < 10
+
+
+def test_a_wait_doesnt_give_a_script_a_fresh_budget():
+    sink, engine, _pack = _load(
+        "#alias noop {#math n {@n + 1}}\n#alias spin {#wait 0;#300 {#300 {noop}}}"
+    )
+    engine.process_input("spin")
+    sink.run_pending()
+    assert int(engine.get_var("n") or 0) < 30_000
+
+
+def test_nested_eval_does_its_work_once():
+    # Every level fails to parse ("... and"), and each failure used to expand its text again.
+    expression = "%eval(" * 20 + "1" + " and)" * 20
+    sink, engine, _pack = _load("#alias ev {#say {%0}}")
+    started = time.monotonic()
+    engine.process_input(f"ev {expression}")
+    _pack.load_source(f"#say {{{expression}}}")
+    assert time.monotonic() - started < 5
+
+
+def test_wildcard_compare_cant_hang_on_a_hostile_pattern():
+    sink, engine, _pack = _load(
+        "#trigger {test *} {#if {%1 =* \"*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b\"} {#say yes} {#say no}}"
+    )
+    started = time.monotonic()
+    engine.process_line(Line("test " + "a" * 40))
+    assert time.monotonic() - started < 10
+    assert _said(sink) in (["no"], [])
+
+
+def test_a_pack_cant_point_its_sounds_folder_outside_its_own_or_the_players(tmp_path):
+    # @sppath is a variable any pack, or MUD text a pack runs with #Exec, can set. Pointed at
+    # "/", a missing sound walked the whole disk and any file could be "played".
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.wav").write_bytes(b"RIFF")
+    pack_dir = tmp_path / "pack"
+    pack_dir.mkdir()
+    sink, engine, _pack = _load(
+        f"#var sppath {{{outside}}}\n#play secret.wav\n#say {{%playhandle}}",
+        base_dir=str(pack_dir),
+    )
+    assert _said(sink) == ["0"]
+    assert not any(str(outside) in played["file"] for played in sink.played)
+    engine.sounds_dir = str(outside)  # the player's own sounds folder is fine
+    _pack.load_source("#play secret.wav\n#say {%playhandle}")
+    assert sink.played[-1]["file"] == str(outside / "secret.wav")

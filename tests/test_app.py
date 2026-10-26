@@ -412,3 +412,26 @@ def test_a_substituted_line_is_shown_and_spoken_instead_of_the_original():
     assert "james: hi" in backend.spoken
     assert "james tells you 'hi'" not in backend.spoken
     assert app.buffer.lines()[-1].plain_text == "james: hi"
+
+
+def test_the_session_log_keeps_the_line_the_mud_sent_when_a_pack_replaces_it():
+    from genericmud.scripting.api import ScriptApi
+    from genericmud.scripting.vipmud_dialect import VipMudPack
+
+    class _Logger:
+        active = True
+
+        def __init__(self):
+            self.lines = []
+
+        def log(self, text):
+            self.lines.append(text)
+            return True
+
+    app, _backend, _sent, _posted = _app()
+    app.logger = _Logger()
+    VipMudPack(ScriptApi(app.engine, source="vip")).load_source(
+        "#trigger {* tells you '*'} {#sub {%1: %2}}\n#trigger {spam} {#sub {}}\n"
+    )
+    app.on_telnet_event(DataReceived(b"james tells you 'hi'\r\nspam\r\n"))
+    assert app.logger.lines == ["james tells you 'hi'", "spam"]

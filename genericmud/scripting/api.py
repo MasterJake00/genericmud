@@ -265,6 +265,10 @@ class ScriptApi:
     def get_gvar(self, name: str) -> str:
         return self._engine.get_gvar(name)
 
+    def delete_gvar(self, name: str) -> None:
+        """Remove a global variable (VIPMud #GUnVar)."""
+        self._engine.delete_gvar(name)
+
     def set_gvar(self, name: str, value: object) -> None:
         """Set a global (cross-session-persistent-namespace) variable; VIPMud ``#GVAR``.
 
@@ -457,10 +461,21 @@ class ScriptApi:
         # /etc/... are rejected. A bare relative name (no pack dir) can't escape (.. already
         # refused above), so it passes through to the backend as before.
         if is_absolute(resolved):
-            roots = [root for root in (self._base_dir, self._engine.get_var("sppath")) if root]
+            roots = [root for root in (self._base_dir, self._sounds_root()) if root]
             if not any(within(root, resolved) for root in roots):
                 return ""
         return resolved
+
+    def _sounds_root(self) -> str | None:
+        """Where the pack's sounds are: @sppath when it lies inside the pack or the player's
+        own sounds folder, else that folder. @sppath is a variable any pack, or MUD text a
+        pack runs as script, can set; pointed at "/" it let any file play and a missing
+        sound walk the whole disk."""
+        sppath = self._engine.get_var("sppath")
+        trusted = [root for root in (self._base_dir, self._engine.sounds_dir) if root]
+        if sppath and any(within(root, sppath) for root in trusted):
+            return sppath
+        return self._engine.sounds_dir
 
     def _find_in_sounds_dir(self, path: str) -> str | None:
         """Locate a missing sound under the user's Sounds folder (``@sppath``).
@@ -473,7 +488,7 @@ class ScriptApi:
         the walk met first. Indexed once per folder; a collision keeps the first match, and
         the walk only runs on a cache miss.
         """
-        sounds_dir = self._engine.get_var("sppath")
+        sounds_dir = self._sounds_root()
         if not sounds_dir or not os.path.isdir(sounds_dir):
             return None
         if self._sounds_index_key != sounds_dir:

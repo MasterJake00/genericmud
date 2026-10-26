@@ -199,6 +199,7 @@ def test_world_sounds_dir_overrides_pack_default_sppath():
     sink = RecordingSink()
     engine = AutomationEngine(sink)
     engine.set_var("sppath", "/my/sounds")
+    engine.sounds_dir = "/my/sounds"  # as the window sets it
     VipMudPack(ScriptApi(engine, source="vip", base_dir="/pack")).load_source(SPHOOK)
     engine.process_line(Line("$sphook play:combat/hit:100:0:0:1"))
     assert sink.played[-1]["file"] == "/my/sounds/combat/hit.wav"
@@ -532,8 +533,7 @@ def test_bracket_patterns_compile_without_a_nested_set_warning():
 
 def test_plain_patterns_are_unchanged_by_the_class_support():
     assert vip_pattern_to_regex("You see * here.") == r"You\ see\ (.*?)\ here\."
-    # ? matches one character but doesn't take a wildcard number: only * does.
-    assert vip_pattern_to_regex("?Enter ?yes' or ?no'?") == r".Enter\ .yes'\ or\ .no'."
+    assert vip_pattern_to_regex("?Enter ?yes' or ?no'?") == r"(.)Enter\ (.)yes'\ or\ (.)no'(.)"
 
 
 def test_variable_names_are_case_insensitive():

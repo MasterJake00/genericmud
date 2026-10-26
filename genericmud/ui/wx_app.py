@@ -347,6 +347,7 @@ class SessionPanel(wx.Panel):
         self._connection.on_status = self.app.on_connection_status
         if self.world.sounds:  # point @sppath at the world's sound folder before packs load
             self.app.engine.set_var("sppath", self.world.sounds)
+            self.app.engine.sounds_dir = self.world.sounds  # and trust it, as packs can't be
         self.app.on_connect(self.world.name)  # activate packs + arm auto-login before data
         if self._diag is not None:
             self._diag.event("connect.begin", host=self.world.host, port=self.world.port)

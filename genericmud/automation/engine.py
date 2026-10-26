@@ -158,6 +158,9 @@ class AutomationEngine:
         self.session_name = ""  # this session's name, for broadcast-exclude
         self.connected = True  # transport state, maintained by the app (packs read it)
         self.diag: DiagnosticLog | None = None  # sound-path trace (set by the app)
+        # The player's own sounds folder for this world (set by the window before packs
+        # load). Unlike @sppath, which any pack can set, it is trusted for sound paths.
+        self.sounds_dir: str | None = None
         # The server line the triggers are working on, so a pack's script can act on it
         # (MUSHclient packs file it under a channel with history_add).
         self.current_line: Line | None = None
@@ -292,6 +295,9 @@ class AutomationEngine:
 
     def get_gvar(self, name: str) -> str:
         return self._gvars.get(name, "")
+
+    def delete_gvar(self, name: str) -> None:
+        self._gvars.pop(name, None)
 
     def set_gvar(self, name: str, value: object) -> None:
         self._gvars[name] = str(value)
