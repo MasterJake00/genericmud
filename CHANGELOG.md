@@ -11,10 +11,10 @@ Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
 **MUSHclient soundpacks**
 
-* Each plugin in a MUSHclient pack keeps its own functions and settings
-  tables, as in MUSHclient. Plugins that used the same names, like the V.I.
-  Mush bundle's init_stuff and save_config, ran each other's code instead of
-  their own.
+* Each plugin in a MUSHclient pack has its own script space, as in
+  MUSHclient. Plugins that used the same function names, like the V.I. Mush
+  bundle's init_stuff and save_config, ran each other's code instead of their
+  own.
 * The V.I. Mush bundle no longer sends a line of junk to Materia Magica each
   time the MUD updates your room or character.
 * Materia Magica's accelerators plugin binds its hotkeys without announcing
