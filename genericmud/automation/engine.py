@@ -196,7 +196,6 @@ def _named(match: re.Match[str]) -> dict[str, str]:
     return {name: value if value is not None else "" for name, value in match.groupdict().items()}
 
 
-
 def _cancel_pending(entry: tuple[object, str, Callable[[], None] | None]) -> None:
     handle, _source, on_cancel = entry
     cancel = getattr(handle, "cancel", None)
@@ -204,6 +203,7 @@ def _cancel_pending(entry: tuple[object, str, Callable[[], None] | None]) -> Non
         cancel()
     if on_cancel is not None:
         on_cancel()
+
 
 class AutomationEngine:
     def __init__(self, sink: EngineSink | None = None, *, sound: SoundBus | None = None) -> None:
