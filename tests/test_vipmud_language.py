@@ -515,3 +515,103 @@ def test_a_comment_at_the_end_of_a_line_is_not_part_of_it():
     engine.process_input("ccorpse")
     engine.press_key("f1")
     assert sink.sent == ["take all from corpse", "wear all", "look"]
+
+
+# --- classes (manual 2.4.8 and 5.2.9) and the special aliases (2.4.1) ---
+
+
+def test_rules_in_a_class_only_work_while_it_is_enabled():
+    sink, engine, _pack = _load(
+        "#key numpad+ {disarm @monster} battle\n"
+        "#alias k {#var monster %1; kill @monster; #class battle enable}\n"
+        "#trigger {You bury the corpse.} {#class battle disable} battle\n"
+    )
+    assert not engine.has_key("numpad+")  # a disabled class's key falls through
+    engine.process_input("k rabbit")
+    assert engine.press_key("numpad+")
+    engine.process_line(Line("You bury the corpse."))
+    assert not engine.press_key("numpad+")
+    assert sink.sent == ["kill rabbit", "disarm rabbit"]
+
+
+def test_the_current_class_covers_the_rules_defined_after_it():
+    sink, engine, _pack = _load(
+        "#class battle\n#key F7 {kick monster}\n#key F8 {punch monster}\n#class 0\n"
+        "#Key F10 {#class battle enable}\n#Key shift-F10 {#class battle disable}\n"
+    )
+    assert not engine.press_key("f7")
+    engine.press_key("f10")
+    engine.press_key("f7")
+    engine.press_key("f8")
+    engine.press_key("shift+f10")
+    assert not engine.press_key("f8")
+    assert sink.sent == ["kick monster", "punch monster"]
+
+
+def test_a_key_goes_back_to_its_plain_definition_when_its_class_is_off():
+    sink, engine, _pack = _load(
+        "#key F7 {look}\n#key F7 {kick monster} battle\n"
+        "#key F10 {#class battle enable}\n#key F11 {#class battle disable}\n"
+    )
+    for key in ("f7", "f10", "f7", "f11", "f7"):
+        engine.press_key(key)
+    assert sink.sent == ["look", "kick monster", "look"]
+
+
+def test_an_alias_in_a_disabled_class_lets_the_command_through():
+    # The unofficial Prometheus pack's fly mode turns "n" into a flight command only while
+    # its fly class is on; with it off, "n" has to reach the MUD.
+    sink, engine, _pack = _load("#alias {n} {fly north} {fly}\n#key f2 {#class fly enable}")
+    assert engine.process_input("n") == ["n"]
+    engine.press_key("f2")
+    assert engine.process_input("n") == []
+    assert sink.sent == ["fly north"]
+
+
+def test_a_rule_in_several_classes_needs_all_of_them():
+    sink, engine, _pack = _load(
+        "#trigger {You walk *} {#say step} {footsteps|global}\n#alias on {#class %1 enable}\n"
+    )
+    engine.process_line(Line("You walk north."))
+    engine.process_input("on footsteps")
+    engine.process_line(Line("You walk north."))
+    engine.process_input("on global")
+    engine.process_line(Line("You walk north."))
+    assert _said(sink) == ["step"]
+
+
+def test_unclass_makes_a_classes_rules_work_all_the_time():
+    sink, engine, _pack = _load("#trigger {ping} {#say pong} battle\n#unclass battle")
+    engine.process_line(Line("ping"))
+    assert _said(sink) == ["pong"]
+
+
+def test_delclass_removes_a_classes_rules():
+    sink, engine, _pack = _load(
+        "#trigger {ping} {#say pong} battle\n#class battle enable\n#delclass battle"
+    )
+    engine.process_line(Line("ping"))
+    assert _said(sink) == []
+
+
+def test_untrigger_with_a_class_only_removes_the_trigger_in_that_class():
+    sink, engine, _pack = _load(
+        "#trigger {ping} {#say pong} battle\n#untrigger {ping} other\n#class battle enable"
+    )
+    engine.process_line(Line("ping"))
+    assert _said(sink) == ["pong"]
+
+
+def test_onconnect_and_ondisconnect_run_when_the_connection_changes():
+    # The unofficial Prometheus pack loads its settings and switches its classes on in
+    # OnConnect, and saves them in OnDisconnect.
+    sink, engine, pack = _load(
+        "#alias OnConnect {#class global enable;#say hello}\n"
+        "#alias {onDisconnect} {#say bye}\n"
+        "#trigger {ping} {#say pong} global\n"
+    )
+    engine.process_line(Line("ping"))
+    pack.connection_changed(True)
+    engine.process_line(Line("ping"))
+    pack.connection_changed(False)
+    assert _said(sink) == ["hello", "pong", "bye"]

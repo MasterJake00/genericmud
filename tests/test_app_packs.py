@@ -162,3 +162,24 @@ def test_msdp_negotiation_flows_to_mushclient_pack(tmp_path):
     assert "plugin.lifecycle.done" in trace
     assert "plugin.lifecycle.error" not in trace
     assert "msdp.start" in trace
+
+
+def test_a_vipmud_packs_onconnect_and_ondisconnect_follow_the_connection(tmp_path):
+    store = PackStore(tmp_path / "store")
+    src = tmp_path / "pack.set"
+    src.write_text("#alias OnConnect {#say ready}\n#alias OnDisconnect {#say gone}\n",
+                   encoding="latin-1")
+    store.install(src, world="prom", trust=True)
+    app, backend, _posted = _app(store)
+    app.on_connect("prom")
+    assert "ready" in backend.spoken
+    app.on_connection_status("connection lost; reconnecting in 5s (attempt 1)")
+    assert "gone" in backend.spoken
+    backend.spoken.clear()
+    app.on_connection_status("connection lost; reconnecting in 10s (attempt 2)")
+    assert "gone" not in backend.spoken  # once per drop, not once per attempt
+    app.on_connection_status("reconnected")
+    assert "ready" in backend.spoken
+    backend.spoken.clear()
+    app.on_disconnected()  # the window's Disconnect, which sends no status
+    assert "gone" in backend.spoken

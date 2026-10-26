@@ -41,6 +41,7 @@ from genericmud.safepath import is_unsafe, legacy_world_component, world_compone
 from genericmud.scripting import user_scripts
 from genericmud.scripting.api import ScriptApi
 from genericmud.scripting.mushclient_compat import MushclientPack
+from genericmud.scripting.vipmud_dialect import VipMudPack
 from genericmud.session.credentials import CredentialStore
 from genericmud.session.hub import SessionHub
 from genericmud.session.log import SessionLogger
@@ -303,6 +304,8 @@ class EngineApp:
         self._last_activation: ActivationResult | None = None  # for the diag:where summary
         self._client_error_spoken = False  # speak the first renderer error, echo the rest
         self._mush_packs: list[MushclientPack] = []  # loaded MUSHclient packs (hook dispatch)
+        self._vip_packs: list[VipMudPack] = []  # loaded VIPMud packs (OnConnect/OnDisconnect)
+        self._vip_connected = False  # which of the two the VIPMud packs last heard
         self._user_script_runtimes: list[user_scripts.LoadedUserScript] = []
         self._user_script_generation = 0
         self._msdp_offered = False  # server sent WILL MSDP (replayed to late-loading packs)
@@ -348,6 +351,8 @@ class EngineApp:
         self._mush_packs = [
             pack for pack in result.packs.values() if isinstance(pack, MushclientPack)
         ]
+        self._vip_packs = [pack for pack in result.packs.values() if isinstance(pack, VipMudPack)]
+        self._vip_connected = False
         self._announce_activation(result)
         return result
 
@@ -385,8 +390,34 @@ class EngineApp:
                 "Soundpack startup hooks failed; sounds may be off.",
                 channel=SYSTEM_CHANNEL, interrupt=False,
             )
+        self._vip_connection_changed(True)
         self.begin_login(world)
         return result
+
+    def on_disconnected(self) -> None:
+        """The player disconnected on purpose, which sends no status line of its own."""
+        self._vip_connection_changed(False)
+
+    def _vip_connection_changed(self, connected: bool) -> None:
+        """Run the VIPMud packs' OnConnect or OnDisconnect alias, once per change.
+
+        The unofficial Prometheus pack loads its settings and switches its sound classes on
+        in OnConnect and saves them in OnDisconnect, so without these it stays silent and
+        forgets every setting.
+        """
+        if connected == self._vip_connected:
+            return
+        self._vip_connected = connected
+        for pack in self._vip_packs:
+            try:
+                pack.connection_changed(connected)
+            except Exception as exc:  # noqa: BLE001 - one pack's hook must not stop the rest
+                if self._diag is not None:
+                    self._diag.event(
+                        "vipmud.connection_hook.error", connected=connected,
+                        error=f"{type(exc).__name__}: {exc}",
+                        traceback=traceback.format_exc(),
+                    )
 
     def _dispatch_plugin_lifecycle(self) -> None:
         """Run each MUSHclient pack's install/connect hooks (MUSHclient calls these
@@ -470,6 +501,7 @@ class EngineApp:
         """Release session resources on close: leave the hub and stop logging."""
         self._closed = True  # ends the OnPluginTick chain
         self.engine.cancel_timers()  # cancel pending pack timers so none fire post-close
+        self._vip_connection_changed(False)  # closing the tab drops the connection too
         self._persist_pack_vars()
         self._save_map()
         if self.hub is not None and self.name:
@@ -1488,6 +1520,12 @@ class EngineApp:
             self.begin_login(self.name)
         self.voice.speak(spoken, channel=SYSTEM_CHANNEL, interrupt=True)
         self._post(protocol.echo(f"* {message}"))  # raw detail stays reviewable in the output
+        # After the status is said, so a pack's own goodbye or welcome isn't cut off by it.
+        if message.startswith(("disconnected", "protocol error", "reconnect failed",
+                               "connection lost")):
+            self._vip_connection_changed(False)
+        elif message.startswith("reconnected"):
+            self._vip_connection_changed(True)
 
     def _log(self, text: str) -> None:
         if self.logger is not None and self.logger.active and not self.logger.log(text):

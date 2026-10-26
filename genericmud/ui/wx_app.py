@@ -779,6 +779,7 @@ class SessionPanel(wx.Panel):
             self.app.engine.cancel_timers()
             self.app.sound.flush()
             self.app.forget_hidden_input()  # no WONT ECHO will come from a closed socket
+            self.app.on_disconnected()  # VIPMud packs' OnDisconnect (they save settings there)
 
 
 class FindDialog(wx.Dialog):

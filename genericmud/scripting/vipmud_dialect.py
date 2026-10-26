@@ -53,6 +53,8 @@ _KEY_COMMANDS = {"KEY", "GKEY"}
 _UNTRIGGER_COMMANDS = {"UNTRIGGER", "UNTRIG", "GUNTRIGGER", "GUNTRIG"}
 _UNALIAS_COMMANDS = {"UNALIAS", "GUNALIAS"}
 _UNKEY_COMMANDS = {"UNKEY", "GUNKEY"}
+_CLASS_ON = {"enable", "enabled", "on"}
+_CLASS_OFF = {"disable", "disabled", "off"}
 _SOUND_VARIANT_RE = re.compile(r"\*(\d+)(\.\w+)$")  # "name*N.ext": one random variant of 1..N
 # Named/positional wildcards inside a .set pattern: &{name}, &name, *, ?
 _PATTERN_WILDCARD_RE = re.compile(r"&\{(\w+)\}|&(\w+)|(\*)|(\?)")
@@ -799,11 +801,29 @@ class _Scope:
 @dataclass
 class _VipRule:
     """A trigger, alias or key as the pack defined it, kept so a redefinition or an #Un...
-    command can find and replace it."""
+    command can find and replace it, and so its classes can switch it on and off."""
 
     body: str
+    classes: tuple[str, ...] = ()  # all of them have to be enabled for the rule to work
     engine_name: str = ""  # the engine rule's name, for removing it
     engine_rule: object | None = None
+
+
+class _KeyBinding:
+    """A pack key as the engine sees it. It is active while one of its definitions is, so a
+    key whose class is off falls through to genericMud instead of doing nothing."""
+
+    def __init__(self, pack: VipMudPack, combo: str) -> None:
+        self._pack = pack
+        self._combo = combo
+
+    def active(self) -> bool:
+        return self._pack._key_rule(self._combo) is not None
+
+    def __call__(self, ctx: MatchContext) -> None:
+        rule = self._pack._key_rule(self._combo)
+        if rule is not None:
+            self._pack._run_rule(rule.body, _Scope([], ctx.line))
 
 
 def _split_trigger_name(pattern: str) -> tuple[str, str]:
@@ -841,11 +861,15 @@ class VipMudPack:
         self._clipboard = ""  # #Clipboard / %Clipboard
         self._directions = dict(_OPPOSITE_DIRECTIONS)  # #Direction adds a pack's own
         # The pack's rules by what identifies them in VIPMud: a trigger by its <name> or its
-        # pattern, an alias by its name, a key by its combo. Defining one again replaces it.
+        # pattern, an alias by its name and classes, a key by its combo and then classes (a
+        # class's F7 and the plain F7 are both kept). Defining one again replaces it.
         self._triggers: dict[str, _VipRule] = {}
-        self._aliases: dict[str, _VipRule] = {}
-        self._keys: dict[str, _VipRule] = {}
+        self._aliases: dict[tuple[str, tuple[str, ...]], _VipRule] = {}
+        self._keys: dict[str, dict[tuple[str, ...], _VipRule]] = {}
         self._rule_count = 0
+        # Classes start switched off; a rule in a class works only while it's enabled.
+        self._enabled_classes: set[str] = set()
+        self._current_classes: tuple[str, ...] = ()  # set by #Class with just a name
         self._remote_sound_base: str | None = None
         self._remote_sound_root: Path | None = None
         # Sounds fetched in the background (see _fetch_in_background), by URL: the download
@@ -966,7 +990,64 @@ class VipMudPack:
         self._rule_count += 1
         return f"vipmud:{self._api.source}:{self._rule_count}"
 
-    def _define_trigger(self, args: list[_Tok]) -> None:
+    def _rule_classes(self, arg: _Tok | None, scope: _Scope) -> tuple[str, ...]:
+        """The classes a rule belongs to: its class parameter (several joined with |, all of
+        which have to be on), else the class #Class made current. Class 0 is no class."""
+        text = self._expand(arg.text, scope) if arg is not None else ""
+        names = (part.strip().lower() for part in text.split("|"))
+        classes = tuple(dict.fromkeys(n for n in names if n and n not in ("0", "anycase")))
+        return classes or self._current_classes
+
+    def _class_active(self, classes: tuple[str, ...]) -> bool:
+        return all(name in self._enabled_classes for name in classes)
+
+    def _switch_rules(self) -> None:
+        """Turn each trigger and alias on or off to match its classes."""
+        for rule in [*self._triggers.values(), *self._aliases.values()]:
+            if rule.engine_rule is not None:
+                rule.engine_rule.enabled = self._class_active(rule.classes)
+
+    def _execute_class(self, command: str, args: list[_Tok], scope: _Scope) -> None:
+        names = [
+            name for name in (
+                part.strip().lower() for part in self._expand(args[0].text, scope).split("|")
+            ) if name
+        ]
+        state = self._expand(args[1].text, scope).strip().lower() if len(args) > 1 else ""
+        if command in ("UNCLASS", "DELCLASS"):
+            self._drop_classes(set(names), delete=command == "DELCLASS")
+        elif state in _CLASS_ON:
+            self._enabled_classes.update(names)
+        elif state in _CLASS_OFF:
+            self._enabled_classes.difference_update(names)
+        elif not state:
+            self._current_classes = tuple(n for n in names if n != "0")
+        self._switch_rules()
+
+    def _drop_classes(self, names: set[str], *, delete: bool) -> None:
+        """#UnClass frees a class's rules to work all the time; #DelClass deletes them."""
+        for key, rule in list(self._triggers.items()):
+            if names & set(rule.classes):
+                if delete:
+                    self._remove_trigger(key)
+                else:
+                    rule.classes = tuple(c for c in rule.classes if c not in names)
+        for key, rule in list(self._aliases.items()):
+            if names & set(rule.classes):
+                self._remove_alias(key)
+                if not delete:
+                    remaining = tuple(c for c in rule.classes if c not in names)
+                    self._register_alias(key[0], rule.body, remaining)
+        for combo, definitions in list(self._keys.items()):
+            for classes in [c for c in definitions if names & set(c)]:
+                rule = definitions.pop(classes)
+                if not delete:
+                    remaining = tuple(c for c in classes if c not in names)
+                    definitions[remaining] = _VipRule(rule.body, remaining)
+            if not definitions:
+                self._remove_key(combo)
+
+    def _define_trigger(self, args: list[_Tok], scope: _Scope) -> None:
         """``#Trigger {pattern} {commands} [class] [AnyCase]``: the pattern has to match the
         whole line (manual 2.4.2: "you must include a leading or trailing asterisk if there
         is any text expected before or after"). Spaces a MUD leaves at the end of a line
@@ -976,46 +1057,87 @@ class VipMudPack:
         body = args[1].text if len(args) > 1 else ""
         flags = "(?i)" if any(arg.text.strip().lower() == "anycase" for arg in args[2:]) else ""
         key = name.lower() if name else pattern
+        classes = self._rule_classes(args[2] if len(args) > 2 else None, scope)
         self._remove_trigger(key)
         engine_name = self._engine_name()
         rule = self._api.add_trigger(
             f"{flags}^{vip_pattern_to_regex(pattern)}[ \t]*$", self._runner(body),
             regex=True, name=engine_name,
         )
-        self._triggers[key] = _VipRule(body, engine_name, rule)
+        rule.enabled = self._class_active(classes)
+        self._triggers[key] = _VipRule(body, classes, engine_name, rule)
 
-    def _remove_trigger(self, key: str) -> None:
-        old = self._triggers.pop(key, None)
-        if old is not None:
+    def _remove_trigger(self, key: str, class_name: str = "") -> None:
+        old = self._triggers.get(key)
+        if old is not None and (not class_name or class_name in old.classes):
+            del self._triggers[key]
             self._api.remove_trigger(old.engine_name)
 
     def _define_key(self, args: list[_Tok], scope: _Scope) -> None:
         combo = vip_key_to_combo(self._expand(args[0].text, scope))
-        self._keys[combo] = _VipRule(args[1].text if len(args) > 1 else "")
-        self._api.add_key(combo, self._key_runner(combo))
+        classes = self._rule_classes(args[2] if len(args) > 2 else None, scope)
+        definitions = self._keys.setdefault(combo, {})
+        definitions.pop(classes, None)  # the newest definition goes last
+        definitions[classes] = _VipRule(args[1].text if len(args) > 1 else "", classes)
+        self._api.add_key(combo, _KeyBinding(self, combo))
 
-    def _key_runner(self, combo: str):
-        def run(ctx: MatchContext) -> None:
-            rule = self._keys.get(combo)
-            if rule is None:
-                return
-            try:
-                self._execute_body(rule.body, _Scope([], ctx.line))
-            except _Abort:
-                pass
+    def _key_rule(self, combo: str) -> _VipRule | None:
+        """What a key does now: the newest definition in an enabled class, else its plain
+        one ("the keys would return to their global assignments", manual 2.4.8)."""
+        definitions = self._keys.get(combo, {})
+        in_classes = [
+            rule for classes, rule in definitions.items()
+            if classes and self._class_active(classes)
+        ]
+        return in_classes[-1] if in_classes else definitions.get(())
 
-        return run
-
-    def _remove_key(self, combo: str) -> None:
-        if self._keys.pop(combo, None) is not None:
+    def _remove_key(self, combo: str, class_name: str = "") -> None:
+        definitions = self._keys.get(combo)
+        if definitions is None:
+            return
+        for classes in list(definitions):
+            if not class_name or class_name in classes:
+                del definitions[classes]
+        if not definitions:
+            del self._keys[combo]
             self._api.remove_key(combo)
 
-    def _remove_alias(self, key: str) -> None:
+    def _remove_alias(self, key: tuple[str, tuple[str, ...]]) -> None:
         old = self._aliases.pop(key, None)
         if old is not None:
             self._api.remove_alias(old.engine_name)
 
-    def _define_alias(self, name: str, body: str) -> None:
+    def _unalias(self, name: str, class_name: str = "") -> None:
+        for key in [k for k in self._aliases if k[0] == name]:
+            if not class_name or class_name in key[1]:
+                self._remove_alias(key)
+
+    def connection_changed(self, connected: bool) -> None:
+        """Run the pack's OnConnect or OnDisconnect alias, as VIPMud does when the
+        connection to the MUD opens or closes (manual 2.4.1)."""
+        name = "onconnect" if connected else "ondisconnect"
+        candidates = [
+            rule for (alias, classes), rule in self._aliases.items()
+            if alias == name and self._class_active(classes)
+        ]
+        if candidates:
+            self._run_rule(candidates[-1].body, _Scope([""]))
+
+    def _run_rule(self, body: str, scope: _Scope) -> None:
+        """Run a rule's commands as one script: an #Abort ends it here."""
+        try:
+            self._execute_body(body, scope)
+        except _Abort:
+            pass
+
+    def _define_alias(self, args: list[_Tok], scope: _Scope) -> None:
+        name = args[0].text.strip()
+        body = args[1].text if len(args) > 1 else ""
+        classes = self._rule_classes(args[2] if len(args) > 2 else None, scope)
+        self._remove_alias((name.lower(), classes))
+        self._register_alias(name, body, classes)
+
+    def _register_alias(self, name: str, body: str, classes: tuple[str, ...]) -> None:
         """``#ALIAS``: the first word of what the player types names the alias.
 
         Real packs are written that way: ``#alias {dk} {dirtkick %1}`` expects "dk goblin" to
@@ -1027,8 +1149,6 @@ class VipMudPack:
         elsewhere (variable names), so alias names are too. A name that carries wildcards
         ("gt *") is a pattern instead, and has to match the whole command.
         """
-        key = name.lower()
-        self._remove_alias(key)
         engine_name = self._engine_name()
         if _PATTERN_WILDCARD_RE.search(name) or name.split() != [name]:
             pattern = f"(?i)^{vip_pattern_to_regex(name)}$"
@@ -1038,17 +1158,14 @@ class VipMudPack:
             rule = self._api.add_alias(
                 pattern, self._alias_runner(body), regex=True, name=engine_name
             )
-        self._aliases[key] = _VipRule(body, engine_name, rule)
+        rule.enabled = self._class_active(classes)
+        self._aliases[(name.lower(), classes)] = _VipRule(body, classes, engine_name, rule)
 
     def _alias_runner(self, body: str):
         def run(ctx: MatchContext) -> None:
             parameters = ctx.wildcards[1] if len(ctx.wildcards) > 1 else ""
             # %0 is everything typed after the alias name; %1.. are its words in turn.
-            wildcards = [parameters, *parameters.split()]
-            try:
-                self._execute_body(body, _Scope(wildcards, ctx.line))
-            except _Abort:
-                pass  # #Abort: stop this alias body early, leaving prior effects in place
+            self._run_rule(body, _Scope([parameters, *parameters.split()], ctx.line))
 
         return run
 
@@ -1056,10 +1173,7 @@ class VipMudPack:
         def run(ctx: MatchContext) -> None:
             for name, value in ctx.named.items():  # named wildcards become @vars
                 self._api.set_var(_fold(name), value or "")
-            try:
-                self._execute_body(body, _Scope(ctx.wildcards, ctx.line))
-            except _Abort:
-                pass  # #Abort: stop this trigger body early, leaving prior effects in place
+            self._run_rule(body, _Scope(ctx.wildcards, ctx.line))
 
         return run
 
@@ -1071,19 +1185,24 @@ class VipMudPack:
         if command is None or command == "SEND":
             self._bare_or_send(args, scope)
         elif command in _TRIGGER_COMMANDS and args:
-            self._define_trigger(args)
+            self._define_trigger(args, scope)
         elif command in _ALIAS_COMMANDS and args:
-            self._define_alias(args[0].text.strip(), args[1].text if len(args) > 1 else "")
+            self._define_alias(args, scope)
         elif command in _KEY_COMMANDS and args:
             self._define_key(args, scope)
-        elif command in _UNTRIGGER_COMMANDS and args:
-            name, pattern = _split_trigger_name(self._expand(args[0].text, scope))
-            self._remove_trigger(name.lower() if name else pattern)
-            self._remove_trigger(pattern.lower())  # #UnTrigger takes a trigger's name too
-        elif command in _UNALIAS_COMMANDS and args:
-            self._remove_alias(self._expand(args[0].text, scope).strip().lower())
-        elif command in _UNKEY_COMMANDS and args:
-            self._remove_key(vip_key_to_combo(self._expand(args[0].text, scope)))
+        elif command in (_UNTRIGGER_COMMANDS | _UNALIAS_COMMANDS | _UNKEY_COMMANDS) and args:
+            target = self._expand(args[0].text, scope)
+            class_name = self._expand(args[1].text, scope).strip().lower() if len(args) > 1 else ""
+            if command in _UNTRIGGER_COMMANDS:
+                name, pattern = _split_trigger_name(target)
+                self._remove_trigger(name.lower() if name else pattern, class_name)
+                self._remove_trigger(pattern.lower(), class_name)  # or the trigger's name
+            elif command in _UNALIAS_COMMANDS:
+                self._unalias(target.strip().lower(), class_name)
+            else:
+                self._remove_key(vip_key_to_combo(target), class_name)
+        elif command in ("CLASS", "GCLASS", "UNCLASS", "DELCLASS") and args:
+            self._execute_class(command, args, scope)
         elif command == "SAY" and args:
             self._api.speak(self._expand(args[0].text, scope))
         elif command in ("PLAY", "PLAYLOOP") and args:
