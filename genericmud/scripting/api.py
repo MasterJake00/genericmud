@@ -164,6 +164,37 @@ class ScriptApi:
         """Cut current speech (packs' interrupt-then-announce idiom, e.g. hp reports)."""
         self._engine.sink.stop_speech()
 
+    def line_speech(self) -> bool:
+        """Whether incoming lines, and the notes packs print like them, are spoken."""
+        return self._engine.line_speech
+
+    def set_line_speech(self, enabled: bool) -> None:
+        """Speak incoming lines or keep them quiet (a pack's Do Not Disturb).
+
+        Quiet lines still reach the buffer and the output, and the review keys still read
+        them; only the automatic reading as they arrive stops.
+        """
+        self._engine.line_speech = bool(enabled)
+
+    def file_in_history(self, channel: str, text: str) -> None:
+        """File ``text`` under a review channel, as MUSHclient packs' ``history_add`` does.
+
+        Packs file the line that just arrived, so that line is tagged with the channel and
+        the channel review keys find it there. Filing under "all" changes nothing: the main
+        review already holds every line. Text that isn't the arriving line (one the pack
+        built itself) goes into the scrollback under that channel, unspoken and unshown.
+        """
+        channel = str(channel).strip().lower()
+        text = str(text)
+        if not channel or channel == "all" or not text.strip():
+            return
+        line = self._engine.current_line
+        if line is not None and text.strip() in line.plain_text:
+            if line.channel == "main":
+                line.channel = channel
+            return
+        self._engine.sink.file_line(text, channel)
+
     def is_connected(self) -> bool:
         return self._engine.connected
 

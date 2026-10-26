@@ -188,8 +188,8 @@ _SPEECH_PLUGINS = frozenset({
     "universal_text_to_speech.xml",
 })
 _SPEECH_COMMANDS = (
-    (r"^tts_interrupt (.*)$", True, True),
-    (r"^tts_note (.*)$", False, True),
+    (r"^tts_interrupt(?: (.*))?$", True, True),  # bare tts_interrupt just stops speech
+    (r"^tts_note(?: (.*))?$", False, True),
     (r"^tts_stop$", True, False),
     (r"^sapi interrupt (.*)$", True, True),
     (r"^sapi say (.*)$", False, True),
@@ -319,6 +319,11 @@ class MushclientPack:
             install_hook, require_hook=not full_stdlib, report=self._report_error
         )
         self._install_api()
+        # MushReader and the channel_history plugin are often installed globally in
+        # MUSHclient rather than shipped with a pack, so packs call their commands without
+        # loading them (Stellarmush, Mystavaria, Empire). Answer them for every pack, after
+        # the pack's own aliases, or "tts_interrupt <text>" goes to the MUD instead of aloud.
+        self._install_speech_commands()
         self._install_sendpkt()
         self._install_audio()
         self._install_nvda()
@@ -1207,7 +1212,7 @@ class MushclientPack:
         line = self._pending_tell + str(text)
         self._pending_tell = ""
         self._api.echo(line)
-        if line.strip():
+        if line.strip() and self._api.line_speech():
             self._api.speak(line)
 
     def _tell(self, text: object = "") -> None:
@@ -2015,7 +2020,7 @@ class MushclientPack:
             self._install_speech_commands()
 
     def _install_speech_commands(self) -> None:
-        """Answer the skipped speech plugin's commands with genericMud's own speech."""
+        """Answer MushReader's and channel_history's commands with genericMud's own."""
         if self._speech_commands_installed:
             return
         self._speech_commands_installed = True
@@ -2024,13 +2029,28 @@ class MushclientPack:
                 pattern, self._speech_command(interrupt, speaks), regex=True,
                 priority=_SPEECH_COMMAND_PRIORITY,
             )
+        answers = (
+            # Miriani-Next's own MushReader: its Do Not Disturb keeps incoming lines quiet.
+            (r"^tts_disable_silent$", lambda _ctx: self._api.set_line_speech(False)),
+            (r"^tts_enable_silent$", lambda _ctx: self._api.set_line_speech(True)),
+            # channel_history.xml: file a line under a channel for the review keys.
+            (
+                r"^history_add (\w[\w ]*)=(.*)$",
+                lambda ctx: self._api.file_in_history(ctx.wildcards[1], ctx.wildcards[2]),
+            ),
+        )
+        for pattern, callback in answers:
+            self._api.add_alias(
+                pattern, callback, regex=True, priority=_SPEECH_COMMAND_PRIORITY
+            )
 
     def _speech_command(self, interrupt: bool, speaks: bool):
         def run(ctx: MatchContext) -> None:
             if interrupt:
                 self._api.stop_speech()
-            if speaks and len(ctx.wildcards) > 1:
-                self._api.speak(ctx.wildcards[1], channel="pack")  # where nvda.say goes too
+            text = ctx.wildcards[1] if len(ctx.wildcards) > 1 else ""
+            if speaks and text.strip():
+                self._api.speak(text, channel="pack")  # where nvda.say goes too
 
         return run
 

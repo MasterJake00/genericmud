@@ -48,6 +48,8 @@ class EngineSink:
     def send(self, text: str) -> None: ...
     def send_packet(self, data: bytes) -> None: ...
     def echo(self, text: str, channel: str = "main") -> None: ...
+    def file_line(self, text: str, channel: str) -> None:
+        """Keep ``text`` in the scrollback under ``channel``, without showing or speaking it."""
     def speak(self, text: str, channel: str = "main", interrupt: bool = False) -> None: ...
     def stop_speech(self) -> None: ...
     def play(
@@ -153,6 +155,11 @@ class AutomationEngine:
         self.session_name = ""  # this session's name, for broadcast-exclude
         self.connected = True  # transport state, maintained by the app (packs read it)
         self.diag: DiagnosticLog | None = None  # sound-path trace (set by the app)
+        # The server line the triggers are working on, so a pack's script can act on it
+        # (MUSHclient packs file it under a channel with history_add).
+        self.current_line: Line | None = None
+        # False while a pack wants incoming lines kept quiet (Miriani-Next's Do Not Disturb).
+        self.line_speech = True
         # (handle, source) pairs let a live script reload cancel only the retiring script set.
         self._timer_handles: list[tuple[object, str]] = []
 
@@ -383,6 +390,13 @@ class AutomationEngine:
 
     def process_line(self, line: Line) -> Line:
         """Run triggers against an incoming line; mutate gag flags in place."""
+        previous, self.current_line = self.current_line, line
+        try:
+            return self._run_triggers(line)
+        finally:
+            self.current_line = previous
+
+    def _run_triggers(self, line: Line) -> Line:
         for rule in list(self._triggers):
             if not rule.enabled:
                 continue

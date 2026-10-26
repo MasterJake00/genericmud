@@ -168,6 +168,9 @@ class AppSink(EngineSink):
         self._buffer.append(Line(text, channel=channel))
         self._post(protocol.echo(text, channel))
 
+    def file_line(self, text: str, channel: str) -> None:
+        self._buffer.append(Line(text, channel=channel))
+
     def speak(self, text: str, channel: str = "main", interrupt: bool = False) -> None:
         self._voice.speak(text, channel, interrupt)
 
@@ -813,7 +816,7 @@ class EngineApp:
         if self._walk is not None and self._walk.active:
             self._walk.on_line(line.plain_text)  # halt the walk if a step was blocked
         policy = self.channels.policy(line.channel)
-        if policy.speak and not line.gagged:
+        if policy.speak and not line.gagged and self.engine.line_speech:
             self.voice.speak(
                 line.plain_text,
                 channel=(policy.voice or line.channel),

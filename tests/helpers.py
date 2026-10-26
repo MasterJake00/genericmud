@@ -16,6 +16,7 @@ class RecordingSink(EngineSink):
     sent: list[str] = field(default_factory=list)
     packets: list[bytes] = field(default_factory=list)
     echoed: list[tuple[str, str]] = field(default_factory=list)
+    filed: list[tuple[str, str]] = field(default_factory=list)
     spoken: list[tuple[str, str, bool]] = field(default_factory=list)
     played: list[dict[str, Any]] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
@@ -31,6 +32,9 @@ class RecordingSink(EngineSink):
 
     def echo(self, text: str, channel: str = "main") -> None:
         self.echoed.append((text, channel))
+
+    def file_line(self, text: str, channel: str) -> None:
+        self.filed.append((text, channel))
 
     def speak(self, text: str, channel: str = "main", interrupt: bool = False) -> None:
         self.spoken.append((text, channel, interrupt))

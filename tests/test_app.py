@@ -364,3 +364,36 @@ def test_plugin_tick_chain_dispatches_and_pauses_when_disconnected():
     app.shutdown()
     scheduled.pop()()  # closed: chain ends, nothing rescheduled
     assert pack.ticks == 1 and scheduled == []
+
+
+def test_a_pack_can_quiet_incoming_lines_without_touching_review_or_the_buffer():
+    # A pack's Do Not Disturb (Miriani-Next) silences lines as they arrive. They still land
+    # in the buffer and the output, so nothing is lost, and the review keys still speak.
+    app, backend, _sent, posted = _app()
+    app.engine.line_speech = False
+    app.on_telnet_event(DataReceived(b"Someone pages you.\r\n"))
+    assert "Someone pages you." not in backend.spoken
+    assert app.buffer.lines()[-1].plain_text == "Someone pages you."
+    assert any(m["type"] == "line" and m["text"] == "Someone pages you." for m in posted)
+    app._handle_key("ctrl+1")  # recall the newest line
+    assert backend.spoken[-1] == "Someone pages you."
+
+
+def test_a_line_filed_under_a_channel_shows_up_in_channel_review():
+    # MUSHclient packs file chat with history_add; the line is tagged so the channel review
+    # keys (Ctrl+Alt+arrows) find it, and "all" adds nothing because the buffer has it.
+    from genericmud.model.buffer import Line
+    from genericmud.scripting.api import ScriptApi
+
+    app, _backend, _sent, _posted = _app()
+    api = ScriptApi(app.engine, source="pack")
+    line = Line("Bob says, hi")
+    app.engine.current_line = line
+    api.file_in_history("say", "Bob says, hi")
+    api.file_in_history("all", "Bob says, hi")
+    app.engine.current_line = None
+    assert line.channel == "say"
+    api.file_in_history("Tell", "a line the pack built")
+    assert app.buffer.lines()[-1].plain_text == "a line the pack built"
+    assert app.buffer.lines()[-1].channel == "tell"
+    assert "tell" in app.chan_review.channels()

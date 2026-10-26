@@ -1726,3 +1726,59 @@ def test_a_sandboxed_pack_cannot_write_outside_its_folder_through_sqlite(tmp_pat
     )
     assert not outside.exists()
     assert (pack_dir / "state.db").exists()  # the pack's own database still works
+
+
+def test_history_add_without_a_channel_history_plugin_files_the_line_instead_of_sending_it():
+    # Empire and Mystavaria call history_add expecting MUSHclient's channel_history plugin,
+    # which players install globally. Nothing answered it here, so every chat line sent
+    # "history_add say=Bob says, 'hi'" to the MUD.
+    sink, engine, pack = _rules(
+        '<triggers><trigger match="* says, *" enabled="y" send_to="12" sequence="100">'
+        "<send>Execute(\"history_add say=%0\") Execute(\"history_add all=%0\")</send>"
+        "</trigger></triggers>"
+    )
+    line = engine.process_line(Line("Bob says, hi"))
+    assert sink.sent == []
+    assert line.channel == "say"  # the channel review keys find it under "say"
+    pack._lua.execute('Execute("history_add tell=a line the pack wrote itself")')
+    assert sink.filed == [("a line the pack wrote itself", "tell")]
+    assert sink.sent == []
+
+
+def test_mushreader_commands_are_answered_even_when_the_pack_never_loads_mushreader():
+    # Stellarmush and Mystavaria expect MushReader installed globally in MUSHclient, so they
+    # never include it. genericMud only answered its commands when a pack included it, so
+    # "tts_interrupt <text>" went to the MUD and the message was never spoken.
+    sink, engine, pack = _rules(
+        '<triggers><trigger match="^\\$alert (.*?)$" regexp="y" enabled="y" send_to="12">'
+        '<send>Execute("tts_interrupt " .. "%1")</send></trigger></triggers>'
+    )
+    engine.process_line(Line("$alert red alert"))
+    pack._lua.execute('Execute("tts_note quietly")')
+    pack._lua.execute('Execute("tts_interrupt")')  # bare: just stop speaking
+    pack._lua.execute('Execute("tts_stop")')
+    assert sink.sent == []
+    assert ("red alert", "pack", False) in sink.spoken
+    assert ("quietly", "pack", False) in sink.spoken
+    assert sink.speech_stops == 3
+
+
+def test_a_packs_own_tts_alias_still_wins_over_genericmuds_answer():
+    sink, engine, pack = _rules(
+        '<aliases><alias match="^tts_interrupt (.*)$" regexp="y" enabled="y" send_to="12">'
+        '<send>SetVariable("mine", "%1")</send></alias></aliases>'
+    )
+    pack._lua.execute('Execute("tts_interrupt from the pack")')
+    assert pack._api.get_var("mine") == "from the pack"
+    assert sink.spoken == []
+
+
+def test_miriani_next_do_not_disturb_quiets_incoming_lines_and_brings_them_back():
+    # Miriani-Next's own MushReader adds tts_disable_silent / tts_enable_silent for its Do Not
+    # Disturb mode; genericMud skips that plugin, so both commands went to the MUD.
+    sink, engine, pack = _rules("")
+    pack._lua.execute('Execute("tts_disable_silent")')
+    assert engine.line_speech is False
+    pack._lua.execute('Execute("tts_enable_silent")')
+    assert engine.line_speech is True
+    assert sink.sent == []
