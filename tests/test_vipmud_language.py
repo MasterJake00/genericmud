@@ -1031,3 +1031,16 @@ def test_a_linked_pack_knows_where_its_scripts_sounds_and_themes_are(tmp_path):
     assert engine.get_var("soundspath") == str(sounds)
     assert engine.get_var("themespath") == str(sounds / "Themes")
     assert engine.get_var("linked") == str(scripts)  # the scripts' Main.set ran
+
+
+def test_a_script_that_breaks_stops_there_and_the_rest_keeps_working():
+    # The manual's own example runs whatever another player tells you through #Exec, so the
+    # MUD decides what that script contains; nesting it 3000 deep mustn't take the line
+    # processing down with it.
+    nested = "%trim(" * 3000 + "x" + ")" * 3000
+    sink, engine, _pack = _load(
+        "#trigger {Amy tells you '*'} {#Exec %1}\n#trigger {ping} {#say pong}\n"
+    )
+    engine.process_line(Line(f"Amy tells you '#say {nested}'"))
+    engine.process_line(Line("ping"))
+    assert _said(sink)[-1] == "pong"

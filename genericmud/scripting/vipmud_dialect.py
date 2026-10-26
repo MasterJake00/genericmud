@@ -109,6 +109,10 @@ _DEFAULT_VOLUME = 100
 _LOOP_LIMIT = 10_000
 _STEP_LIMIT = 50_000
 _REPEAT_LIMIT = 32_767  # #N {commands}: the manual's range is 1 to 32767
+# Function calls nest this deep at most; deeper ones are left as written. Packs nest a few
+# levels, and text a MUD can get run through #Exec would otherwise cost the client its stack,
+# and its time: every level rescans the rest of the line.
+_CALL_DEPTH_LIMIT = 32
 _MIN_REPEATING_ALARM = 0.1  # seconds; "#alarm -0 {...}" must not spin
 _FIND_LINES = 5000  # how far back #Find and %LastLine look in the output
 # #Say's voice types other than Incoming (its default) and Output, which #SetSpeech
@@ -884,7 +888,11 @@ class _KeyBinding:
         self._combo = combo
 
     def active(self) -> bool:
-        return self._pack._key_rule(self._combo) is not None
+        # The window asks from its own thread while the pack may be changing its keys.
+        try:
+            return self._pack._key_rule(self._combo) is not None
+        except RuntimeError:
+            return True
 
     def __call__(self, ctx: MatchContext) -> None:
         rule = self._pack._key_rule(self._combo)
@@ -953,6 +961,7 @@ class VipMudPack:
         self._alarms: dict[int, _Alarm] = {}  # by the number #Alarm hands its variable
         self._alarm_count = 0
         self._run_depth = 0  # scripts running inside one another (an alias calling an alias)
+        self._call_depth = 0  # %functions being evaluated inside one another
         self._found_line = ""  # %FoundLine, from #Find
         self._find_index: int | None = None  # where #Find last found, for "next"
         self._gagging_all = False  # between #GagOn All and #UnGagOn
@@ -1197,7 +1206,7 @@ class VipMudPack:
         one ("the keys would return to their global assignments", manual 2.4.8)."""
         definitions = self._keys.get(combo, {})
         in_classes = [
-            rule for classes, rule in definitions.items()
+            rule for classes, rule in list(definitions.items())
             if classes and self._class_active(classes)
         ]
         return in_classes[-1] if in_classes else definitions.get(())
@@ -1244,6 +1253,12 @@ class VipMudPack:
             self._execute_body(body, scope)
         except _ABORTS:
             pass
+        except Exception as error:  # noqa: BLE001 - one broken script mustn't stop the MUD's lines
+            if self._api.diag is not None:
+                self._api.diag.event(
+                    "script.error", source=self._api.source or "?",
+                    error=f"{type(error).__name__}: {error}"[:300],
+                )
         finally:
             self._run_depth -= 1
 
@@ -2098,11 +2113,17 @@ class VipMudPack:
             k += 1
         name = text[j:k].lower()
         if k < n and text[k] == "(":
+            if self._call_depth >= _CALL_DEPTH_LIMIT:
+                return None
             call = _scan_call(text, k)
             if call is None:
                 return None
             raw_args, end = call
-            result = self._call_function(name, raw_args, scope)
+            self._call_depth += 1
+            try:
+                result = self._call_function(name, raw_args, scope)
+            finally:
+                self._call_depth -= 1
             # A function VIPMud doesn't have stays as written rather than vanishing.
             return (result if result is not None else text[i:end]), end
         value = self._system_variable(name, scope)
