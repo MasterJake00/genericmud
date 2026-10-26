@@ -100,6 +100,12 @@ class _Tok:
     text: str
 
 
+# VIPMud's escape character: the next character is ordinary, so ~} isn't the end of a
+# block, ~; doesn't end a statement, and ~~ is a tilde. Structure only here: the pair stays
+# in the text, and the escape comes off when the text is evaluated.
+_ESCAPE = "~"
+
+
 def _scan_block(source: str, i: int) -> tuple[str, int]:
     """``source[i]`` is ``{``; return (inner text, index after matching ``}``)."""
     depth = 0
@@ -108,6 +114,9 @@ def _scan_block(source: str, i: int) -> tuple[str, int]:
     n = len(source)
     while j < n:
         c = source[j]
+        if c == _ESCAPE:
+            j += 2
+            continue
         if c == "{":
             depth += 1
         elif c == "}":
@@ -172,7 +181,7 @@ def tokenize_statements(source: str) -> list[tuple[str | None, list[_Tok]]]:
                 else:
                     word_start = i
                     while i < n and source[i] not in " \t\r\n;{":
-                        i += 1
+                        i += 2 if source[i] == _ESCAPE else 1
                     args.append(_Tok(False, source[word_start:i]))
             statements.append((command, args))
         else:
@@ -181,7 +190,7 @@ def tokenize_statements(source: str) -> list[tuple[str | None, list[_Tok]]]:
             # commands); without the split the whole line went out as one string and
             # a leading alias name prefix-matched, swallowing the rest.
             while i < n and source[i] not in "\r\n;":
-                i += 1
+                i += 2 if source[i] == _ESCAPE else 1
             text = source[line_start:i].strip()
             if text:
                 statements.append((None, [_Tok(False, text)]))

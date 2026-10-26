@@ -19,6 +19,7 @@ from genericmud.scripting.vipmud_dialect import (
     _expand_sound_variant,
     _parse_vip_settings,
     _serialize_vip_settings,
+    _Tok,
     tokenize_statements,
     vip_pattern_to_regex,
 )
@@ -788,3 +789,32 @@ def test_a_download_is_never_written_through_a_link_out_of_the_sounds_folder(
     assert list(outside.iterdir()) == []  # no file, and no folder made for one either
     assert pack._fetch_remote_sound(str(sounds / "combat" / "hit.wav")) is True
 
+
+
+def test_a_tilde_keeps_braces_and_semicolons_from_ending_their_statement():
+    # VIPMud's escape character: ~ makes the next character ordinary, ~~ is a tilde. The
+    # parser took ~} as the end of a block and ~; as a statement break.
+    assert tokenize_statements("say a~;b\n#var x {a~}b~~}") == [
+        (None, [_Tok(False, "say a~;b")]),
+        ("VAR", [_Tok(False, "x"), _Tok(True, "a~}b~~")]),
+    ]
+
+
+def test_loading_prometheus_save_config_sends_nothing_to_the_mud():
+    # The official Prometheus pack's Conf.set. Its escaped braces closed the alias body
+    # early, and the two leftover "}" lines went to the MUD right after login.
+    sink, engine = _load(
+        "#alias SaveConfig {\n"
+        " #For @SPOptions {\n"
+        "  #If {%IsNumber(@{@saveTmp1})=1} {\n"
+        "   #Var saveTmp2 {@saveTmp2#Var @saveTmp1 @{@saveTmp1}%CRLF}\n"
+        "  } {\n"
+        "   #Var saveTmp3 {%Replace(@{@saveTmp1},~~,~~~~)};\n"
+        "   #Var saveTmp2 {@saveTmp2#Var @saveTmp1 {%Replace(@saveTmp3,~},~~~})}%CRLF}\n"
+        "  }\n"
+        " }\n"
+        "}\n"
+        "#alias spload {#say loaded}\n"
+    )
+    assert sink.sent == []
+    assert engine.process_input("spload") == []
