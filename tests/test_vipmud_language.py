@@ -1,0 +1,382 @@
+"""The VIPMud language as its manual documents it: substitution, expressions and functions.
+
+Most cases are the manual's own examples (VipMud Documentation V2.0, sections 2.4.4-2.4.7,
+5.1.3, 5.2 and 5.3), so a failure here means a real pack script reads differently in
+genericMud than in VIPMud.
+"""
+
+from __future__ import annotations
+
+from genericmud.automation.engine import AutomationEngine
+from genericmud.model.buffer import Line
+from genericmud.scripting.api import ScriptApi
+from genericmud.scripting.vipmud_dialect import VipMudPack
+from tests.helpers import RecordingSink
+
+
+def _load(source: str, base_dir: str | None = None):
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    pack = VipMudPack(ScriptApi(engine, source="vip", base_dir=base_dir))
+    pack.load_source(source)
+    return sink, engine, pack
+
+
+def _said(sink: RecordingSink) -> list[str]:
+    return [text for text, _channel, _interrupt in sink.spoken]
+
+
+# --- variables (manual 2.4.4 and 2.4.7) ---
+
+
+def test_braced_variable_names_can_run_into_text():
+    sink, _engine, _pack = _load("#var name wart\n#say {@{name}hog}")
+    assert _said(sink) == ["warthog"]
+
+
+def test_indirect_variables_resolve_through_the_named_variable():
+    sink, engine, _pack = _load(
+        "#var Name1 Name2\n"
+        "#var @name1 hello\n"
+        "#say @name1\n"
+        "#say @Name2\n"
+        "#say %var(@name1)\n"
+        "#say @{@name1}\n"
+    )
+    assert engine.get_var("name2") == "hello"
+    assert _said(sink) == ["Name2", "hello", "hello", "hello"]
+
+
+def test_a_variable_name_starts_with_a_letter_and_stops_at_the_first_other_character():
+    sink, _engine, _pack = _load("#var hp 40\n#say {@hp, then @hp.}\n#say {mail me@1 now}")
+    assert _said(sink) == ["40, then 40.", "mail me@1 now"]
+
+
+def test_var_without_a_value_defines_the_variable_empty():
+    sink, _engine, _pack = _load(
+        "#var abc\n"
+        '#say {%case(%defined(abc)+1,"Not defined","defined")}\n'
+        '#say {%case(%defined(xyz)+1,"Not defined","defined")}\n'
+    )
+    assert _said(sink) == ["defined", "Not defined"]
+
+
+# --- the escape character (manual 5.1.2) ---
+
+
+def test_tilde_makes_the_next_character_ordinary():
+    sink, _engine, _pack = _load(
+        "#var eight 8\n"
+        "#say {see ya ~@eight}\n"
+        "#say {100~% sure}\n"
+        "#say {a ~~ b}\n"
+    )
+    assert _said(sink) == ["see ya @eight", "100% sure", "a ~ b"]
+
+
+def test_prometheus_keeps_an_at_sign_in_its_sounds_path_through_exec(tmp_path):
+    # The official Prometheus pack escapes every @ in its sounds path so the path survives
+    # being expanded a second time by #Exec, which is how every one of its sounds plays.
+    sound = tmp_path / "Sounds@Home" / "General" / "beep.wav"
+    sound.parent.mkdir(parents=True)
+    sound.write_bytes(b"RIFF")
+    sink, engine, _pack = _load(
+        "#var SoundsPath {Sounds~@Home}\n"
+        "#Var StabilizedSoundsPath {%Replace(@SoundsPath,~@,~~~@)}\n"
+        "#Var SoundTmp4 {@StabilizedSoundsPath\\}\n"
+        "#Var SoundTmp2 {#Play^General\\beep.wav}\n"
+        "#Exec {%Word(@SoundTmp2,^,1) {@SoundTmp4%Word(@SoundTmp2,^,2)} 80}\n",
+        base_dir=str(tmp_path),
+    )
+    assert engine.get_var("stabilizedsoundspath") == "Sounds~@Home"
+    assert sink.played, "nothing played"
+    assert sink.played[-1]["file"].replace("\\", "/").endswith("Sounds@Home/General/beep.wav")
+    assert abs(sink.played[-1]["gain"] - 0.8) < 1e-9
+
+
+def test_exec_runs_the_expanded_text_as_commands():
+    # Prometheus bakes an alias's parameters into an alarm this way; the alarm body
+    # itself can't see %0 when it fires later.
+    sink, _engine, _pack = _load("#alias spc {#Exec {#Alarm 0 {#say {copied %0}}}}")
+    _engine.process_input("spc the hull report")
+    sink.run_pending()
+    assert _said(sink) == ["copied the hull report"]
+
+
+def test_a_line_starting_with_an_angle_bracket_goes_to_the_mud_untouched():
+    sink, _engine, _pack = _load(
+        "#var version 4.2\n"
+        "#key f1 {>say Meet me @ Village square; bring your #1 sword}\n"
+        "#exec {>#$#register_soundpack Official VIP Mud Soundpack | @version}\n"
+    )
+    assert sink.sent == ["#$#register_soundpack Official VIP Mud Soundpack | 4.2"]
+    _engine.press_key("f1")
+    assert sink.sent[-1] == "say Meet me @ Village square; bring your #1 sword"
+
+
+# --- expressions (manual 5.1.3) ---
+
+
+def test_arithmetic_follows_the_manuals_precedence_and_stays_whole():
+    _sink, engine, _pack = _load(
+        "#var radius 7\n"
+        "#math a {2 + 3 * 4}\n"
+        "#math b {(2 + 3) * 4}\n"
+        "#math c {7 / 2}\n"
+        "#math d {7 \\ 2}\n"
+        "#math e {2 ^ 10}\n"
+        "#math f {-5 + 2}\n"
+        "#math AreaOfCircle {22 * @radius ^ 2 /7}\n"
+    )
+    values = {name: engine.get_var(name) for name in "abcdef"}
+    assert values == {"a": "14", "b": "20", "c": "3", "d": "1", "e": "1024", "f": "-3"}
+    assert engine.get_var("areaofcircle") == "154"
+
+
+def test_logical_operators_work_on_values_not_bits():
+    sink, _engine, _pack = _load(
+        "#say {%eval( 1 or 2)}\n"
+        "#say {%eval(1 xor 1)}\n"
+        "#say {%eval(1 xor 0)}\n"
+        "#say {%eval(3 and 0)}\n"
+    )
+    assert _said(sink) == ["1", "0", "1", "0"]
+
+
+def test_not_toggles_a_setting_like_the_manuals_speech_mute_key():
+    _sink, engine, _pack = _load(
+        "#key F10 {#if {not %defined(SpeechMute)} {#gVar SpeechMute 0};"
+        " #GVar SpeechMute {%eval(not @SpeechMute)}}"
+    )
+    engine.press_key("f10")
+    assert engine.get_var("speechmute") == "1"
+    engine.press_key("f10")
+    assert engine.get_var("speechmute") == "0"
+
+
+def test_comparisons_take_bare_text_from_wildcards():
+    sink, engine, _pack = _load(
+        '#trigger {* hugs you.} {#if {%1 = "Brutus"} {#say bonk} {#say {hug %1}}}'
+    )
+    engine.process_line(Line("Brutus hugs you."))
+    engine.process_line(Line("Fred hugs you."))
+    assert _said(sink) == ["bonk", "hug Fred"]
+
+
+def test_comparisons_are_numeric_when_both_sides_are_numbers_and_ignore_case_otherwise():
+    sink, _engine, _pack = _load(
+        "#var x 05\n#var name Fred\n#var hp 150\n"
+        "#if {@x = 5} {#say numeric}\n"
+        "#if {@name = fred} {#say caseless}\n"
+        "#if {@hp > 20} {#say bigger}\n"
+        "#if {@name <> fred} {#say wrong}\n"
+    )
+    assert _said(sink) == ["numeric", "caseless", "bigger"]
+
+
+def test_an_empty_value_compares_as_empty_text():
+    sink, _engine, _pack = _load(
+        "#var e {}\n"
+        '#if {@e = ""} {#say empty}\n'
+        '#if {@e <> ""} {#say full}\n'
+        '#if {@missing = ""} {#say unset}\n'
+    )
+    assert _said(sink) == ["empty", "unset"]
+
+
+def test_wildcard_compare_matches_like_a_trigger_pattern():
+    sink, engine, _pack = _load(
+        '#trigger {*} {#if {%1 =* "Amy enters from the *"} {#say {hi Amy}}}'
+    )
+    engine.process_line(Line("Amy enters from the north"))
+    engine.process_line(Line("Bob enters from the north"))
+    assert _said(sink) == ["hi Amy"]
+
+
+def test_a_function_result_is_one_value_even_with_operator_characters_in_it():
+    # The official Prometheus sound engine tells loops apart with %Copy(%2,1,2)="l^";
+    # pasting "l^" into the expression as text would read ^ as raising to a power.
+    sink, engine, _pack = _load(
+        '#alias pp {#If {%Copy(%1,1,2)="l^"} {#say looping} {#say once}}'
+    )
+    engine.process_input("pp l^Ship\\Engine@Ext")
+    engine.process_input("pp General\\Beep@Ext")
+    assert _said(sink) == ["looping", "once"]
+
+
+def test_a_variable_goes_into_a_condition_as_text_quotes_and_all():
+    # Cosmic Rage stores its settings with the quotes (#var speech "disabled", and the same
+    # in its settings file) and checks them with @intromusic = "enabled"; that only holds if
+    # the variable's text, quotes included, becomes part of the condition.
+    sink, engine, _pack = _load(
+        '#var intromusic "Enabled"\n'
+        "#trigger {Welcome to: cosmic rage!}"
+        ' {#if {@intromusic = "enabled"} {#say music}} {} AnyCase'
+    )
+    engine.process_line(Line("Welcome to: cosmic rage!"))
+    assert engine.get_var("intromusic") == '"Enabled"'
+    assert _said(sink) == ["music"]
+
+
+def test_a_quoted_wildcard_compares_as_the_text_inside_the_quotes():
+    sink, engine, _pack = _load('#trigger {* says, *} {#if {%2 = "Fred"} {#say match}}')
+    engine.process_line(Line('Bob says, "Fred"'))
+    assert _said(sink) == ["match"]
+
+
+def test_text_with_a_hyphen_stays_text():
+    sink, engine, _pack = _load('#trigger {wear *} {#if {%1 = gold-plated} {#say shiny}}')
+    engine.process_line(Line("wear gold-plated"))
+    assert _said(sink) == ["shiny"]
+
+
+def test_a_real_footstep_condition_from_the_official_prometheus_pack():
+    sink, engine, _pack = _load(
+        "#var FootstepTmp1 {Metal}\n#var PlayOtherTreadSound 1\n#var PlayTreadSound 0\n"
+        "#alias pstep {#If {%Length(@FootstepTmp1)>0 and ((%1=\"Other\" and"
+        " @PlayOtherTreadSound=1) or (%1=\"You\" and @PlayTreadSound=1))} {#say step}}"
+    )
+    engine.process_input("pstep Other")
+    engine.process_input("pstep You")
+    assert _said(sink) == ["step"]
+
+
+# --- functions (manual 5.3) ---
+
+
+def test_functions_nest_and_do_their_own_arithmetic():
+    sink, _engine, _pack = _load(
+        "#var oldString  {This is the text we want, this is the text we do not want}\n"
+        '#say  {%copy(@oldstring,1,%pos(",",@oldstring)-1)}\n'
+    )
+    assert _said(sink) == ["This is the text we want"]
+
+
+def test_case_picks_a_value_by_number():
+    _sink, engine, _pack = _load("#var InVal 3\n#var answer %case(@InVal,5,7,8,12)")
+    assert engine.get_var("answer") == "8"
+
+
+def test_chr_delete_and_proper():
+    sink, _engine, _pack = _load(
+        "#say {%chr(72)%chr(105)}\n"
+        "#var TempVar {I am not going}\n"
+        "#say %delete(@TempVar,6,4)\n"
+        "#say {%proper(aMY.)}\n"
+    )
+    assert _said(sink) == ["Hi", "I am going", "Amy."]
+
+
+def test_list_items_are_deleted_by_number_or_by_contents():
+    sink, _engine, _pack = _load(
+        '#say {%delNItem("Gloves|armour|boots",2)}\n'
+        '#say {%delItem("gloves|armour|boots","boots")}\n'
+    )
+    assert _said(sink) == ["Gloves|boots", "gloves|armour"]
+
+
+def test_eval_and_if_return_values_inside_text():
+    sink, _engine, _pack = _load(
+        "#var Experience 150\n#var oldExperience 100\n#var answer 1\n#var wrong 0\n"
+        "#say {You have gained %eval(@Experience - @oldExperience) points}\n"
+        '#say {%if(@answer,"Yes the answer is correct","Too bad")}\n'
+        '#say {%if(@wrong,"Yes the answer is correct","Too bad")}\n'
+    )
+    assert _said(sink) == ["You have gained 50 points", "Yes the answer is correct", "Too bad"]
+
+
+def test_ifword_and_isnumber():
+    sink, _engine, _pack = _load(
+        "#var cmd kill\n"
+        '#say {%IfWord(@cmd,enter|k|kill|flee,"|")}\n'
+        '#say {%IfWord(flee~s,enter|k|kill|flee,"|")}\n'
+        "#say {%IsNumber(42) %IsNumber(abc) %isnumber(-3)}\n"
+    )
+    assert _said(sink) == ["1", "0", "1 0 1"]
+
+
+def test_string_slicing_length_and_trims():
+    sink, _engine, _pack = _load(
+        "#var TestVar {123456789}\n"
+        "#say {%left(@testvar,5) %right(@testvar,2) %length(@testvar)}\n"
+        '#var s1 {"   The time has come.  "}\n'
+        "#var s1 {%trim(@s1)}\n"
+        "#say {[@s1]}\n"
+        "#say {[%ltrim(  x )][%rtrim(  y  )]}\n"
+    )
+    assert _said(sink) == ["12345 89 9", "[The time has come.]", "[x ][  y]"]
+
+
+def test_min_and_max_take_any_number_of_values():
+    sink, _engine, _pack = _load(
+        "#var potionCount 3\n#var experience 500\n#var mana 80\n"
+        "#say {Buy %max(5,10-@potionCount) potions}\n"
+        "#say {%min(@experience,@mana, 100)}\n"
+    )
+    assert _said(sink) == ["Buy 7 potions", "80"]
+
+
+def test_word_and_numwords():
+    sink, _engine, _pack = _load(
+        "#var sentence {the quick brown fox}\n"
+        "#say {%word(@sentence, ,%numWords(@sentence)-1)}\n"
+        '#say {%word("a|b|c","|",2) %word("a|b|c","|",9) %numwords("a|b|c","|")}\n'
+    )
+    assert _said(sink) == ["brown", "b c 3"]
+
+
+def test_push_and_pop_keep_a_stack_in_a_list_variable():
+    sink, engine, _pack = _load(
+        "#var travels {}\n"
+        "#alias JustSeen {@travels = %push(@travels,%0)}\n"
+        "#alias LookFor {#say %pop(travels)}\n"
+    )
+    for place in ("gold palace", "iron bridge", "Wishing Well"):
+        engine.process_input(f"justSeen {place}")
+    assert engine.get_var("travels") == "Wishing Well|iron bridge|gold palace"
+    for _ in range(3):
+        engine.process_input("LookFor")
+    assert _said(sink) == ["Wishing Well", "iron bridge", "gold palace"]
+    assert engine.get_var("travels") == ""
+
+
+def test_random_stays_inside_its_bounds():
+    _sink, engine, _pack = _load("#key f1 {#var roll %random(1,6)}")
+    rolls = set()
+    for _ in range(60):
+        engine.press_key("f1")
+        rolls.add(int(engine.get_var("roll")))
+    assert rolls <= set(range(1, 7))
+    assert len(rolls) > 1
+
+
+def test_replace_reverse_and_sort():
+    sink, _engine, _pack = _load(
+        "#var s1 {Thexbrownxdogxranxquickly.}\n"
+        "#var findString x\n"
+        '#var replaceString {" "}\n'
+        "#say {%replace(@s1,@findString,@replaceString)}\n"
+        "#var s {A|b|c|d}\n#say {%reverseList(@s)}\n"
+        "#var s {b|c|a|e|d}\n#say {%sort(@s,0)}\n#say {%sort(@s,1)}\n"
+    )
+    assert _said(sink) == [
+        "The brown dog ran quickly.", "d|c|b|A", "a|b|c|d|e", "e|d|c|b|a",
+    ]
+
+
+def test_switch_direction_uses_the_direction_table():
+    sink, _engine, _pack = _load("#say {%SwitchDirection(W) %switchdirection(north)}")
+    assert _said(sink) == ["E south"]
+
+
+def test_system_variables():
+    sink, engine, _pack = _load("#var line {a%crlf%b}\n#say {[%version]}")
+    assert engine.get_var("line") == "a\r\n%b"  # %b isn't a system variable
+    version = _said(sink)[0]
+    assert version.startswith("[") and version[1:-1].isdigit()
+    assert len(version) == 8  # %version is xyyzzz
+
+
+def test_an_unknown_function_or_a_lone_percent_sign_is_left_as_written():
+    sink, _engine, _pack = _load("#say {50%off(sale) and 100% sure}")
+    assert _said(sink) == ["50%off(sale) and 100% sure"]

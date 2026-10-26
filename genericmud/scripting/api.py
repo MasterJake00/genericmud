@@ -391,6 +391,11 @@ class ScriptApi:
         """The registration source (pack id) that rules from this api are tagged with."""
         return self._source
 
+    @property
+    def world_name(self) -> str:
+        """The name of the world this session plays (VIPMud's %MudName)."""
+        return self._engine.session_name
+
     def _resolve(self, file: str) -> tuple[str, bool]:
         original = file
         resolved = self._confine_media(file)

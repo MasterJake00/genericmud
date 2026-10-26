@@ -1,41 +1,42 @@
-"""VIPMud ``.set`` scripting dialect — clean-room interpreter.
+"""VIPMud ``.set`` scripting dialect: a clean-room interpreter.
 
-VIPMud's language is macro-substitution plus a small command set, documented
-publicly (Order of Chaos wiki). It is not a general-purpose language, so a
-dedicated interpreter targeting the shared :class:`AutomationEngine` is small and
-sufficient. This lets existing VIPMud soundpacks run alongside Lua packs.
+VIPMud's language is text substitution plus a command set, documented in the VIPMud 2.0
+manual. Statements are ``#commands`` and plain lines of text, separated by newlines or
+semicolons; ``{...}`` groups a parameter, and ``~`` makes the next character ordinary.
+
+Before a command runs, its parameters are expanded once: ``@name`` and ``@{name}`` read a
+variable (``@{@name}`` reads it indirectly), ``%1``..``%99`` the rule's wildcards,
+``%name(...)`` calls a built-in function and ``%name`` reads a system variable. What
+substitution inserts is not expanded again in the same pass, which is how packs keep a
+literal ``@``: ``~@`` comes through one pass as ``@``, and ``#Exec`` runs its expanded text
+as commands, a second pass.
+
+Conditions (``#If``, ``#Math``, ``%Eval``) are expressions with the manual's operators.
+Variables, wildcards and function results are single values there, so a value with an
+operator character in it stays one value; other text is a string operand.
 
 Definition commands (load time):
     #TRIGGER <pat> {body}  / #TR <pat> {body}  / #GTRIGGER <pat> {body}  [{} AnyCase]
     #ALIAS <pat> {body}    #KEY <key> {body}
-Action commands (fire time, inside a body):
-    #SAY {text} [mode]   #PLAY {file} [vol]   #PLAYLOOP {file} [vol]
-    #VAR <name> {value}  #GVAR <name> {value}   #STOP
-    #IF {cond} {then} [{else}]
-    #PC <handle> stop|volume N|pan N|frequency N
-    bare text -> sent to the MUD;  bare ``@name = value`` -> variable assignment
-
 Patterns use VIPMud wildcards: ``*`` (any run), ``?`` (one char), and named
 wildcards ``&{name}`` / ``&name`` exposed at fire time as ``@name``.
-Substitution at fire time: ``@var`` -> variable, ``%0..%9`` -> positional capture,
-``%playhandle`` -> the id of the most recently started cue.
 
 Server-controlled packs (e.g. Cosmic Rage) run through this: the MUD streams a
 ``$sphook play:path:vol:...`` line, the trigger captures the fields as ``@action``
-etc., and ``#if`` dispatches to ``#play``/``#playloop``. Unimplemented commands
-(``#math``, the ``%function()`` library, ``#wait``, file I/O, ``#Configure``) are
-ignored, so a pack loads partially but its sound core works.
+etc., and ``#if`` dispatches to ``#play``/``#playloop``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import random
 import re
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote
 
@@ -45,9 +46,6 @@ from genericmud.safepath import confine
 from genericmud.scripting.api import ScriptApi
 
 _DEFINITIONS = {"TRIGGER", "TRIG", "TR", "GTRIGGER", "ALIAS", "KEY"}  # VIPMud allows abbreviation
-_VAR_RE = re.compile(r"@(\w+)")
-_WILDCARD_RE = re.compile(r"%(\d)")
-_FORALL_VAR_RE = re.compile(r"%[Ii]\b")  # #ForAll loop variable (%I / %i), expanded per item
 _SOUND_VARIANT_RE = re.compile(r"\*(\d+)(\.\w+)$")  # "name*N.ext": one random variant of 1..N
 # Named/positional wildcards inside a .set pattern: &{name}, &name, *, ?
 _PATTERN_WILDCARD_RE = re.compile(r"&\{(\w+)\}|&(\w+)|(\*)|(\?)")
@@ -61,25 +59,18 @@ def _fold(name: str) -> str:
     shared with case-sensitive dialects (MUSHclient GetVariable/SetVariable), so the
     folding must happen at this dialect's boundary, on every read and write."""
     return name.lower()
-# A single comparison for #if: left <op> right (longer operators first; <> is
-# VIPMud's not-equal and packs use it heavily, e.g. every pan/pitch gate in
-# Cosmic Rage's $sphook dispatch).
-_CONDITION_RE = re.compile(r"^(.*?)\s*(<=|>=|<>|!=|<|>|=)\s*(.*)$")
-# Fire-time %function(arg) calls the sound core needs: %var (indirect variable
-# read -- how a pack stops a cue whose handle it stored under a server-supplied
-# name), %defined (guards those reads), and %ifword (dispatches Star Conquest's
-# communicator and other category-specific cues).
-_FUNC_RE = re.compile(r"%(var|defined|ifword)\(([^()]*)\)", re.IGNORECASE)
-# #math accepts plain arithmetic once variables are substituted; anything else
-# (names, quotes) is refused rather than guessed at. The character class allows `*`, hence `**`,
-# so exponentiation is rejected separately below -- `9**9**9` is regex-clean but a big-int CPU/
-# memory bomb (and a hostile MUD can feed the operands via a captured variable).
-_MATH_SAFE_RE = re.compile(r"^[\d\s.+\-*/()]+$")
-_MATH_MAX_LEN = 256  # a pan/level calc is tiny; refuse anything pathologically long
+
+
+# Expressions refuse anything longer than this, and nest parentheses only this deep.
+_EXPRESSION_MAX_LENGTH = 8192
+_EXPRESSION_MAX_DEPTH = 64
+# A whole number past this many bits from ^ is refused: a hostile MUD can feed operands
+# through a captured variable, and 9^9^9 would take the client down.
+_POWER_MAX_BITS = 256
 _DEFAULT_VOLUME = 100
 _MASTER_HANDLE = "0"  # VIPMud handle 0 == all cues / master volume
 _MAX_EXEC_DEPTH = 20  # bare-text alias expansion recursion cap (self-invoking alias)
-_PLAY_HANDLE_TOKEN = "%playhandle"
+_VIPMUD_VERSION = "200000"  # %Version: VIPMud 2.0.0 as xyyzzz
 # VIPMud key names ("Alt-Shift-PageUp", "control-f11") -> the combo the window builds
 # (wx_app._key_combo: ctrl, alt, shift in that order, then the key, joined with "+").
 _KEY_MODIFIERS = {"ctrl": "ctrl", "control": "ctrl", "alt": "alt", "shift": "shift"}
@@ -87,6 +78,14 @@ _KEY_MODIFIER_ORDER = ("ctrl", "alt", "shift")
 _KEY_NAMES = {
     "pgup": "pageup", "pgdn": "pagedown", "del": "delete", "ins": "insert",
     "return": "enter", "esc": "escape", "spacebar": "space",
+}
+# %SwitchDirection's opposites, for MUDs whose packs never declare their own with #Direction.
+_OPPOSITE_DIRECTIONS = {
+    "n": "s", "s": "n", "e": "w", "w": "e", "u": "d", "d": "u",
+    "ne": "sw", "sw": "ne", "nw": "se", "se": "nw",
+    "north": "south", "south": "north", "east": "west", "west": "east",
+    "up": "down", "down": "up", "northeast": "southwest", "southwest": "northeast",
+    "northwest": "southeast", "southeast": "northwest", "in": "out", "out": "in",
 }
 _REMOTE_SOUND_MAX_BYTES = 32 * 1024 * 1024
 # A sound that failed to download is left alone this long before a cue tries it again, so a
@@ -180,10 +179,22 @@ def tokenize_statements(source: str) -> list[tuple[str | None, list[_Tok]]]:
                     args.append(_Tok(True, inner))
                 else:
                     word_start = i
-                    while i < n and source[i] not in " \t\r\n;{":
+                    while i < n and source[i] not in " \t\r\n;":
+                        if source[i] == "{":
+                            if i == word_start or source[i - 1] not in "@%":
+                                break
+                            # @{name} and %{1} belong to the word they're in.
+                            _inner, i = _scan_block(source, i)
+                            continue
                         i += 2 if source[i] == _ESCAPE else 1
                     args.append(_Tok(False, source[word_start:i]))
             statements.append((command, args))
+        elif source[i] == ">":
+            # ">" sends the rest of the line to the MUD as it is, semicolons and all.
+            line_start = i
+            while i < n and source[i] not in "\r\n":
+                i += 1
+            statements.append((None, [_Tok(False, source[line_start:i].rstrip())]))
         else:
             line_start = i
             # ';' separates statements in bare text too ("makebetter; look" is two
@@ -290,6 +301,15 @@ def vip_pattern_to_regex(pattern: str) -> str:
     return "".join(out)
 
 
+@lru_cache(maxsize=256)
+def _wildcard_compare_regex(pattern: str) -> re.Pattern[str] | None:
+    """The ``=*`` operator's pattern: a whole-value match, the way a trigger matches a line."""
+    try:
+        return re.compile(f"^{vip_pattern_to_regex(pattern)}$", re.IGNORECASE | re.DOTALL)
+    except re.error:
+        return None
+
+
 def vip_key_to_combo(spec: str) -> str:
     """A VIPMud #key name as the combo the window sends for that keypress.
 
@@ -326,110 +346,103 @@ def _to_int(value: str, default: int) -> int:
         return default
 
 
-def _unquote(text: str) -> str:
-    text = text.strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-        return text[1:-1]
-    return text
-
-
-def _split_function_args(text: str) -> list[str]:
-    """Split a VIPMud function's comma-separated arguments, preserving quoted commas."""
-    args: list[str] = []
-    start = 0
-    quote = ""
-    for i, char in enumerate(text):
-        if quote:
-            if char == quote:
-                quote = ""
-        elif char in "\"'":
-            quote = char
-        elif char == ",":
-            args.append(text[start:i].strip())
-            start = i + 1
-    args.append(text[start:].strip())
-    return args
-
-
-def _strip_outer_parentheses(expression: str) -> str:
-    """Remove parentheses only when they enclose the complete expression."""
-    expression = expression.strip()
-    while len(expression) >= 2 and expression[0] == "(" and expression[-1] == ")":
-        depth = 0
-        quote = ""
-        encloses_all = True
-        for i, char in enumerate(expression):
-            if quote:
-                if char == quote:
-                    quote = ""
-                continue
-            if char in "\"'":
-                quote = char
-            elif char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0 and i != len(expression) - 1:
-                    encloses_all = False
-                    break
-                if depth < 0:
-                    encloses_all = False
-                    break
-        if not encloses_all or depth != 0:
-            break
-        expression = expression[1:-1].strip()
-    return expression
-
-
-def _split_boolean(expression: str, operator: str) -> list[str]:
-    """Split a top-level ``and``/``or``, ignoring quoted text and parenthesized groups."""
-    parts: list[str] = []
-    start = 0
-    depth = 0
-    quote = ""
-    lower = expression.lower()
-    i = 0
-    while i < len(expression):
-        char = expression[i]
-        if quote:
-            if char == quote:
-                quote = ""
-            i += 1
-            continue
-        if char in "\"'":
-            quote = char
-            i += 1
-            continue
-        if char == "(":
-            depth += 1
-            i += 1
-            continue
-        if char == ")":
-            depth = max(0, depth - 1)
-            i += 1
-            continue
-        end = i + len(operator)
-        before_word = i > 0 and (expression[i - 1].isalnum() or expression[i - 1] == "_")
-        after_word = end < len(expression) and (
-            expression[end].isalnum() or expression[end] == "_"
-        )
-        if depth == 0 and lower[i:end] == operator and not before_word and not after_word:
-            parts.append(expression[start:i].strip())
-            start = end
-            i = end
-            continue
-        i += 1
-    if parts:
-        parts.append(expression[start:].strip())
-        return parts
-    return [expression]
-
-
 def _as_number(text: str) -> float | None:
     try:
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+_INTEGER_RE = re.compile(r"^[+-]?\d{1,30}$")
+_DECIMAL_RE = re.compile(r"^[+-]?(?:\d{1,30}\.\d{0,30}|\.\d{1,30})$")
+
+
+def _number(text: str) -> int | float | None:
+    """``text`` as a VIPMud number, or None when it isn't one.
+
+    Only plain decimal notation counts: Python's float() would also take "inf", "nan",
+    "1e5" and "1_000", none of which a VIPMud script means as a number.
+    """
+    text = text.strip()
+    if _INTEGER_RE.match(text):
+        return int(text)
+    if _DECIMAL_RE.match(text):
+        return float(text)
+    return None
+
+
+def _format_number(value: int | float) -> str:
+    if isinstance(value, float):
+        if value.is_integer() and abs(value) < 1e15:
+            return str(int(value))
+        return format(value, ".10g")
+    return str(value)
+
+
+def _truthy(text: str) -> bool:
+    """VIPMud's truth: a number is true unless zero; text is true unless empty."""
+    number = _number(text)
+    if number is not None:
+        return number != 0
+    return text.strip() != ""
+
+
+def _unquote(text: str) -> str:
+    """Text without the double quotes around it, if it is exactly one quoted string."""
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+        return stripped[1:-1]
+    return text
+
+
+def _skip_quoted(text: str, i: int) -> int:
+    """``text[i]`` is ``"``; the index after its closing quote (or the end of the text)."""
+    j = i + 1
+    while j < len(text):
+        if text[j] == _ESCAPE:
+            j += 2
+            continue
+        if text[j] == '"':
+            return j + 1
+        j += 1
+    return len(text)
+
+
+def _scan_call(text: str, open_index: int) -> tuple[list[str], int] | None:
+    """Split ``%name(a,b,...)`` at ``text[open_index] == "("`` into its raw arguments.
+
+    Commas inside quotes, braces or nested parentheses belong to their argument, and ``~,``
+    is an ordinary comma. Returns the arguments and the index after ``)``, or None when the
+    call is never closed.
+    """
+    depth = 0
+    start = open_index + 1
+    args: list[str] = []
+    i = open_index
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == _ESCAPE:
+            i += 2
+            continue
+        if c == '"':
+            i = _skip_quoted(text, i)
+            continue
+        if c == "{":
+            _inner, i = _scan_block(text, i)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                args.append(text[start:i])
+                return args, i + 1
+        elif c == "," and depth == 1:
+            args.append(text[start:i])
+            start = i + 1
+        i += 1
+    return None
 
 
 def _expand_sound_variant(path: str) -> str:
@@ -444,6 +457,233 @@ def _expand_sound_variant(path: str) -> str:
     count = int(match.group(1))
     pick = random.randint(1, count) if count >= 1 else 1
     return path[: match.start()] + str(pick) + match.group(2)
+
+
+# --- expressions ---
+
+# Longest first, so "<=" isn't read as "<" then "=".
+_EXPRESSION_SYMBOLS = ("=*", "<=", ">=", "<>", "!=", "=", "<", ">", "+", "-", "*", "/", "\\", "^")
+_EXPRESSION_WORDS = frozenset({"and", "or", "xor", "not"})
+_WORD_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_."
+)
+_COMPARISONS = ("=*", "<=", ">=", "<>", "!=", "=", "<", ">")
+
+
+@dataclass
+class _ExpressionToken:
+    kind: str  # "op", "(", ")", "value" or "space"
+    text: str  # the operator (word operators lowercased), or the value's text
+    quoted: bool = False  # a "..." string
+
+    @property
+    def source(self) -> str:
+        return f'"{self.text}"' if self.quoted else self.text
+
+
+class _ExpressionError(Exception):
+    """The text isn't an expression this interpreter can evaluate."""
+
+
+@dataclass
+class _Value:
+    text: str
+    start: int  # the token span it came from, for operators that fall back to plain text
+    end: int
+    missing: bool = False  # no operand was written here ("= 1", or between two operators)
+
+
+class _ExpressionParser:
+    """Evaluate expression tokens with the manual's operators, lowest precedence first:
+    XOR, OR, AND, the comparisons, + and -, *, / and \\ (modulus), ^, then NOT and signs.
+
+    Arithmetic on something that isn't a number gives back the text it was written as, so
+    "gold-plated" compared with a captured "gold-plated" is still equal.
+    """
+
+    def __init__(self, tokens: list[_ExpressionToken]) -> None:
+        self._tokens = tokens
+        self._position = 0
+
+    def parse(self) -> str:
+        value = self._xor()
+        self._skip_spaces()
+        if self._position < len(self._tokens):
+            raise _ExpressionError(f"unexpected {self._tokens[self._position].text!r}")
+        return value.text
+
+    # --- token helpers ---
+
+    def _skip_spaces(self) -> None:
+        while self._position < len(self._tokens) and self._tokens[self._position].kind == "space":
+            self._position += 1
+
+    def _operator(self, choices: tuple[str, ...]) -> str | None:
+        self._skip_spaces()
+        if self._position < len(self._tokens):
+            token = self._tokens[self._position]
+            if token.kind == "op" and token.text in choices:
+                self._position += 1
+                return token.text
+        return None
+
+    def _source(self, start: int, end: int) -> str:
+        return "".join(token.source for token in self._tokens[start:end]).strip()
+
+    def _binary(self, operand, operators: tuple[str, ...], apply) -> _Value:
+        left = operand()
+        while True:
+            operator = self._operator(operators)
+            if operator is None:
+                return left
+            right = operand()
+            text = apply(operator, left, right)
+            left = _Value(text, left.start, right.end)
+
+    # --- precedence levels ---
+
+    def _xor(self) -> _Value:
+        return self._binary(self._or, ("xor",), self._logical)
+
+    def _or(self) -> _Value:
+        return self._binary(self._and, ("or",), self._logical)
+
+    def _and(self) -> _Value:
+        return self._binary(self._comparison, ("and",), self._logical)
+
+    def _comparison(self) -> _Value:
+        return self._binary(self._additive, _COMPARISONS, self._compare)
+
+    def _additive(self) -> _Value:
+        return self._binary(self._multiplicative, ("+", "-"), self._arithmetic)
+
+    def _multiplicative(self) -> _Value:
+        return self._binary(self._power, ("*", "/", "\\"), self._arithmetic)
+
+    def _power(self) -> _Value:
+        return self._binary(self._unary, ("^",), self._arithmetic)
+
+    def _unary(self) -> _Value:
+        start = self._position
+        operator = self._operator(("not", "-", "+"))
+        if operator is None:
+            return self._primary()
+        operand = self._unary()
+        if operand.missing:
+            raise _ExpressionError(f"nothing after {operator!r}")
+        if operator == "not":
+            return _Value("0" if _truthy(operand.text) else "1", start, operand.end)
+        number = 0 if not operand.text.strip() else _number(operand.text)
+        if number is None:
+            return _Value(self._source(start, operand.end), start, operand.end)
+        return _Value(_format_number(-number if operator == "-" else number), start, operand.end)
+
+    def _primary(self) -> _Value:
+        self._skip_spaces()
+        start = self._position
+        if start >= len(self._tokens) or self._tokens[start].kind in ("op", ")"):
+            return _Value("", start, start, missing=True)
+        if self._tokens[start].kind == "(":
+            self._position += 1
+            value = self._xor()
+            self._skip_spaces()
+            if self._position >= len(self._tokens) or self._tokens[self._position].kind != ")":
+                raise _ExpressionError("unclosed parenthesis")
+            self._position += 1
+            return _Value(value.text, start, self._position)
+        # An operand is every value and space up to the next operator or parenthesis.
+        end = start
+        while end < len(self._tokens) and self._tokens[end].kind in ("value", "space"):
+            end += 1
+        while end > start and self._tokens[end - 1].kind == "space":
+            end -= 1
+        self._position = end
+        tokens = self._tokens[start:end]
+        if len(tokens) == 1:
+            return _Value(tokens[0].text, start, end)
+        return _Value("".join(token.text for token in tokens).strip(), start, end)
+
+    # --- operators ---
+
+    @staticmethod
+    def _logical(operator: str, left: _Value, right: _Value) -> str:
+        if left.missing or right.missing:
+            raise _ExpressionError(f"{operator!r} needs a value on both sides")
+        a, b = _truthy(left.text), _truthy(right.text)
+        result = {"and": a and b, "or": a or b, "xor": a != b}[operator]
+        return "1" if result else "0"
+
+    @staticmethod
+    def _compare(operator: str, left: _Value, right: _Value) -> str:
+        if operator == "=*":
+            regex = _wildcard_compare_regex(right.text)
+            return "1" if regex is not None and regex.match(left.text) else "0"
+        a, b = _number(left.text), _number(right.text)
+        if operator in ("<", ">", "<=", ">="):
+            # An unset variable is zero next to a number, as with VIPMud's Explicit off.
+            if a is None and not left.text.strip() and b is not None:
+                a = 0
+            if b is None and not right.text.strip() and a is not None:
+                b = 0
+        if a is not None and b is not None:
+            x: object = a
+            y: object = b
+        else:
+            x, y = left.text.casefold(), right.text.casefold()
+        result = {
+            "=": x == y, "<>": x != y, "!=": x != y,
+            "<": x < y, ">": x > y, "<=": x <= y, ">=": x >= y,  # type: ignore[operator]
+        }[operator]
+        return "1" if result else "0"
+
+    def _arithmetic(self, operator: str, left: _Value, right: _Value) -> str:
+        if left.missing or right.missing:
+            raise _ExpressionError(f"{operator!r} needs a value on both sides")
+        a = 0 if not left.text.strip() else _number(left.text)
+        b = 0 if not right.text.strip() else _number(right.text)
+        if a is None or b is None:
+            return self._source(left.start, right.end)  # not numbers: it was text
+        result = _calculate(operator, a, b)
+        if result is None:
+            return self._source(left.start, right.end)
+        return _format_number(result)
+
+
+def _calculate(operator: str, a: int | float, b: int | float) -> int | float | None:
+    """One arithmetic step. VIPMud works in whole numbers, so whole operands divide whole."""
+    whole = isinstance(a, int) and isinstance(b, int)
+    if operator == "+":
+        return a + b
+    if operator == "-":
+        return a - b
+    if operator == "*":
+        return a * b
+    if operator == "/":
+        if b == 0:
+            return 0
+        if whole:
+            quotient = abs(a) // abs(b)  # type: ignore[operator]
+            return quotient if (a >= 0) == (b >= 0) else -quotient
+        return a / b
+    if operator == "\\":
+        if b == 0:
+            return 0
+        if whole:
+            quotient = abs(a) // abs(b)  # type: ignore[operator]
+            quotient = quotient if (a >= 0) == (b >= 0) else -quotient
+            return a - b * quotient
+        return math.fmod(a, b)
+    if operator == "^":
+        if whole and b >= 0:
+            if abs(a) > 1 and b * math.log2(abs(a)) > _POWER_MAX_BITS:
+                return None
+            return a**b
+        try:
+            result = float(a) ** float(b)
+        except (OverflowError, ZeroDivisionError):
+            return None
+        return None if isinstance(result, complex) or math.isinf(result) else result
+    return None
 
 
 _SETTINGS_RECORD = 128  # VIPMud settings files store one value per fixed 128-byte record
@@ -517,6 +757,19 @@ class _VipFile:
     dirty: bool = False
 
 
+@dataclass
+class _Scope:
+    """What a running script can see: the wildcards of the rule that started it, the line
+    it fired on, and the #ForAll item it is working through (%i)."""
+
+    wildcards: list[str]
+    line: Line | None = None
+    loops: list[tuple[str, int]] = field(default_factory=list)  # (%i, %repeatnum), innermost last
+
+    def looping(self, item: str, number: int) -> _Scope:
+        return _Scope(self.wildcards, self.line, [*self.loops, (item, number)])
+
+
 class _Abort(Exception):  # noqa: N818 - a control-flow signal (#Abort), not an error condition
     """Raised by ``#Abort`` to stop the current script body (a trigger fire or a load)."""
 
@@ -533,6 +786,10 @@ class VipMudPack:
         self._next_handle = 1
         self._exec_depth = 0  # bare-text -> alias-pipeline recursion guard
         self._last_handle = _MASTER_HANDLE
+        self._last_loop_handle = _MASTER_HANDLE  # %MP3Loop: the newest looping cue
+        self._master_volume = _DEFAULT_VOLUME  # %Volume, set by #pc 0 volume
+        self._clipboard = ""  # #Clipboard / %Clipboard
+        self._directions = dict(_OPPOSITE_DIRECTIONS)  # #Direction adds a pack's own
         self._remote_sound_base: str | None = None
         self._remote_sound_root: Path | None = None
         # Sounds fetched in the background (see _fetch_in_background), by URL: the download
@@ -642,12 +899,13 @@ class VipMudPack:
                 temporary.unlink(missing_ok=True)
 
     def load_source(self, source: str) -> None:
+        scope = _Scope([])
         for command, args in tokenize_statements(source):
             if command in _DEFINITIONS:
                 self._define(command, args)
             else:
                 try:
-                    self._execute_statement(command, args, [])
+                    self._execute_statement(command, args, scope)
                 except _Abort:
                     return  # a top-level #Abort stops loading the rest of this script
 
@@ -690,7 +948,7 @@ class VipMudPack:
             # %0 is everything typed after the alias name; %1.. are its words in turn.
             wildcards = [parameters, *parameters.split()]
             try:
-                self._execute_body(body, wildcards, line=ctx.line)
+                self._execute_body(body, _Scope(wildcards, ctx.line))
             except _Abort:
                 pass  # #Abort: stop this alias body early, leaving prior effects in place
 
@@ -701,35 +959,35 @@ class VipMudPack:
             for name, value in ctx.named.items():  # named wildcards become @vars
                 self._api.set_var(_fold(name), value or "")
             try:
-                self._execute_body(body, ctx.wildcards, line=ctx.line)
+                self._execute_body(body, _Scope(ctx.wildcards, ctx.line))
             except _Abort:
                 pass  # #Abort: stop this trigger body early, leaving prior effects in place
 
         return run
 
-    def _execute_body(self, body: str, wildcards: list[str], line: Line | None = None) -> None:
+    def _execute_body(self, body: str, scope: _Scope) -> None:
         for command, args in tokenize_statements(body):
-            self._execute_statement(command, args, wildcards, line)
+            self._execute_statement(command, args, scope)
 
-    def _execute_statement(
-        self, command: str | None, args: list[_Tok], wildcards: list[str], line: Line | None = None
-    ) -> None:
+    def _execute_statement(self, command: str | None, args: list[_Tok], scope: _Scope) -> None:
         if command is None or command == "SEND":
-            self._bare_or_send(args, wildcards)
+            self._bare_or_send(args, scope)
         elif command == "SAY" and args:
-            self._api.speak(self._subst(args[0].text, wildcards))
+            self._api.speak(self._expand(args[0].text, scope))
         elif command in ("PLAY", "PLAYLOOP") and args:
-            self._play(args, wildcards, loop=command == "PLAYLOOP")
-        elif command == "VAR" and len(args) > 1:
-            name = _fold(self._subst(args[0].text, wildcards))  # @-indirect target supported
-            self._api.set_var(name, self._subst(args[1].text, wildcards))
-        elif command == "GVAR" and len(args) > 1:  # global namespace; @-reads still resolve it
-            name = _fold(self._subst(args[0].text, wildcards))
-            self._api.set_gvar(name, self._subst(args[1].text, wildcards))
+            self._play(args, scope, loop=command == "PLAYLOOP")
+        elif command in ("VAR", "GVAR") and args:
+            # #Var name [value]: no value still defines the variable, empty.
+            name = _fold(self._expand(args[0].text, scope))  # @-indirect target supported
+            value = self._expand(args[1].text, scope) if len(args) > 1 else ""
+            if command == "GVAR":  # global namespace; @-reads still resolve it
+                self._api.set_gvar(name, value)
+            else:
+                self._api.set_var(name, value)
         elif command == "UNVAR" and args:
-            self._api.delete_var(_fold(self._subst(args[0].text, wildcards)))
+            self._api.delete_var(_fold(self._expand(args[0].text, scope)))
         elif command == "MATH" and len(args) > 1:
-            self._execute_math(args, wildcards)
+            self._execute_math(args, scope)
         elif command == "STOP":
             # VIPMud #Stop halts every playing sound. The api default channel ("sound")
             # is one this dialect never plays on -- every cue goes to a per-cue vip-N
@@ -737,31 +995,41 @@ class VipMudPack:
             self._pending_cues.clear()
             self._api.flush()
         elif command == "IF" and args:
-            self._execute_if(args, wildcards, line)
+            self._execute_if(args, scope)
+        elif command in ("EXEC", "EXECUTE") and args:
+            # #Exec runs its parameter, expanded once more, as commands of its own.
+            self._execute_body(self._expand(args[0].text, scope), scope)
         elif command == "FORALL" and len(args) > 1:
-            self._execute_forall(args, wildcards, line)
+            self._execute_forall(args, scope)
         elif command == "ALARM" and len(args) > 1:
-            self._execute_alarm(args, wildcards)
-        elif command == "GAGLINE" and line is not None:
+            self._execute_alarm(args, scope)
+        elif command == "GAGLINE" and scope.line is not None:
             # "#gagline [count] voice" gags self-voice but keeps the line reviewable; without a
             # "voice" arg ("all", a bare count, or nothing) it removes the line entirely. Packs
             # play a sound in the gagged line's place. (SC writes "voice"; Prometheus "1 Voice".)
-            line.gagged = True
-            line.display_when_gagged = any(a.text.lower() == "voice" for a in args)
+            scope.line.gagged = True
+            scope.line.display_when_gagged = any(a.text.lower() == "voice" for a in args)
         elif command == "ABORT":
             raise _Abort
         elif command == "PC" and len(args) > 1:
-            self._execute_pc(args, wildcards)
+            self._execute_pc(args, scope)
         elif command == "LOAD" and args:
-            self._load_file(self._subst(args[0].text, wildcards))
+            self._load_file(self._expand(args[0].text, scope))
         elif command == "FILE" and len(args) > 1:
-            self._open_file(args, wildcards)
+            self._open_file(args, scope)
         elif command == "READ" and len(args) > 2:
-            self._read_file(args, wildcards)
+            self._read_file(args, scope)
         elif command == "WRITE" and len(args) > 2:
-            self._write_file(args, wildcards)
+            self._write_file(args, scope)
         elif command == "CLOSE" and args:
-            self._close_file(args, wildcards)
+            self._close_file(args, scope)
+        elif command in ("CLIP", "CLIPBOARD") and args:
+            self._clipboard = self._expand(args[0].text, scope)
+        elif command in ("DIR", "DIRECTION") and len(args) > 1:
+            way = self._expand(args[0].text, scope).strip().lower()
+            back = self._expand(args[1].text, scope).strip()
+            if way and back:
+                self._directions[way] = back
         # Unknown #commands are ignored rather than sent to the MUD (Phase 2 features).
 
     def _resolve_in_pack(self, reference: str, *, must_exist: bool) -> Path | None:
@@ -812,13 +1080,13 @@ class VipMudPack:
         self._loaded.add(key)
         self.load_source(real.read_text(encoding="latin-1", errors="ignore"))
 
-    def _open_file(self, args: list[_Tok], wildcards: list[str]) -> None:
+    def _open_file(self, args: list[_Tok], scope: _Scope) -> None:
         """``#file <handle> {path} [mode]`` — open a VIPMud settings file under a handle so
         #Read/#Write address it by record number. Reading the pack's shipped settings is what
         turns its sound-enable flags on (e.g. Star Conquest gates every #Play on @silent=1, which
         lives in Settings.set); without this they keep the off-by-default set before the read."""
-        handle = self._subst(args[0].text, wildcards)
-        path = self._resolve_in_pack(self._subst(args[1].text, wildcards), must_exist=False)
+        handle = self._expand(args[0].text, scope).strip()
+        path = self._resolve_in_pack(self._expand(args[1].text, scope), must_exist=False)
         values: list[str] = []
         if path is not None and path.is_file():
             try:
@@ -827,31 +1095,31 @@ class VipMudPack:
                 values = []
         self._files[handle] = _VipFile(path=path, values=values)
 
-    def _read_file(self, args: list[_Tok], wildcards: list[str]) -> None:
+    def _read_file(self, args: list[_Tok], scope: _Scope) -> None:
         """``#Read <handle> <var> <record>`` — read a 1-based record into the variable."""
-        vfile = self._files.get(self._subst(args[0].text, wildcards))
+        vfile = self._files.get(self._expand(args[0].text, scope).strip())
         if vfile is None:
             return
-        index = _to_int(self._subst(args[2].text, wildcards), 0) - 1
+        index = _to_int(self._expand(args[2].text, scope), 0) - 1
         if 0 <= index < len(vfile.values):
-            self._api.set_var(_fold(args[1].text), vfile.values[index])
+            self._api.set_var(_fold(self._expand(args[1].text, scope)), vfile.values[index])
 
-    def _write_file(self, args: list[_Tok], wildcards: list[str]) -> None:
+    def _write_file(self, args: list[_Tok], scope: _Scope) -> None:
         """``#Write <handle> <value> <record>`` — set a 1-based record (flushed on #Close)."""
-        vfile = self._files.get(self._subst(args[0].text, wildcards))
+        vfile = self._files.get(self._expand(args[0].text, scope).strip())
         if vfile is None:
             return
-        index = _to_int(self._subst(args[2].text, wildcards), 0) - 1
+        index = _to_int(self._expand(args[2].text, scope), 0) - 1
         if index < 0:
             return
         while len(vfile.values) <= index:
             vfile.values.append("")
-        vfile.values[index] = self._subst(args[1].text, wildcards)
+        vfile.values[index] = self._expand(args[1].text, scope)
         vfile.dirty = True
 
-    def _close_file(self, args: list[_Tok], wildcards: list[str]) -> None:
+    def _close_file(self, args: list[_Tok], scope: _Scope) -> None:
         """``#Close <handle>`` — flush a written settings file back to disk, then drop it."""
-        vfile = self._files.pop(self._subst(args[0].text, wildcards), None)
+        vfile = self._files.pop(self._expand(args[0].text, scope).strip(), None)
         if vfile is not None and vfile.dirty and vfile.path is not None:
             try:
                 vfile.path.parent.mkdir(parents=True, exist_ok=True)
@@ -859,15 +1127,17 @@ class VipMudPack:
             except OSError:
                 pass
 
-    def _bare_or_send(self, args: list[_Tok], wildcards: list[str]) -> None:
+    def _bare_or_send(self, args: list[_Tok], scope: _Scope) -> None:
         if not args:
             return
         text = args[-1].text
+        if text.startswith(">"):
+            # The manual's pass-through: the rest of the line goes to the MUD as written.
+            self._api.send(text[1:])
+            return
         assignment = _ASSIGN_RE.match(text)
         if assignment:  # "@name = value" sets a variable; it isn't sent to the MUD
-            self._api.set_var(
-                _fold(assignment.group(1)), self._subst(assignment.group(2), wildcards)
-            )
+            self._api.set_var(_fold(assignment.group(1)), self._expand(assignment.group(2), scope))
             return
         # Bare text runs "as if typed": VIPMud expands aliases in script bodies (packs
         # call their own aliases by name, e.g. CR's `makebetter`), so route through the
@@ -877,19 +1147,21 @@ class VipMudPack:
             return
         self._exec_depth += 1
         try:
-            self._api.execute(self._subst(text, wildcards))
+            self._api.execute(self._expand(text, scope))
         finally:
             self._exec_depth -= 1
 
-    def _play(self, args: list[_Tok], wildcards: list[str], *, loop: bool) -> None:
-        file = _expand_sound_variant(self._subst(args[0].text, wildcards))
+    def _play(self, args: list[_Tok], scope: _Scope, *, loop: bool) -> None:
+        file = _expand_sound_variant(self._expand(args[0].text, scope))
         volume = _DEFAULT_VOLUME
         if len(args) > 1:
-            volume = _to_int(self._subst(args[1].text, wildcards), _DEFAULT_VOLUME)
+            volume = _to_int(self._expand(args[1].text, scope), _DEFAULT_VOLUME)
         handle = str(self._next_handle)
         self._next_handle += 1
         channel = f"vip-{handle}"  # one channel per cue so #pc can target it later
         self._handles[handle] = channel
+        if loop:
+            self._last_loop_handle = handle
         if not self._api.sound_exists(file) and self._fetch_in_background(
             file, channel, volume, loop
         ):
@@ -952,25 +1224,22 @@ class VipMudPack:
                 continue  # stopped while it was downloading
             self._api.play(cue.file, channel=channel, gain=cue.gain, pan=cue.pan, loop=cue.loop)
 
-    def _execute_if(self, args: list[_Tok], wildcards: list[str], line: Line | None = None) -> None:
-        branch = 1 if self._eval_condition(args[0].text, wildcards) else 2  # then : else
+    def _execute_if(self, args: list[_Tok], scope: _Scope) -> None:
+        branch = 1 if self._condition(args[0].text, scope) else 2  # then : else
         if len(args) > branch:
-            self._execute_body(args[branch].text, wildcards, line)
+            self._execute_body(args[branch].text, scope)
 
-    def _execute_forall(
-        self, args: list[_Tok], wildcards: list[str], line: Line | None = None
-    ) -> None:
-        """``#ForAll {a|b|c} {body}`` — run ``body`` once per ``|``-separated item with the loop
-        token ``%I`` replaced by the item. VIPMud loaders use it to pull in every script, e.g.
+    def _execute_forall(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#ForAll {a|b|c} {body}`` — run ``body`` once per ``|``-separated item, with the
+        item in ``%i``. VIPMud loaders use it to pull in every script, e.g.
         ``#ForAll {combat|ground|...} {#load {Scripts\\%I.set}}``."""
         body = args[1].text
-        for item in self._subst(args[0].text, wildcards).split("|"):
+        for number, item in enumerate(self._expand(args[0].text, scope).split("|"), 1):
             item = item.strip()
             if item:
-                expanded = _FORALL_VAR_RE.sub(lambda _m, it=item: it, body)
-                self._execute_body(expanded, wildcards, line)
+                self._execute_body(body, scope.looping(item, number))
 
-    def _execute_alarm(self, args: list[_Tok], wildcards: list[str]) -> None:
+    def _execute_alarm(self, args: list[_Tok], scope: _Scope) -> None:
         """``#alarm <delay> {body}`` — run ``body`` after ``delay`` seconds (a VIPMud timer).
 
         Packs defer loading the rest of the pack until the login line arrives, via
@@ -978,68 +1247,40 @@ class VipMudPack:
         ``#unalarm``) aren't modelled. Fires only when an event loop drives the engine's
         scheduler (the live app); under a no-op scheduler the timer simply never runs.
         """
-        delay = _as_number(self._subst(args[0].text, wildcards))
+        delay = _as_number(self._expand(args[0].text, scope))
         if delay is None or delay < 0:
             return
         body = args[1].text
-        self._api.add_timer(delay, lambda: self._execute_body(body, []))
+        self._api.add_timer(delay, lambda: self._run_alarm(body))
 
-    def _execute_math(self, args: list[_Tok], wildcards: list[str]) -> None:
+    def _run_alarm(self, body: str) -> None:
+        # An alarm body runs later, on its own: the wildcards of whatever set it are gone.
+        try:
+            self._execute_body(body, _Scope([]))
+        except _Abort:
+            pass
+
+    def _execute_math(self, args: list[_Tok], scope: _Scope) -> None:
         """``#math <var> {expr}`` — arithmetic into a variable. Cosmic Rage computes its
         stereo pan with it (``#math pan {@pan * 50}``), so without it every directional
-        cue collapsed to center. Only plain arithmetic survives substitution; anything
-        with residual names is refused (never eval'd)."""
-        expression = self._subst(args[1].text, wildcards)
-        clean = _MATH_SAFE_RE.match(expression) and "**" not in expression
-        if not clean or len(expression) > _MATH_MAX_LEN:
-            return  # reject names, exponentiation (a big-int bomb), and over-long expressions
-        try:
-            result = eval(expression, {"__builtins__": {}}, {})  # noqa: S307 - regex-gated, no **
-        except (SyntaxError, ZeroDivisionError, ValueError, TypeError):
+        cue collapsed to center. A result that isn't a number leaves the variable alone."""
+        expression = " ".join(arg.text for arg in args[1:])
+        result = self._evaluate(expression, scope)
+        if result is None or _number(result) is None:
             return
-        if isinstance(result, float) and result.is_integer():
-            result = int(result)
-        self._api.set_var(_fold(self._subst(args[0].text, wildcards)), result)
+        self._api.set_var(_fold(self._expand(args[0].text, scope)), result)
 
-    def _eval_condition(self, condition: str, wildcards: list[str]) -> bool:
-        return self._eval_expression(self._subst(condition, wildcards))
-
-    def _eval_expression(self, expression: str) -> bool:
-        expression = _strip_outer_parentheses(expression)
-        alternatives = _split_boolean(expression, "or")
-        if len(alternatives) > 1:
-            return any(self._eval_expression(part) for part in alternatives)
-        requirements = _split_boolean(expression, "and")
-        if len(requirements) > 1:
-            return all(self._eval_expression(part) for part in requirements)
-        negated = re.match(r"(?i)^not\b(.*)$", expression)
-        if negated:
-            return not self._eval_expression(negated.group(1))
-        match = _CONDITION_RE.match(expression)
-        if not match:
-            number = _as_number(_unquote(expression))
-            return number is not None and number != 0
-        left, op, right = _unquote(match.group(1)), match.group(2), _unquote(match.group(3))
-        if op == "=":
-            return left.lower() == right.lower()
-        if op in ("<>", "!="):
-            return left.lower() != right.lower()
-        left_n, right_n = _as_number(left), _as_number(right)
-        if left_n is None or right_n is None:
-            return False
-        return {"<": left_n < right_n, ">": left_n > right_n,
-                "<=": left_n <= right_n, ">=": left_n >= right_n}[op]
-
-    def _execute_pc(self, args: list[_Tok], wildcards: list[str]) -> None:
-        handle = self._subst(args[0].text, wildcards).strip()
-        action = args[1].text.lower()
-        value = self._subst(args[2].text, wildcards) if len(args) > 2 else ""
+    def _execute_pc(self, args: list[_Tok], scope: _Scope) -> None:
+        handle = self._expand(args[0].text, scope).strip()
+        action = self._expand(args[1].text, scope).strip().lower()
+        value = self._expand(args[2].text, scope) if len(args) > 2 else ""
         if handle == _MASTER_HANDLE:  # 0 controls all cues / the master gain
             if action == "stop":
                 self._pending_cues.clear()
                 self._api.flush()
             elif action == "volume":
-                self._api.set_master(_to_int(value, _DEFAULT_VOLUME) / 100)
+                self._master_volume = max(0, min(100, _to_int(value, _DEFAULT_VOLUME)))
+                self._api.set_master(self._master_volume / 100)
             return
         channel = self._handles.get(handle)
         if channel is None:
@@ -1064,41 +1305,446 @@ class VipMudPack:
                 self._api.adjust(channel, pan=pan)
         # frequency: no live pitch control in the bus — accepted, ignored.
 
-    def _subst(self, text: str, wildcards: list[str]) -> str:
-        text = _VAR_RE.sub(lambda m: self._api.get_var(_fold(m.group(1))), text)
-        text = text.replace(_PLAY_HANDLE_TOKEN, self._last_handle)
-        # Functions run after @vars so %var(@id) reads the variable @id names. Positional
-        # wildcards are expanded per argument inside _call_function, before %ifword compares
-        # them, then once more over the remaining text.
-        text = _FUNC_RE.sub(lambda match: self._call_function(match, wildcards), text)
-        return self._subst_wildcards(text, wildcards)
+    # --- substitution ---
+
+    def _expand(self, text: str, scope: _Scope) -> str:
+        """``text`` with one pass of substitution: escapes removed, variables, wildcards,
+        functions and system variables replaced. What goes in isn't scanned again."""
+        if "~" not in text and "@" not in text and "%" not in text:
+            return text
+        out: list[str] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if c == _ESCAPE and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            found = None
+            if c == "@":
+                found = self._scan_variable(text, i, scope)
+            elif c == "%":
+                found = self._scan_percent(text, i, scope)
+            if found is not None:
+                value, i = found
+                out.append(value)
+                continue
+            out.append(c)
+            i += 1
+        return "".join(out)
+
+    def _scan_variable(self, text: str, i: int, scope: _Scope) -> tuple[str, int] | None:
+        """The variable reference at ``text[i] == "@"``: (its value, the index after it).
+
+        ``@{name}`` takes the name from the braces (so it can run into text, and ``@{@x}``
+        names the variable indirectly); otherwise the name is a letter and then letters and
+        digits. An ``@`` before anything else is an ordinary character.
+        """
+        j = i + 1
+        n = len(text)
+        if j < n and text[j] == "{":
+            inner, end = _scan_block(text, j)
+            return self._variable(self._expand(inner, scope).strip()), end
+        if j < n and text[j].isascii() and text[j].isalpha():
+            k = j + 1
+            while k < n and text[k].isascii() and text[k].isalnum():
+                k += 1
+            return self._variable(text[j:k]), k
+        return None
+
+    def _variable(self, name: str) -> str:
+        return self._api.get_var(_fold(name), "") or ""
+
+    def _scan_percent(self, text: str, i: int, scope: _Scope) -> tuple[str, int] | None:
+        """What a ``%`` at ``text[i]`` stands for: a wildcard (``%1``, ``%{1}``), a function
+        call or a system variable. None when it is an ordinary percent sign."""
+        j = i + 1
+        n = len(text)
+        if j >= n:
+            return None
+        c = text[j]
+        if c == "{":
+            inner, end = _scan_block(text, j)
+            key = inner.strip()
+            if key.isdigit():
+                return self._wildcard(scope, int(key)), end
+            value = self._system_variable(key.lower(), scope)
+            return (value, end) if value is not None else None
+        if c.isdigit():
+            k = j + 1
+            if k < n and text[k].isdigit():  # %0 to %99
+                k += 1
+            return self._wildcard(scope, int(text[j:k])), k
+        if not (c.isascii() and c.isalpha()):
+            return None
+        k = j + 1
+        while k < n and text[k].isascii() and text[k].isalnum():
+            k += 1
+        name = text[j:k].lower()
+        if k < n and text[k] == "(":
+            call = _scan_call(text, k)
+            if call is None:
+                return None
+            raw_args, end = call
+            result = self._call_function(name, raw_args, scope)
+            # A function VIPMud doesn't have stays as written rather than vanishing.
+            return (result if result is not None else text[i:end]), end
+        value = self._system_variable(name, scope)
+        return (value, k) if value is not None else None
 
     @staticmethod
-    def _subst_wildcards(text: str, wildcards: list[str]) -> str:
-        def wildcard(match: re.Match[str]) -> str:
-            index = int(match.group(1))
-            return wildcards[index] if index < len(wildcards) else ""
+    def _wildcard(scope: _Scope, index: int) -> str:
+        return scope.wildcards[index] if index < len(scope.wildcards) else ""
 
-        return _WILDCARD_RE.sub(wildcard, text)
+    def _system_variable(self, name: str, scope: _Scope) -> str | None:
+        if name in ("i", "repeatnum"):
+            if not scope.loops:
+                return ""
+            item, number = scope.loops[-1]
+            return item if name == "i" else str(number)
+        if name == "playhandle":
+            return self._last_handle
+        if name == "mp3loop":
+            return self._last_loop_handle
+        if name in ("crlf", "cr", "lf"):
+            return {"crlf": "\r\n", "cr": "\r", "lf": "\n"}[name]
+        if name == "version":
+            return _VIPMUD_VERSION
+        if name in ("homefolder", "installfolder", "mudfolder"):
+            return self._folder(self._base_dir)
+        if name == "soundsfolder":
+            return self._folder(self._remote_sound_root or self._base_dir)
+        if name in ("mudname", "hosttitle"):
+            return self._api.world_name
+        if name in ("char", "reference", "password", "logsfolder"):
+            return ""  # never the password: a pack has no business holding it
+        if name == "connected":
+            return "1" if self._api.is_connected() else "0"
+        if name == "clipboard":
+            return self._clipboard
+        if name == "volume":
+            return str(self._master_volume)
+        if name == "socket":
+            return "0"
+        return None
 
-    def _call_function(self, match: re.Match[str], wildcards: list[str]) -> str:
-        name = match.group(1).lower()
-        args = [
-            _unquote(self._subst_wildcards(arg, wildcards))
-            for arg in _split_function_args(match.group(2))
-        ]
-        if name == "ifword":
-            if len(args) < 2 or not args[0]:
-                return "0"
-            needle, words = args[0].casefold(), args[1].casefold()
-            delimiter = args[2].casefold() if len(args) > 2 else " "
-            if not delimiter:
-                return "1" if needle == words else "0"
-            return "1" if f"{delimiter}{needle}{delimiter}" in (
-                f"{delimiter}{words}{delimiter}"
-            ) else "0"
-        arg = args[0] if args else ""
-        value = self._api.get_var(_fold(arg), None)
-        if name == "defined":
-            return "1" if value is not None else "0"
-        return value if value is not None else ""  # %var of an unset name reads empty
+    @staticmethod
+    def _folder(path: str | Path | None) -> str:
+        """A folder as VIPMud gives one, ending in a separator, so {%HomeFolder}Logs works."""
+        if not path:
+            return ""
+        return str(path).rstrip("\\/") + os.sep
+
+    # --- expressions ---
+
+    def _evaluate(self, expression: str, scope: _Scope) -> str | None:
+        """The value of a VIPMud expression, or None when it can't be evaluated."""
+        if len(expression) > _EXPRESSION_MAX_LENGTH:
+            return None
+        try:
+            return _ExpressionParser(self._expression_tokens(expression, scope)).parse()
+        except (_ExpressionError, RecursionError):
+            return None
+
+    def _condition(self, expression: str, scope: _Scope) -> bool:
+        value = self._evaluate(expression, scope)
+        return value is not None and _truthy(value)
+
+    def _expression_tokens(
+        self, text: str, scope: _Scope, *, data: bool = False
+    ) -> list[_ExpressionToken]:
+        """Tokens of an expression. A variable or wildcard goes in as its text, so quotes
+        and operators in it count, the way VIPMud substitutes before it evaluates (Cosmic
+        Rage stores "enabled" with its quotes and compares it to "enabled"). That text is
+        ``data``: an @, % or ~ in it stays an ordinary character. A function's result is
+        one value whatever it contains."""
+        tokens: list[_ExpressionToken] = []
+        depth = 0
+        i = 0
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if c in " \t\r\n":
+                j = i
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                tokens.append(_ExpressionToken("space", text[i:j]))
+                i = j
+                continue
+            if c == _ESCAPE and i + 1 < n and not data:
+                tokens.append(_ExpressionToken("value", text[i + 1]))
+                i += 2
+                continue
+            if c == '"':
+                end = _skip_quoted(text, i)
+                closed = end - 1 > i and text[end - 1] == '"'
+                inner = text[i + 1 : end - 1] if closed else text[i + 1 :]
+                value = inner if data else self._expand(inner, scope)
+                tokens.append(_ExpressionToken("value", value, quoted=True))
+                i = end
+                continue
+            if c in "@%" and not data:
+                if c == "@":
+                    found = self._scan_variable(text, i, scope)
+                    substituted = True
+                else:
+                    substituted = i + 1 < n and (text[i + 1].isdigit() or text[i + 1] == "{")
+                    found = self._scan_percent(text, i, scope)
+                if found is not None:
+                    value, i = found
+                    if substituted:  # a variable or wildcard: its text joins the expression
+                        text_tokens = self._expression_tokens(value, scope, data=True)
+                        if all(token.kind == "space" for token in text_tokens):
+                            # Unset or blank is still an operand: "" and 0 in arithmetic.
+                            text_tokens = [_ExpressionToken("value", "")]
+                        tokens.extend(text_tokens)
+                    else:  # a function or system variable: one value
+                        tokens.append(_ExpressionToken("value", value))
+                    continue
+            if c in "()":
+                depth = depth + 1 if c == "(" else max(0, depth - 1)
+                if depth > _EXPRESSION_MAX_DEPTH:
+                    raise _ExpressionError("parentheses nested too deep")
+                tokens.append(_ExpressionToken(c, c))
+                i += 1
+                continue
+            symbol = next((s for s in _EXPRESSION_SYMBOLS if text.startswith(s, i)), None)
+            if symbol is not None:
+                tokens.append(_ExpressionToken("op", symbol))
+                i += len(symbol)
+                continue
+            if c in _WORD_CHARACTERS:
+                j = i
+                while j < n and text[j] in _WORD_CHARACTERS:
+                    j += 1
+                word = text[i:j]
+                if word.lower() in _EXPRESSION_WORDS:
+                    tokens.append(_ExpressionToken("op", word.lower()))
+                else:
+                    tokens.append(_ExpressionToken("value", word))
+                i = j
+                continue
+            tokens.append(_ExpressionToken("value", c))
+            i += 1
+        return tokens
+
+    # --- functions (manual 5.3) ---
+
+    def _text_argument(self, args: list[str], index: int, scope: _Scope, default: str = "") -> str:
+        """An argument used as text: expanded once, and unquoted when it is one quoted string."""
+        if index >= len(args):
+            return default
+        return _unquote(self._expand(args[index], scope))
+
+    def _number_argument(
+        self, args: list[str], index: int, scope: _Scope, default: int | float = 0
+    ) -> int | float:
+        """An argument used as a number: evaluated as an expression, so %pos(...)-1 works."""
+        if index >= len(args) or not args[index].strip():
+            return default
+        value = self._evaluate(args[index], scope)
+        number = _number(value) if value is not None else None
+        return number if number is not None else default
+
+    def _call_function(self, name: str, args: list[str], scope: _Scope) -> str | None:
+        handler = getattr(self, f"_function_{name}", None)
+        if handler is None:
+            return None
+        return handler(args, scope)
+
+    def _function_case(self, args: list[str], scope: _Scope) -> str:
+        index = int(self._number_argument(args, 0, scope))
+        if 1 <= index < len(args):
+            return self._text_argument(args, index, scope)
+        return ""
+
+    def _function_charinfo(self, args: list[str], scope: _Scope) -> str:
+        what = self._text_argument(args, 0, scope).strip().lower()
+        if what == "mudname":
+            return self._api.world_name
+        if what == "connected":
+            return "1" if self._api.is_connected() else "0"
+        return ""  # name, reference and password aren't the pack's to have
+
+    def _function_chr(self, args: list[str], scope: _Scope) -> str:
+        code = int(self._number_argument(args, 0, scope))
+        return chr(code) if 1 <= code <= 255 else ""
+
+    def _function_clip(self, args: list[str], scope: _Scope) -> str:
+        return self._clipboard  # VIPMud 1's %Clip(), replaced by %Clipboard in 2.0
+
+    def _function_connected(self, args: list[str], scope: _Scope) -> str:
+        return "1" if self._api.is_connected() else "0"
+
+    def _function_copy(self, args: list[str], scope: _Scope) -> str:
+        text = self._text_argument(args, 0, scope)
+        start = max(1, int(self._number_argument(args, 1, scope, 1)))
+        count = int(self._number_argument(args, 2, scope, len(text)))
+        return text[start - 1 : start - 1 + max(0, count)]
+
+    def _function_defined(self, args: list[str], scope: _Scope) -> str:
+        name = self._text_argument(args, 0, scope).strip()
+        return "1" if name and self._api.get_var(_fold(name), None) is not None else "0"
+
+    def _function_delete(self, args: list[str], scope: _Scope) -> str:
+        text = self._text_argument(args, 0, scope)
+        start = max(1, int(self._number_argument(args, 1, scope, 1)))
+        count = max(0, int(self._number_argument(args, 2, scope, 0)))
+        return text[: start - 1] + text[start - 1 + count :]
+
+    def _function_delitem(self, args: list[str], scope: _Scope) -> str:
+        items = _list_items(self._text_argument(args, 0, scope))
+        wanted = self._text_argument(args, 1, scope).casefold()
+        # The manual deletes the first item that contains the text. An item that is exactly
+        # the text goes first, so deleting "boot" doesn't take out "boots" listed before it.
+        exact = [k for k, item in enumerate(items) if item.casefold() == wanted]
+        partial = [k for k, item in enumerate(items) if wanted and wanted in item.casefold()]
+        matches = exact or partial
+        if matches:
+            del items[matches[0]]
+        return "|".join(items)
+
+    def _function_delnitem(self, args: list[str], scope: _Scope) -> str:
+        items = _list_items(self._text_argument(args, 0, scope))
+        index = int(self._number_argument(args, 1, scope))
+        if 1 <= index <= len(items):
+            del items[index - 1]
+        return "|".join(items)
+
+    def _function_eval(self, args: list[str], scope: _Scope) -> str:
+        expression = ",".join(args)
+        value = self._evaluate(expression, scope)
+        return value if value is not None else self._expand(expression, scope)
+
+    def _function_expand(self, args: list[str], scope: _Scope) -> str:
+        return self._expand(",".join(args), scope)
+
+    def _function_if(self, args: list[str], scope: _Scope) -> str:
+        chosen = 1 if args and self._condition(args[0], scope) else 2
+        return self._text_argument(args, chosen, scope)
+
+    def _function_ifword(self, args: list[str], scope: _Scope) -> str:
+        needle = self._text_argument(args, 0, scope).casefold()
+        words = self._text_argument(args, 1, scope).casefold()
+        delimiter = self._text_argument(args, 2, scope, " ").casefold()
+        if not needle:
+            return "0"
+        if not delimiter:
+            return "1" if needle == words else "0"
+        return "1" if f"{delimiter}{needle}{delimiter}" in f"{delimiter}{words}{delimiter}" else "0"
+
+    def _function_isnumber(self, args: list[str], scope: _Scope) -> str:
+        return "1" if _number(self._text_argument(args, 0, scope)) is not None else "0"
+
+    def _function_lastline(self, args: list[str], scope: _Scope) -> str:
+        return ""
+
+    def _function_left(self, args: list[str], scope: _Scope) -> str:
+        count = max(0, int(self._number_argument(args, 1, scope, 0)))
+        return self._text_argument(args, 0, scope)[:count]
+
+    def _function_length(self, args: list[str], scope: _Scope) -> str:
+        return str(len(self._text_argument(args, 0, scope)))
+
+    def _function_ltrim(self, args: list[str], scope: _Scope) -> str:
+        return self._text_argument(args, 0, scope).lstrip()
+
+    def _function_max(self, args: list[str], scope: _Scope) -> str:
+        values = [self._number_argument(args, k, scope) for k in range(len(args))]
+        return _format_number(max(values)) if values else ""
+
+    def _function_min(self, args: list[str], scope: _Scope) -> str:
+        values = [self._number_argument(args, k, scope) for k in range(len(args))]
+        return _format_number(min(values)) if values else ""
+
+    def _function_numwords(self, args: list[str], scope: _Scope) -> str:
+        text = self._text_argument(args, 0, scope)
+        delimiter = self._text_argument(args, 1, scope, " ")
+        return str(len(_words(text, delimiter)))
+
+    def _function_pick(self, args: list[str], scope: _Scope) -> str:
+        return ""  # no list to pick from yet: as if the player cancelled
+
+    def _function_pop(self, args: list[str], scope: _Scope) -> str:
+        name = _fold(self._text_argument(args, 0, scope).strip())
+        if not name:
+            return ""
+        first, _separator, rest = (self._api.get_var(name, "") or "").partition("|")
+        self._api.set_var(name, rest)
+        return first
+
+    def _function_pos(self, args: list[str], scope: _Scope) -> str:
+        needle = self._text_argument(args, 0, scope).casefold()
+        haystack = self._text_argument(args, 1, scope).casefold()
+        return str(haystack.find(needle) + 1) if needle else "0"
+
+    def _function_proper(self, args: list[str], scope: _Scope) -> str:
+        text = self._text_argument(args, 0, scope)
+        return text[:1].upper() + text[1:].lower()
+
+    def _function_push(self, args: list[str], scope: _Scope) -> str:
+        items = self._text_argument(args, 0, scope)
+        item = self._text_argument(args, 1, scope)
+        return f"{item}|{items}" if items else item
+
+    def _function_random(self, args: list[str], scope: _Scope) -> str:
+        low = int(self._number_argument(args, 0, scope, 0))
+        high = int(self._number_argument(args, 1, scope, low))
+        if low > high:
+            low, high = high, low
+        return str(random.randint(low, high))
+
+    def _function_replace(self, args: list[str], scope: _Scope) -> str:
+        text = self._text_argument(args, 0, scope)
+        old = self._text_argument(args, 1, scope)
+        new = self._text_argument(args, 2, scope)
+        return text.replace(old, new) if old else text
+
+    def _function_reverselist(self, args: list[str], scope: _Scope) -> str:
+        return "|".join(reversed(_list_items(self._text_argument(args, 0, scope))))
+
+    def _function_right(self, args: list[str], scope: _Scope) -> str:
+        count = max(0, int(self._number_argument(args, 1, scope, 0)))
+        text = self._text_argument(args, 0, scope)
+        return text[len(text) - count :] if count else ""
+
+    def _function_rtrim(self, args: list[str], scope: _Scope) -> str:
+        return self._text_argument(args, 0, scope).rstrip()
+
+    def _function_sort(self, args: list[str], scope: _Scope) -> str:
+        items = _list_items(self._text_argument(args, 0, scope))
+        descending = self._number_argument(args, 1, scope, 0) != 0
+        return "|".join(sorted(items, key=str.casefold, reverse=descending))
+
+    def _function_switchdirection(self, args: list[str], scope: _Scope) -> str:
+        way = self._text_argument(args, 0, scope).strip()
+        back = self._directions.get(way.lower())
+        if back is None:
+            return way
+        return back.upper() if way.isupper() else back
+
+    def _function_trim(self, args: list[str], scope: _Scope) -> str:
+        return self._text_argument(args, 0, scope).strip()
+
+    def _function_var(self, args: list[str], scope: _Scope) -> str:
+        return self._variable(self._text_argument(args, 0, scope).strip())
+
+    def _function_word(self, args: list[str], scope: _Scope) -> str:
+        text = self._text_argument(args, 0, scope)
+        words = _words(text, self._text_argument(args, 1, scope, " "))
+        if not words:
+            return ""
+        index = int(self._number_argument(args, 2, scope, 1))
+        return words[min(max(index, 1), len(words)) - 1]  # past the end: the last word
+
+
+def _list_items(text: str) -> list[str]:
+    return text.split("|") if text else []
+
+
+def _words(text: str, delimiter: str) -> list[str]:
+    """``text`` split into VIPMud words: on runs of spaces, or on ``delimiter`` exactly."""
+    if not delimiter or delimiter == " ":
+        return text.split()
+    return text.split(delimiter) if text else []
