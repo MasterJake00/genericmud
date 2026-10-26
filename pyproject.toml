@@ -21,6 +21,8 @@ authors = [{ name = "Matt Alvernaz" }]
 dependencies = [
   "lupa>=2.0",
   "regex>=2024.0",
+  # Updating packs from their git repositories (git's own protocol, file by file).
+  "dulwich>=1.2.19",
 ]
 
 # A source/pip install gets a `genericmud` command on every platform (Windows/macOS/Linux).

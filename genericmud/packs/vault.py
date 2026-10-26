@@ -181,6 +181,21 @@ def _secure_urlopen(request, *args, **kwargs):
     default opener for real fetches)."""
     return _OPENER.open(request, *args, **kwargs)
 
+
+def check_url(url: str) -> None:
+    """Refuse ``url`` the way a pack download would (raises :class:`BlockedUrl`)."""
+    _validate_url(url)
+
+
+def open_checked(request: Request):
+    """Open ``request`` through the pack downloads' opener: the entry URL, every redirect and
+    every address a connection reaches are checked, with the usual network timeout."""
+    _validate_url(request.full_url)
+    return _secure_urlopen(request, timeout=_NETWORK_TIMEOUT_SECONDS)
+
+
+USER_AGENT = _USER_AGENT
+
 # Clients genericMud can actually load (one of the three script dialects); others
 # (Mudlet, TinTin++, MonkeyTerm) are listed but flagged as unsupported.
 SUPPORTED_CLIENTS = frozenset({"mush", "vipmud"})
