@@ -1044,3 +1044,25 @@ def test_a_script_that_breaks_stops_there_and_the_rest_keeps_working():
     engine.process_line(Line(f"Amy tells you '#say {nested}'"))
     engine.process_line(Line("ping"))
     assert _said(sink)[-1] == "pong"
+
+
+def test_gagline_with_a_count_gags_the_lines_after_it_too():
+    # Miriani hides its starmap's atmosphere block with "#GagLine 4 All" on its first line.
+    _sink, engine, _pack = _load(
+        "#Trigger {Atmosphere of *} {#GagLine 3 All}\n#Trigger {Quiet *} {#GagLine 2 Voice}\n"
+    )
+    texts = ["Atmosphere of Kryton", "oxygen 21%", "nitrogen 78%", "Next room."]
+    lines = [engine.process_line(Line(text)) for text in texts]
+    assert [line.gagged for line in lines] == [True, True, True, False]
+    quiet = [engine.process_line(Line(text)) for text in ("Quiet please", "whisper", "loud")]
+    assert [(line.gagged, line.display_when_gagged) for line in quiet] == [
+        (True, True), (True, True), (False, False),
+    ]
+
+
+def test_ungagline_also_stops_the_lines_still_to_be_gagged():
+    _sink, engine, _pack = _load(
+        "#Trigger {Starmap *} {#GagLine 5 All}\n#Trigger {End of map} {#UnGagLine}\n"
+    )
+    lines = [engine.process_line(Line(t)) for t in ("Starmap 1", "row", "End of map", "after")]
+    assert [line.gagged for line in lines] == [True, True, False, False]

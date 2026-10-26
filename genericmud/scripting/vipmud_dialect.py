@@ -966,6 +966,10 @@ class VipMudPack:
         self._find_index: int | None = None  # where #Find last found, for "next"
         self._gagging_all = False  # between #GagOn All and #UnGagOn
         self._gag_rule: object | None = None
+        # "#GagLine 4 All" gags the line and the three after it.
+        self._gag_left = 0
+        self._gag_voice_only = False
+        self._gag_from: Line | None = None  # the line that asked, which isn't one of them
         self._steps = 0  # commands the outermost running script has used of _STEP_LIMIT
         # Classes start switched off; a rule in a class works only while it's enabled.
         self._enabled_classes: set[str] = set()
@@ -1398,6 +1402,7 @@ class VipMudPack:
         elif command == "UNGAGLINE" and scope.line is not None:
             scope.line.gagged = False
             scope.line.display_when_gagged = False
+            self._gag_left = 0  # and no more of the lines a #GagLine count still had to go
         elif command == "FIND" and args:
             self._execute_find(args, scope)
         elif command in ("PLAY", "PLAYLOOP") and args:
@@ -1435,8 +1440,15 @@ class VipMudPack:
             # "#gagline [count] voice" gags self-voice but keeps the line reviewable; without a
             # "voice" arg ("all", a bare count, or nothing) it removes the line entirely. Packs
             # play a sound in the gagged line's place. (SC writes "voice"; Prometheus "1 Voice".)
+            voice = any(a.text.lower() == "voice" for a in args)
             scope.line.gagged = True
-            scope.line.display_when_gagged = any(a.text.lower() == "voice" for a in args)
+            scope.line.display_when_gagged = voice
+            counts = [_number(self._expand(a.text, scope)) for a in args]
+            count = next((int(n) for n in counts if n is not None), 1)
+            if count > 1:
+                self._gag_left, self._gag_voice_only = count - 1, voice
+                self._gag_from = scope.line
+                self._add_gag_rule()
         elif command == "ABORT":
             raise _AbortScript if args else _AbortLevel
         elif command.isdigit():
@@ -1521,17 +1533,25 @@ class VipMudPack:
         self._api.set_line_speech(False)
         if mode == "all":
             self._gagging_all = True
-            if self._gag_rule is None:
-                # After every other trigger, so an #UnGagOn on this very line wins.
-                self._gag_rule = self._api.add_trigger(
-                    r".", self._gag_everything, regex=True, priority=-1,
-                    name=self._engine_name(),
-                )
+            self._add_gag_rule()
+
+    def _add_gag_rule(self) -> None:
+        """The trigger behind #GagOn All and #GagLine's count. It runs after every other
+        trigger, so an #UnGagOn or #UnGagLine on the same line wins."""
+        if self._gag_rule is None:
+            self._gag_rule = self._api.add_trigger(
+                r".", self._gag_everything, regex=True, priority=-1, name=self._engine_name(),
+            )
 
     def _gag_everything(self, ctx: MatchContext) -> None:
+        line = ctx.line
+        if self._gag_left > 0 and line is not self._gag_from:
+            self._gag_left -= 1
+            line.gagged = True
+            line.display_when_gagged = line.display_when_gagged or self._gag_voice_only
         if self._gagging_all:
-            ctx.line.gagged = True
-            ctx.line.display_when_gagged = False
+            line.gagged = True
+            line.display_when_gagged = False
 
     def _execute_find(self, args: list[_Tok], scope: _Scope) -> None:
         """``#Find text [First|Next|Forward|Reverse]``: look through the output for a line
