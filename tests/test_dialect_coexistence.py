@@ -45,7 +45,8 @@ def test_three_dialects_coexist_on_one_engine():
 def test_packs_do_not_cross_fire():
     sink = RecordingSink()
     engine = AutomationEngine(sink)
-    VipMudPack(ScriptApi(engine, source="vipmud")).load_source("#TR {only vip} {#say {vip}}")
+    # A VIPMud pattern matches the whole line, so text after it needs the trailing *.
+    VipMudPack(ScriptApi(engine, source="vipmud")).load_source("#TR {only vip*} {#say {vip}}")
     LuaPackRuntime(ScriptApi(engine, source="lua")).run_source(
         'mud.trigger("only lua", function() mud.speak("lua") end)'
     )

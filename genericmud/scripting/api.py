@@ -280,20 +280,30 @@ class ScriptApi:
 
     # --- registration ---
 
-    def add_trigger(self, pattern: str, callback: Callback, **opts: object) -> None:
+    def add_trigger(self, pattern: str, callback: Callback, **opts: object):
+        """Register a trigger; returns the engine's rule (its ``enabled`` can be switched)."""
         opts.setdefault("source", self._source)
-        self._engine.add_trigger(pattern, callback, **opts)  # type: ignore[arg-type]
+        return self._engine.add_trigger(pattern, callback, **opts)  # type: ignore[arg-type]
 
     def remove_trigger(self, name: str) -> None:
         """Drop a previously-registered trigger by name (dynamic MUSHclient triggers)."""
         self._engine.remove_trigger(name)
 
-    def add_alias(self, pattern: str, callback: Callback, **opts: object) -> None:
+    def add_alias(self, pattern: str, callback: Callback, **opts: object):
+        """Register an alias; returns the engine's rule (its ``enabled`` can be switched)."""
         opts.setdefault("source", self._source)
-        self._engine.add_alias(pattern, callback, **opts)  # type: ignore[arg-type]
+        return self._engine.add_alias(pattern, callback, **opts)  # type: ignore[arg-type]
+
+    def remove_alias(self, name: str) -> None:
+        """Drop a previously-registered alias by name."""
+        self._engine.remove_alias(name)
 
     def add_key(self, key: str, callback: Callback) -> None:
         self._engine.add_key(key, callback, source=self._source)
+
+    def remove_key(self, key: str) -> None:
+        """Drop this source's binding of ``key``."""
+        self._engine.remove_key(key, source=self._source)
 
     def add_timer(self, delay: float, callback: Callable[[], None]) -> None:
         if self._active_timers >= _MAX_ACTIVE_TIMERS:

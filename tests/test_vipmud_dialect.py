@@ -532,7 +532,8 @@ def test_bracket_patterns_compile_without_a_nested_set_warning():
 
 def test_plain_patterns_are_unchanged_by_the_class_support():
     assert vip_pattern_to_regex("You see * here.") == r"You\ see\ (.*?)\ here\."
-    assert vip_pattern_to_regex("?Enter ?yes' or ?no'?") == r"(.)Enter\ (.)yes'\ or\ (.)no'(.)"
+    # ? matches one character but doesn't take a wildcard number: only * does.
+    assert vip_pattern_to_regex("?Enter ?yes' or ?no'?") == r".Enter\ .yes'\ or\ .no'."
 
 
 def test_variable_names_are_case_insensitive():

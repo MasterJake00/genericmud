@@ -45,7 +45,14 @@ from genericmud.model.buffer import Line
 from genericmud.safepath import confine
 from genericmud.scripting.api import ScriptApi
 
-_DEFINITIONS = {"TRIGGER", "TRIG", "TR", "GTRIGGER", "ALIAS", "KEY"}  # VIPMud allows abbreviation
+# Definitions and their removals; the G forms are VIPMud's every-session versions, and one
+# session is all a pack sees here.
+_TRIGGER_COMMANDS = {"TRIGGER", "TRIG", "TR", "GTRIGGER", "GTRIG", "GTR"}
+_ALIAS_COMMANDS = {"ALIAS", "GALIAS"}
+_KEY_COMMANDS = {"KEY", "GKEY"}
+_UNTRIGGER_COMMANDS = {"UNTRIGGER", "UNTRIG", "GUNTRIGGER", "GUNTRIG"}
+_UNALIAS_COMMANDS = {"UNALIAS", "GUNALIAS"}
+_UNKEY_COMMANDS = {"UNKEY", "GUNKEY"}
 _SOUND_VARIANT_RE = re.compile(r"\*(\d+)(\.\w+)$")  # "name*N.ext": one random variant of 1..N
 # Named/positional wildcards inside a .set pattern: &{name}, &name, *, ?
 _PATTERN_WILDCARD_RE = re.compile(r"&\{(\w+)\}|&(\w+)|(\*)|(\?)")
@@ -174,6 +181,10 @@ def tokenize_statements(source: str) -> list[tuple[str | None, list[_Tok]]]:
                     i += 1
                 if i >= n or source[i] in "\r\n;":  # ; ends a statement (same as newline)
                     break
+                if source.startswith("//", i):  # the rest of the line is a comment
+                    while i < n and source[i] != "\n":
+                        i += 1
+                    break
                 if source[i] == "{":
                     inner, i = _scan_block(source, i)
                     args.append(_Tok(True, inner))
@@ -197,12 +208,18 @@ def tokenize_statements(source: str) -> list[tuple[str | None, list[_Tok]]]:
             statements.append((None, [_Tok(False, source[line_start:i].rstrip())]))
         else:
             line_start = i
+            line_end = None
             # ';' separates statements in bare text too ("makebetter; look" is two
             # commands); without the split the whole line went out as one string and
             # a leading alias name prefix-matched, swallowing the rest.
             while i < n and source[i] not in "\r\n;":
+                if source.startswith("//", i) and source[i - 1] in " \t":
+                    line_end = i  # a comment to the end of the line (not "http://")
+                    while i < n and source[i] != "\n":
+                        i += 1
+                    break
                 i += 2 if source[i] == _ESCAPE else 1
-            text = source[line_start:i].strip()
+            text = source[line_start : i if line_end is None else line_end].strip()
             if text:
                 statements.append((None, [_Tok(False, text)]))
     return statements
@@ -216,7 +233,7 @@ def _scan_char_class(pattern: str, start: int) -> int | None:
     write a literal bracket, ``[[]`` for ``[`` and ``[]]`` for ``]``.
     """
     i = start + 1
-    if i < len(pattern) and pattern[i] == "^":
+    if i < len(pattern) and pattern[i] in "^!":
         i += 1
     if i < len(pattern) and pattern[i] == "]":
         i += 1
@@ -236,7 +253,7 @@ def _char_class(source: str) -> str:
     still will not compile, so a malformed class can never kill a pack load.
     """
     body = source[1:-1]
-    negated = body.startswith("^")
+    negated = body.startswith(("^", "!"))  # VIPMud writes [!a-c]; [^a-c] is kept too
     if negated:
         body = body[1:]
     members: list[str] = []
@@ -260,8 +277,10 @@ def vip_pattern_to_regex(pattern: str) -> str:
     """Convert a VIPMud wildcard pattern to a regex with named/numbered captures.
 
     ``&{name}``/``&name`` -> a named group (read at fire time as ``@name``); ``*`` ->
-    a numbered group; ``?`` -> one char. A wildcard at the very end takes the rest
-    (greedy); a bounded one is non-greedy so the following literal delimits it.
+    a numbered group; ``?`` -> any one character, without a number of its own (only the
+    asterisks number the wildcards); ``~`` makes the next character literal. A wildcard at
+    the very end takes the rest (greedy); a bounded one is non-greedy so the following
+    literal delimits it.
 
     ``[...]`` is a character class and passes through, because that is what VIPMud does and
     packs depend on it: channel triggers are written ``[[]*] * *`` to match a line like
@@ -270,10 +289,16 @@ def vip_pattern_to_regex(pattern: str) -> str:
     in the Star Conquest pack silently matched nothing.
     """
     out: list[str] = []
+    names: set[str] = set()
     literal_start = 0
     i = 0
     end = len(pattern)
     while i < end:
+        if pattern[i] == _ESCAPE and i + 1 < end:
+            out.append(re.escape(pattern[literal_start:i]))
+            out.append(re.escape(pattern[i + 1]))
+            i = literal_start = i + 2
+            continue
         if pattern[i] == "[":
             close = _scan_char_class(pattern, i)
             if close is None:  # unclosed: an ordinary literal bracket
@@ -290,12 +315,13 @@ def vip_pattern_to_regex(pattern: str) -> str:
         out.append(re.escape(pattern[literal_start : match.start()]))
         body = ".*" if match.end() == end else ".*?"
         name = match.group(1) or match.group(2)
-        if name:
+        if name and name.isidentifier() and name not in names:
+            names.add(name)
             out.append(f"(?P<{name}>{body})")
-        elif match.group(3):  # *
+        elif name or match.group(3):  # * (or a name a regex group can't carry)
             out.append(f"({body})")
         else:  # ?
-            out.append("(.)")
+            out.append(".")
         i = literal_start = match.end()
     out.append(re.escape(pattern[literal_start:]))
     return "".join(out)
@@ -770,6 +796,30 @@ class _Scope:
         return _Scope(self.wildcards, self.line, [*self.loops, (item, number)])
 
 
+@dataclass
+class _VipRule:
+    """A trigger, alias or key as the pack defined it, kept so a redefinition or an #Un...
+    command can find and replace it."""
+
+    body: str
+    engine_name: str = ""  # the engine rule's name, for removing it
+    engine_rule: object | None = None
+
+
+def _split_trigger_name(pattern: str) -> tuple[str, str]:
+    """A ``<name>`` at the start of a trigger pattern names the trigger (manual 5.2.54).
+
+    Only when real pattern text follows and the name has no wildcards in it: COGG's
+    ``<Sanity -*>`` is its prompt, and read as a name it would leave nothing to match.
+    """
+    if pattern.startswith("<"):
+        close = pattern.find(">")
+        name, rest = pattern[1:close], pattern[close + 1 :]
+        if close > 1 and rest.strip() and not any(c in name for c in "*?&[]~"):
+            return name, rest
+    return "", pattern
+
+
 class _Abort(Exception):  # noqa: N818 - a control-flow signal (#Abort), not an error condition
     """Raised by ``#Abort`` to stop the current script body (a trigger fire or a load)."""
 
@@ -790,6 +840,12 @@ class VipMudPack:
         self._master_volume = _DEFAULT_VOLUME  # %Volume, set by #pc 0 volume
         self._clipboard = ""  # #Clipboard / %Clipboard
         self._directions = dict(_OPPOSITE_DIRECTIONS)  # #Direction adds a pack's own
+        # The pack's rules by what identifies them in VIPMud: a trigger by its <name> or its
+        # pattern, an alias by its name, a key by its combo. Defining one again replaces it.
+        self._triggers: dict[str, _VipRule] = {}
+        self._aliases: dict[str, _VipRule] = {}
+        self._keys: dict[str, _VipRule] = {}
+        self._rule_count = 0
         self._remote_sound_base: str | None = None
         self._remote_sound_root: Path | None = None
         # Sounds fetched in the background (see _fetch_in_background), by URL: the download
@@ -901,27 +957,63 @@ class VipMudPack:
     def load_source(self, source: str) -> None:
         scope = _Scope([])
         for command, args in tokenize_statements(source):
-            if command in _DEFINITIONS:
-                self._define(command, args)
-            else:
-                try:
-                    self._execute_statement(command, args, scope)
-                except _Abort:
-                    return  # a top-level #Abort stops loading the rest of this script
+            try:
+                self._execute_statement(command, args, scope)
+            except _Abort:
+                return  # a top-level #Abort stops loading the rest of this script
 
-    def _define(self, command: str, args: list[_Tok]) -> None:
-        if not args:
-            return
-        body = args[1].text if len(args) > 1 else ""  # {body} is the first block after the pattern
-        if command in ("TRIGGER", "TRIG", "TR", "GTRIGGER"):
-            flags = "(?i)" if any(a.text.lower() == "anycase" for a in args[2:]) else ""
-            self._api.add_trigger(
-                flags + vip_pattern_to_regex(args[0].text), self._runner(body), regex=True
-            )
-        elif command == "ALIAS":
-            self._define_alias(args[0].text, body)
-        elif command == "KEY":
-            self._api.add_key(vip_key_to_combo(args[0].text), self._runner(body))
+    def _engine_name(self) -> str:
+        self._rule_count += 1
+        return f"vipmud:{self._api.source}:{self._rule_count}"
+
+    def _define_trigger(self, args: list[_Tok]) -> None:
+        """``#Trigger {pattern} {commands} [class] [AnyCase]``: the pattern has to match the
+        whole line (manual 2.4.2: "you must include a leading or trailing asterisk if there
+        is any text expected before or after"). Spaces a MUD leaves at the end of a line
+        don't count; a screen reader never says them, so no pack author knew to allow for
+        them."""
+        name, pattern = _split_trigger_name(args[0].text)
+        body = args[1].text if len(args) > 1 else ""
+        flags = "(?i)" if any(arg.text.strip().lower() == "anycase" for arg in args[2:]) else ""
+        key = name.lower() if name else pattern
+        self._remove_trigger(key)
+        engine_name = self._engine_name()
+        rule = self._api.add_trigger(
+            f"{flags}^{vip_pattern_to_regex(pattern)}[ \t]*$", self._runner(body),
+            regex=True, name=engine_name,
+        )
+        self._triggers[key] = _VipRule(body, engine_name, rule)
+
+    def _remove_trigger(self, key: str) -> None:
+        old = self._triggers.pop(key, None)
+        if old is not None:
+            self._api.remove_trigger(old.engine_name)
+
+    def _define_key(self, args: list[_Tok], scope: _Scope) -> None:
+        combo = vip_key_to_combo(self._expand(args[0].text, scope))
+        self._keys[combo] = _VipRule(args[1].text if len(args) > 1 else "")
+        self._api.add_key(combo, self._key_runner(combo))
+
+    def _key_runner(self, combo: str):
+        def run(ctx: MatchContext) -> None:
+            rule = self._keys.get(combo)
+            if rule is None:
+                return
+            try:
+                self._execute_body(rule.body, _Scope([], ctx.line))
+            except _Abort:
+                pass
+
+        return run
+
+    def _remove_key(self, combo: str) -> None:
+        if self._keys.pop(combo, None) is not None:
+            self._api.remove_key(combo)
+
+    def _remove_alias(self, key: str) -> None:
+        old = self._aliases.pop(key, None)
+        if old is not None:
+            self._api.remove_alias(old.engine_name)
 
     def _define_alias(self, name: str, body: str) -> None:
         """``#ALIAS``: the first word of what the player types names the alias.
@@ -935,12 +1027,18 @@ class VipMudPack:
         elsewhere (variable names), so alias names are too. A name that carries wildcards
         ("gt *") is a pattern instead, and has to match the whole command.
         """
+        key = name.lower()
+        self._remove_alias(key)
+        engine_name = self._engine_name()
         if _PATTERN_WILDCARD_RE.search(name) or name.split() != [name]:
             pattern = f"(?i)^{vip_pattern_to_regex(name)}$"
-            self._api.add_alias(pattern, self._runner(body), regex=True)
-            return
-        pattern = rf"(?i)^{re.escape(name)}(?:\s+(.*?))?\s*$"
-        self._api.add_alias(pattern, self._alias_runner(body), regex=True)
+            rule = self._api.add_alias(pattern, self._runner(body), regex=True, name=engine_name)
+        else:
+            pattern = rf"(?i)^{re.escape(name)}(?:\s+(.*?))?\s*$"
+            rule = self._api.add_alias(
+                pattern, self._alias_runner(body), regex=True, name=engine_name
+            )
+        self._aliases[key] = _VipRule(body, engine_name, rule)
 
     def _alias_runner(self, body: str):
         def run(ctx: MatchContext) -> None:
@@ -972,6 +1070,20 @@ class VipMudPack:
     def _execute_statement(self, command: str | None, args: list[_Tok], scope: _Scope) -> None:
         if command is None or command == "SEND":
             self._bare_or_send(args, scope)
+        elif command in _TRIGGER_COMMANDS and args:
+            self._define_trigger(args)
+        elif command in _ALIAS_COMMANDS and args:
+            self._define_alias(args[0].text.strip(), args[1].text if len(args) > 1 else "")
+        elif command in _KEY_COMMANDS and args:
+            self._define_key(args, scope)
+        elif command in _UNTRIGGER_COMMANDS and args:
+            name, pattern = _split_trigger_name(self._expand(args[0].text, scope))
+            self._remove_trigger(name.lower() if name else pattern)
+            self._remove_trigger(pattern.lower())  # #UnTrigger takes a trigger's name too
+        elif command in _UNALIAS_COMMANDS and args:
+            self._remove_alias(self._expand(args[0].text, scope).strip().lower())
+        elif command in _UNKEY_COMMANDS and args:
+            self._remove_key(vip_key_to_combo(self._expand(args[0].text, scope)))
         elif command == "SAY" and args:
             self._api.speak(self._expand(args[0].text, scope))
         elif command in ("PLAY", "PLAYLOOP") and args:

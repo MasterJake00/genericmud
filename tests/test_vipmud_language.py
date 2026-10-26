@@ -380,3 +380,138 @@ def test_system_variables():
 def test_an_unknown_function_or_a_lone_percent_sign_is_left_as_written():
     sink, _engine, _pack = _load("#say {50%off(sale) and 100% sure}")
     assert _said(sink) == ["50%off(sale) and 100% sure"]
+
+
+# --- rules (manual 2.4.2, 5.2.54, 6.2) ---
+
+BLOOD = [
+    "Your blood freezes when you here the scream from the skunk.",
+    "Your blood freezes when you here the scream from the turkey.",
+    "YOUR blood freezes when you here the scream from the giant squirrel.",
+    "Yes, your blood freezes when you here the scream from the rabid rat.",
+    "YOUR blood freezes when you here the scream, from the red fox.",
+]
+
+
+def test_a_trigger_matches_the_whole_line_like_the_manuals_example():
+    # "Note that you must include a leading or trailing asterisk if there is any text
+    # expected before or after the search string."
+    sink, engine, _pack = _load(
+        "#trigger {Your blood freezes when you here the scream from *} {#say {%1}}"
+    )
+    for line in [*BLOOD, "Then Your blood freezes when you here the scream from the cat."]:
+        engine.process_line(Line(line))
+    assert _said(sink) == ["the skunk.", "the turkey."]
+
+
+def test_a_leading_asterisk_lets_text_come_before_the_pattern():
+    sink, engine, _pack = _load(
+        "#trigger {*your blood freezes when you here the scream from *} {#say {%2}}"
+    )
+    for line in BLOOD:
+        engine.process_line(Line(line))
+    assert _said(sink) == ["the rabid rat."]
+
+
+def test_spaces_the_mud_leaves_at_the_end_of_a_line_dont_stop_a_match():
+    sink, engine, _pack = _load("#trigger {You are hungry.} {#say food}")
+    engine.process_line(Line("You are hungry.   "))
+    assert _said(sink) == ["food"]
+
+
+def test_anycase_makes_a_trigger_ignore_case():
+    sink, engine, _pack = _load(
+        "#trig {* shouts '*fred*'} {#say {shout from %1}} {} AnyCase\n"
+        "#trig {Hello there} {#say exact}\n"
+    )
+    engine.process_line(Line("Bob shouts 'FRED, come here!'"))
+    engine.process_line(Line("hello there"))
+    assert _said(sink) == ["shout from Bob"]
+
+
+def test_a_question_mark_matches_one_character_and_doesnt_take_a_wildcard_number():
+    # Only the asterisks number the wildcards (manual 5.2.54).
+    sink, engine, _pack = _load("#trigger {?ou hit *} {#say {%1}}")
+    engine.process_line(Line("You hit the orc"))
+    assert _said(sink) == ["the orc"]
+
+
+def test_an_exclamation_mark_negates_a_character_class():
+    sink, engine, _pack = _load("#trigger {[!x-z]ebra} {#say {%0}}")
+    engine.process_line(Line("zebra"))
+    engine.process_line(Line("Debra"))
+    assert _said(sink) == ["Debra"]
+
+
+def test_a_tilde_makes_a_wildcard_character_literal_in_a_pattern():
+    sink, engine, _pack = _load("#trigger {Score~: ~*~*~* *} {#say {%1}}")
+    engine.process_line(Line("Score: *** 42"))
+    engine.process_line(Line("Score: abc 42"))
+    assert _said(sink) == ["42"]
+
+
+def test_named_triggers_with_the_same_pattern_both_fire():
+    sink, engine, _pack = _load(
+        "#trigger {<Alas1>Alas, you can't go that way.} {#say one}\n"
+        "#trigger {<Alas2>Alas, you can't go that way.} {#say two}\n"
+    )
+    engine.process_line(Line("Alas, you can't go that way."))
+    assert sorted(_said(sink)) == ["one", "two"]
+
+
+def test_a_pattern_that_is_all_angle_brackets_is_text_not_a_name():
+    # COGG triggers on its "<Sanity -*>" prompt; read as a trigger name, nothing is left
+    # to match and the trigger could never fire.
+    sink, engine, _pack = _load("#trigger {<Sanity -*>} {#say {sanity %1}}")
+    engine.process_line(Line("<Sanity -5>"))
+    assert _said(sink) == ["sanity 5"]
+
+
+def test_defining_the_same_trigger_again_replaces_it():
+    # A pack reloaded on every login would otherwise play each sound once per load.
+    sink, engine, _pack = _load("#trigger {boom} {#say one}\n#trigger {boom} {#say two}")
+    engine.process_line(Line("boom"))
+    assert _said(sink) == ["two"]
+
+
+def test_defining_the_same_alias_or_key_again_replaces_it():
+    sink, engine, _pack = _load(
+        "#alias {hi} {#say first}\n#alias {HI} {#say second}\n"
+        "#key f2 {#say one}\n#key F2 {#say two}\n"
+    )
+    engine.process_input("hi")
+    engine.press_key("f2")
+    assert _said(sink) == ["second", "two"]
+
+
+def test_rules_defined_inside_a_script_work():
+    sink, engine, _pack = _load("#alias arm {#trigger {pong} {#say {got %0}}}")
+    engine.process_input("arm")
+    engine.process_line(Line("pong"))
+    assert _said(sink) == ["got pong"]
+
+
+def test_untrigger_unalias_and_unkey_remove_rules():
+    sink, engine, _pack = _load(
+        "#trigger {<DroppedSword>Your sword slips from your hands.} {#say grab}\n"
+        "#trigger {A scream escapes your lips *} {#say scream}\n"
+        "#alias gt {#say alias}\n#key Shift-F9 {#say key}\n"
+        "#UnTrig DroppedSword\n"
+        "#Untrigger {A scream escapes your lips *}\n"
+        "#UnAlias Gt\n#UnKey Shift-F9\n"
+    )
+    engine.process_line(Line("Your sword slips from your hands."))
+    engine.process_line(Line("A scream escapes your lips loudly"))
+    assert engine.process_input("gt") == ["gt"]
+    engine.press_key("shift+f9")
+    assert _said(sink) == []
+
+
+def test_a_comment_at_the_end_of_a_line_is_not_part_of_it():
+    sink, engine, _pack = _load(
+        "#alias ccorpse {take all from corpse;wear all}  //used to pickup all your eq\n"
+        "#key f1 {look  // glance about\n}\n"
+    )
+    engine.process_input("ccorpse")
+    engine.press_key("f1")
+    assert sink.sent == ["take all from corpse", "wear all", "look"]

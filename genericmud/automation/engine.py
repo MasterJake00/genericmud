@@ -178,22 +178,22 @@ class AutomationEngine:
         keep_evaluating: bool = True,
         source: str = "",
         channel: str | None = None,
-    ) -> None:
-        self._triggers.append(
-            _Rule(
-                compile_pattern(pattern, regex),
-                callback,
-                priority,
-                name,
-                True,
-                gag,
-                gag_but_display,
-                keep_evaluating,
-                source,
-                channel,
-            )
+    ) -> _Rule:
+        rule = _Rule(
+            compile_pattern(pattern, regex),
+            callback,
+            priority,
+            name,
+            True,
+            gag,
+            gag_but_display,
+            keep_evaluating,
+            source,
+            channel,
         )
+        self._triggers.append(rule)
         self._triggers.sort(key=lambda r: -r.priority)
+        return rule
 
     def add_alias(
         self,
@@ -205,15 +205,15 @@ class AutomationEngine:
         name: str = "",
         keep_evaluating: bool = False,
         source: str = "",
-    ) -> None:
+    ) -> _Rule:
         # process_input anchors every alias at the start; a wildcard alias is anchored at the
         # end too, so it has to be the whole command. Regex aliases keep whatever their
         # author wrote.
-        self._aliases.append(
-            _Rule(compile_pattern(pattern, regex, whole=True), callback, priority, name, True,
-                  source=source, keep_evaluating=keep_evaluating)
-        )
+        rule = _Rule(compile_pattern(pattern, regex, whole=True), callback, priority, name, True,
+                     source=source, keep_evaluating=keep_evaluating)
+        self._aliases.append(rule)
         self._aliases.sort(key=lambda r: -r.priority)
+        return rule
 
     def remove_trigger(self, name: str) -> None:
         self._triggers = [rule for rule in self._triggers if rule.name != name]
@@ -224,6 +224,18 @@ class AutomationEngine:
     def add_key(self, key: str, callback: Callback, *, source: str = "") -> None:
         self._keys[key.lower()] = callback
         self._key_bindings.append((key.lower(), source, callback))
+
+    def remove_key(self, key: str, *, source: str = "") -> None:
+        """Drop one source's bindings of ``key``; an earlier owner's binding comes back."""
+        key = key.lower()
+        self._key_bindings = [
+            binding for binding in self._key_bindings if binding[:2] != (key, source)
+        ]
+        survivors = [callback for bound, _source, callback in self._key_bindings if bound == key]
+        if survivors:
+            self._keys[key] = survivors[-1]
+        else:
+            self._keys.pop(key, None)
 
     def registrations_by_source(self) -> dict[str, dict[str, list[str]]]:
         """Every trigger/alias/key grouped by the pack that registered it.
@@ -453,10 +465,9 @@ class AutomationEngine:
         return [text]
 
     def press_key(self, key: str) -> bool:
-        callback = self._keys.get(key.lower())
-        if callback is None:
+        if not self.has_key(key):
             return False
-        callback(MatchContext(Line(""), [], {}, self))
+        self._keys[key.lower()](MatchContext(Line(""), [], {}, self))
         return True
 
     def has_key(self, key: str) -> bool:
@@ -466,4 +477,7 @@ class AutomationEngine:
         through to the platform (menu access keys, accelerators) instead of dying
         in the macro path. Read cross-thread; dict membership is safe under the GIL.
         """
-        return key.lower() in self._keys
+        callback = self._keys.get(key.lower())
+        # A binding can be switched off for now (a VIPMud key whose class is disabled), and
+        # then the keypress belongs to the platform again.
+        return callback is not None and getattr(callback, "active", lambda: True)()
