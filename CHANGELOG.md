@@ -7,6 +7,34 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.15.0 — 2026-10-26
+
+**Soundpack menus and questions**
+
+Soundpacks can show you menus and ask you things, in ordinary dialogs your screen
+reader reads. Before, those menus never appeared and the packs carried on as if
+you'd cancelled.
+
+* The unofficial Prometheus soundpack's options menu on F2 works: volume, muting,
+  and every panning and gagging switch.
+* Cosmic Rage's gag creator, decimal separator choice and other menus work.
+* Star Conquest's menus for adding and removing chat buffers work.
+* Miriani's saved destinations list and buffer choices work.
+* MUSHclient soundpacks' message boxes, questions and lists appear. Chatpack asks
+  once whether to download sounds it doesn't have.
+* With more than one world open, a pack's dialog says which world is asking.
+* Keys a pack ties to VIP Mud's own menus and windows go back to genericMud.
+  With Cosmic Rage loaded, Alt+F, Ctrl+O, Escape, Ctrl+Q and others did nothing.
+
+**Worth knowing**
+
+* While a pack's dialog is open, genericMud waits for your answer, the way VIP Mud
+  and MUSHclient do. The pack's own timers keep going, so hints it speaks while
+  its menu is open still play, and your other worlds catch up once you answer. A
+  dialog left unanswered for fifteen minutes closes as if cancelled.
+* A MUSHclient pack's list starts with nothing selected, as in MUSHclient, so
+  pressing Enter without choosing picks nothing.
+
 ## 0.14.0 — 2026-10-26
 
 **VIP Mud soundpacks**
