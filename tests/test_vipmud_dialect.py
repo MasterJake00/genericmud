@@ -633,7 +633,7 @@ def _remote_pack(tmp_path):
     engine = AutomationEngine(sink)
     pack = VipMudPack(ScriptApi(engine, source="vip", base_dir=str(tmp_path)))
     pack.load_source(
-        SPHOOK + "\n#alias {quiet} {#pc 1 stop}\n#alias {place} {#pc 1 volume 30;#pc 1 pan -50}"
+        SPHOOK + "\n#alias {quiet} {#pc 1 stop}\n#alias {place} {#pc 1 volume 30;#pc 1 pan -2500}"
     )
     return sink, engine
 
@@ -716,7 +716,7 @@ async def test_volume_and_pan_set_while_a_sound_downloads_are_kept(tmp_path, mon
     monkeypatch.setattr("genericmud.packs.vault.download", download)
     sink, engine = _remote_pack(tmp_path)
     engine.process_line(Line("$sphook play:a:80:0:0:1"))
-    engine.process_input("place")  # #pc 1 volume 30 and #pc 1 pan -50, before it lands
+    engine.process_input("place")  # #pc 1 volume 30 and #pc 1 pan -2500, before it lands
     release.set()
     await _until(lambda: sink.played)
     assert (sink.played[0]["gain"], sink.played[0]["pan"]) == (0.3, -0.5)

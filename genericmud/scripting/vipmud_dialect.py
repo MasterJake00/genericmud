@@ -1505,7 +1505,8 @@ class VipMudPack:
         handle = self._expand(args[0].text, scope).strip()
         action = self._expand(args[1].text, scope).strip().lower()
         value = self._expand(args[2].text, scope) if len(args) > 2 else ""
-        if handle == _MASTER_HANDLE:  # 0 controls all cues / the master gain
+        number = _number(handle)
+        if number is not None and number <= 0:  # zero or less: every cue, and the master
             if action == "stop":
                 self._pending_cues.clear()
                 self._api.flush()
@@ -1514,6 +1515,15 @@ class VipMudPack:
                 self._api.set_master(self._master_volume / 100)
             return
         channel = self._handles.get(handle)
+        if action == "isplaying":
+            # "#PC handle IsPlaying variable": non-zero while the sound plays. One still
+            # downloading counts; it starts as soon as it lands.
+            playing = channel is not None and (
+                channel in self._pending_cues or self._api.is_playing(channel)
+            )
+            if value.strip():
+                self._api.set_var(_fold(value.strip()), "1" if playing else "0")
+            return
         if channel is None:
             return
         if action == "stop":
@@ -1528,8 +1538,8 @@ class VipMudPack:
             else:
                 self._api.adjust(channel, gain=gain)
         elif action == "pan":
-            # VIPMud pan is -100..100; the bus wants -1..1.
-            pan = max(-1.0, min(1.0, _to_int(value, 0) / 100))
+            # VIPMud pan runs from -5000 (left) to 5000 (right); the bus wants -1..1.
+            pan = max(-1.0, min(1.0, _to_int(value, 0) / 5000))
             if channel in self._pending_cues:
                 self._pending_cues[channel].pan = pan
             else:

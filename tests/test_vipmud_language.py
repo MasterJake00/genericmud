@@ -11,6 +11,7 @@ from genericmud.automation.engine import AutomationEngine
 from genericmud.model.buffer import Line
 from genericmud.scripting.api import ScriptApi
 from genericmud.scripting.vipmud_dialect import VipMudPack
+from genericmud.sound.bus import SoundBus
 from tests.helpers import RecordingSink
 
 
@@ -615,3 +616,50 @@ def test_onconnect_and_ondisconnect_run_when_the_connection_changes():
     engine.process_line(Line("ping"))
     pack.connection_changed(False)
     assert _said(sink) == ["hello", "pong", "bye"]
+
+
+# --- sound (manual 5.2.37) ---
+
+
+class _SpyBus(SoundBus):
+    def __init__(self) -> None:
+        super().__init__()
+        self.adjusted: list[tuple[str, float | None, float | None]] = []
+        self.busy: set[str] = set()
+
+    def adjust(self, channel, gain=None, pan=None) -> None:
+        self.adjusted.append((channel, gain, pan))
+
+    def is_playing(self, channel) -> bool:
+        return channel in self.busy
+
+
+def test_pan_runs_from_minus_5000_to_5000_the_way_packs_write_it(tmp_path):
+    # Star Conquest pans to +-3500, Prometheus to +-1500 and +-4000, and Cosmic Rage
+    # multiplies the server's pan by 50. Read as -100..100 they all went hard left or right.
+    (tmp_path / "hit.wav").write_bytes(b"RIFF")
+    sink = RecordingSink()
+    bus = _SpyBus()
+    engine = AutomationEngine(sink, sound=bus)
+    VipMudPack(ScriptApi(engine, source="vip", base_dir=str(tmp_path))).load_source(
+        "#alias pan {#play {hit.wav}; #pc %playhandle pan %0}"
+    )
+    for value in ("-3500", "1500", "5000", "-9000", "0"):
+        engine.process_input(f"pan {value}")
+    assert [pan for _channel, _gain, pan in bus.adjusted] == [-0.7, 0.3, 1.0, -1.0, 0.0]
+
+
+def test_isplaying_tells_the_pack_whether_its_sound_is_still_going(tmp_path):
+    (tmp_path / "loop.wav").write_bytes(b"RIFF")
+    sink = RecordingSink()
+    bus = _SpyBus()
+    engine = AutomationEngine(sink, sound=bus)
+    VipMudPack(ScriptApi(engine, source="vip", base_dir=str(tmp_path))).load_source(
+        "#playloop {loop.wav}\n#var h %playhandle\n"
+        "#alias check {#pc @h isplaying playing}"
+    )
+    engine.process_input("check")
+    assert engine.get_var("playing") == "0"
+    bus.busy.add("vip-1")
+    engine.process_input("check")
+    assert engine.get_var("playing") == "1"
