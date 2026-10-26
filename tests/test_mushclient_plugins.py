@@ -223,6 +223,37 @@ def test_a_plain_include_that_fails_leaves_its_plugin_working(tmp_path):
     assert _notes(sink) == ["handler", "handler"]
 
 
+def test_the_world_files_handlers_run_around_the_plugins_hooks():
+    # MUSHclient runs on_world_open once the world and its plugins are loaded, before it
+    # connects, and the world's connect and disconnect handlers before the plugins'. yugioh
+    # sets up its settings in OnWorldOpen. A handler starting with ! is a command.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(
+        "<muclient><world name='w' on_world_open='Opened' on_world_connect='Connected'"
+        " on_world_disconnect='Dropped' on_world_close='!say bye'/><script><![CDATA[\n"
+        "function Opened() Note('world open, connected ' .. tostring(IsConnected())) end\n"
+        "function Connected() Note('world connect') end\n"
+        "function Dropped() Note('world disconnect') end\n"
+        "]]></script></muclient>"
+    )
+    pack.load_source(_plugin(A, "p", (
+        "function OnPluginInstall() Note('plugin install') end\n"
+        "function OnPluginConnect() Note('plugin connect') end\n"
+        "function OnPluginDisconnect() Note('plugin disconnect') end\n"
+        "function OnPluginClose() Note('plugin close') end"
+    )))
+    pack.dispatch_install()
+    pack.dispatch_connect()
+    pack.dispatch_disconnect()
+    pack.dispatch_close()
+    assert _notes(sink) == [
+        "plugin install", "world open, connected false", "world connect", "plugin connect",
+        "world disconnect", "plugin disconnect", "plugin close",
+    ]
+    assert sink.sent == ["say bye"]
+
+
 def test_a_disabled_plugins_alias_lets_the_command_through():
     sink, engine = _engine()
     pack = MushclientPack(ScriptApi(engine, source="m"))

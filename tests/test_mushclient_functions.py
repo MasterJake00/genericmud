@@ -394,3 +394,22 @@ def test_trigger_info_gives_the_last_wildcards_and_a_whole_second_time():
         "Send(tostring(GetTriggerInfo('t', 22) == math.floor(GetTriggerInfo('t', 22))))",
     )
     assert sink.sent[-2:] == ["one,two", "true"]
+
+
+def test_get_world_finds_this_world_and_no_other():
+    # Materia Magica's GMCP handler sends the room to a mapping world only when GetWorld
+    # finds that world open; the do-nothing stand-in made it send junk to the MUD.
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(
+        "<muclient><world name='Materia Magica'/><script><![CDATA[\n"
+        "local dune = GetWorld('sandbox.dune.net')\n"
+        "if dune ~= nil then Send(dune, 'room.info {}') end\n"
+        "local me = GetWorld('materia magica')\n"
+        "me:Note('found ' .. tostring(GetWorldById(GetWorldID()) ~= nil) .. ' '"
+        " .. tostring(GetWorldIdList()[1] == GetWorldID()))\n"
+        "]]></script></muclient>"
+    )
+    assert sink.sent == []
+    assert [text for text, _channel in sink.echoed] == ["found true true"]

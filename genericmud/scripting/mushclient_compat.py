@@ -405,6 +405,9 @@ _GMCP_HANDLER_ID = "3e7dedbe37e44942dd46d264"  # GMCP_handler_NJG broadcast iden
 
 _XML_TRUE = frozenset({"y", "yes", "1", "-1", "true", "t"})
 _PLUGIN_SEQUENCE = 5000  # MUSHclient's default plugin sequence
+# World file event handlers genericMud runs (on_world_<event>). MUSHclient's get_focus and
+# lose_focus, for the window, have no equivalent here yet.
+_WORLD_EVENTS = ("open", "connect", "disconnect", "close")
 _PLUGIN_DATE = re.compile(r"^(\d+)-(\d+)-(\d+)(?:\s+(\d+)(?::(\d+))?(?::(\d+))?)?$")
 
 
@@ -524,6 +527,9 @@ class MushclientPack:
         self._world_name = ""
         self._world_address = ""
         self._world_port = 0
+        # The world file's own event handlers (on_world_open="OnWorldOpen" and so on).
+        self._world_events: dict[str, str] = {}
+        self._world_object = None  # what GetWorld answers for this world (see _get_world)
         self._exposed: dict[str, dict] = {}  # ppi: plugin id -> {exposed name -> Lua fn}
         self._current_plugin = "world"  # whose script is loading now (for ppi.Expose)
         self._current_document: Path | None = None
@@ -1796,6 +1802,9 @@ class MushclientPack:
             "GetUniqueID": lambda *_a: uuid4().hex[:24],
             "GetUniqueNumber": self._get_unique_number,
             "GetWorldID": lambda *_a: self._world_id,
+            "GetWorld": self._get_world,
+            "GetWorldById": self._get_world_by_id,
+            "GetWorldIdList": lambda *_a: self._lua.table_from([self._world_id]),
             "GetWorldList": lambda *_a: self._lua.table_from(
                 [self._world_name] if self._world_name else []
             ),
@@ -3826,6 +3835,33 @@ class MushclientPack:
         self._api.add_timer(delay, fire)
         return E_OK
 
+    def _get_world(self, name: object = "", *_args: object):
+        """MUSHclient ``GetWorld``: this world's object by its name, nil for any other.
+        genericMud's sessions can't reach each other, and in MUSHclient nil means that world
+        isn't open: Materia Magica's GMCP handler checks for it before it sends the room to
+        a mapping world, and sent the do-nothing stand-in's text to the MUD instead."""
+        wanted = str(name or "").casefold()
+        if not wanted or wanted != self._world_name.casefold():
+            return None
+        return self._this_world()
+
+    def _get_world_by_id(self, world_id: object = "", *_args: object):
+        return self._this_world() if str(world_id or "") == self._world_id else None
+
+    def _this_world(self):
+        """This world as an object, its functions called with a colon (w:Note("hi"))."""
+        if self._world_object is None:
+            self._world_object = self._lua.eval(
+                "function(world)\n"
+                "  return setmetatable({}, {__index = function(_, name)\n"
+                "    local value = world[name]\n"
+                "    if type(value) ~= 'function' then return value end\n"
+                "    return function(_, ...) return value(...) end\n"
+                "  end})\n"
+                "end"
+            )(self._lua.globals().world)
+        return self._world_object
+
     def _plugin_gone(self, plugin: str) -> bool:
         """Whether the plugin that set something up has since been unloaded."""
         return plugin != "world" and plugin not in self._plugin_info
@@ -4130,6 +4166,10 @@ class MushclientPack:
                     self._world_port = int(world.get("port", self._world_port))
                 except (TypeError, ValueError):
                     pass
+                for event in _WORLD_EVENTS:
+                    handler = world.get(f"on_world_{event}", "").strip()
+                    if handler:
+                        self._world_events[event] = handler
             script_filename = world.get("script_filename", "") if world is not None else ""
             # The file's own variables are its starting values (Erion's MSDP plugin ships
             # thirteen); ones the player's saved session already restored stay as they are.
@@ -4307,11 +4347,28 @@ class MushclientPack:
         self._opening = True
         try:
             self.dispatch("OnPluginInstall")
+            # Then the world's own open handler, which MUSHclient runs once the world and its
+            # plugins are loaded, before connecting (yugioh sets up its settings there).
+            self._world_event("open")
         finally:
             self._opening = False
 
+    def _world_event(self, event: str) -> None:
+        """Run the world file's handler for ``event``, a function of the world's script, or
+        with a leading "!" a command to execute, as MUSHclient's SeeIfHandlerCanExecute."""
+        handler = self._world_events.get(event, "")
+        if not handler:
+            return
+        if handler.startswith("!"):
+            self._in_plugin("world", self._api.execute, handler[1:])
+            return
+        function = self._lua_function(handler, "world")
+        if function is not None:
+            self._in_plugin("world", self._guard.run, function)
+
     def dispatch_connect(self) -> None:
         self._connected_at = time.time()
+        self._world_event("connect")  # before the plugins hear it, as in MUSHclient
         self.dispatch("OnPluginConnect")
 
     def resume_timers(self) -> None:
@@ -4325,6 +4382,7 @@ class MushclientPack:
     def dispatch_disconnect(self) -> None:
         """The connection dropped; packs stop their music and save in OnPluginDisconnect."""
         self._connected_at = None
+        self._world_event("disconnect")
         self.dispatch("OnPluginDisconnect")
 
     def dispatch_close(self) -> None:
@@ -4338,6 +4396,7 @@ class MushclientPack:
                     self._call_hook(plugin_id, "OnPluginSaveState")
         finally:
             self._saving_state = False
+        self._world_event("close")
         self.dispatch("OnPluginClose")
 
     def dispatch_line(self, line: str) -> None:
