@@ -177,6 +177,10 @@ class _Rule:
     stop_scope: str | None = None
     tiebreak: str = ""  # orders rules of equal priority (MUSHclient sorts them by match text)
     timed_out: bool = False  # switched off because its pattern ran past the match budget
+    # An alias that takes the command whenever it matches, even when it keeps evaluating
+    # (MUSHclient sends what was typed only when no alias matched at all).
+    consumes: bool = False
+    fallback: bool = False  # an alias that runs only when no alias before it took the command
 
 
 def _rule_order(rule: _Rule) -> tuple[int, str]:
@@ -274,12 +278,16 @@ class AutomationEngine:
         keep_evaluating: bool = False,
         source: str = "",
         tiebreak: str = "",
+        stop_scope: str | None = None,
+        consumes: bool = False,
+        fallback: bool = False,
     ) -> _Rule:
         # process_input anchors every alias at the start; a wildcard alias is anchored at the
         # end too, so it has to be the whole command. Regex aliases keep whatever their
         # author wrote.
         rule = _Rule(compile_pattern(pattern, regex, whole=True), callback, priority, name, True,
-                     source=source, keep_evaluating=keep_evaluating, tiebreak=tiebreak)
+                     source=source, keep_evaluating=keep_evaluating, tiebreak=tiebreak,
+                     stop_scope=stop_scope, consumes=consumes, fallback=fallback)
         self._aliases.append(rule)
         self._aliases.sort(key=_rule_order)
         return rule
@@ -525,8 +533,10 @@ class AutomationEngine:
         Returns the lines to actually send: ``[text]`` when no alias matches, or
         ``[]`` when an alias consumes the input (its callback performs the sends).
         """
+        stopped: set[str] = set()  # scopes an alias has stopped (see _Rule.stop_scope)
+        consumed = False
         for rule in list(self._aliases):
-            if not rule.enabled:
+            if not rule.enabled or rule.stop_scope in stopped or (rule.fallback and consumed):
                 continue
             try:
                 match = rule.pattern.match(text, **_MATCH_KWARGS)
@@ -541,9 +551,13 @@ class AutomationEngine:
                 continue
             if rule.callback is not None:
                 rule.callback(MatchContext(Line(text), _wildcards(match), _named(match), self))
+            consumed = consumed or rule.consumes
             if not rule.keep_evaluating:
-                return []
-        return [text]
+                if rule.stop_scope is None:
+                    return []
+                stopped.add(rule.stop_scope)
+                consumed = True
+        return [] if consumed else [text]
 
     def press_key(self, key: str) -> bool:
         if not self.has_key(key):

@@ -118,6 +118,7 @@ _SEND_TO_NAMES = {
 _DEFAULT_SEQUENCE = 100
 _MAX_SEQUENCE = 10000
 _FILLED_IN = re.compile(r"%[0-9<%NnCc]")  # what a match fills into send text
+_DOCTYPE_RE = re.compile(r"<!DOCTYPE[^\[>]*(?:\[.*?\])?\s*>", re.DOTALL | re.IGNORECASE)
 _NO_SOUND = "(No sound)"  # what MUSHclient writes in a trigger's sound attribute when it has none
 # Rule options packs can read back that genericMud keeps but doesn't act on.
 _KEPT_FLAGS = {
@@ -519,6 +520,9 @@ class MushclientPack:
         self._connected_at: float | None = None  # GetInfo(301) and GetConnectDuration
         self._saving_state = False  # SaveState can't run inside OnPluginSaveState
         self._notepads: dict[str, str] = {}  # MUSHclient notepads by title
+        self._loading_plugins: dict[str, int] = {}  # plugins whose files are loading now
+        self._plugin_files: dict[str, set[Path]] = {}  # plain includes each plugin loaded
+        self._lifecycle_started = False  # OnPluginInstall has gone round once
         self._headless_window = _HeadlessWindow()  # the window's calls when there's no window
         # MUSHclient targets Lua 5.1; trusted packs keep the full stdlib their
         # libraries assume (os/io/loadstring + the module(..., package.seeall) idiom).
@@ -988,8 +992,27 @@ class MushclientPack:
                         self._include_errors.append(
                             (target.name, f"{type(exc).__name__}: {exc}")
                         )
+                    else:
+                        self._install_late(target)
         functions = self._exposed.get(key)
-        return self._lua.table_from(functions) if functions else None
+        if not functions:
+            return None
+        # Each runs as the plugin that exposed it, as MUSHclient's ppi (CallPlugin
+        # underneath) runs it, so its EnableTrigger and GetPluginID are that plugin's.
+        return self._lua.table_from({
+            name: self._as_plugin(key, function) for name, function in functions.items()
+        })
+
+    def _as_plugin(self, plugin_id: str, function):
+        def call(*args: object):
+            previous = self._current_plugin
+            self._current_plugin = plugin_id
+            try:
+                return function(*args)
+            finally:
+                self._current_plugin = previous
+
+        return call
 
     def _gmcp_value(self, path: object = ""):
         value = self._gmcp_values.get(str(path or "").casefold())
@@ -1009,12 +1032,23 @@ class MushclientPack:
         return value
 
     def _broadcast_plugin(self, message: object = 0, text: object = "", *_args: object) -> int:
-        info = self._plugin_info.get(self._current_plugin, {})
-        self.dispatch(
-            "OnPluginBroadcast", int(_to_float(message) or 0), self._get_plugin_id(),
-            str(info.get("name", "")), str(text or ""),
-        )
-        return _SCRIPT_ERROR_OK
+        """MUSHclient ``BroadcastPlugin``: every other enabled plugin's OnPluginBroadcast
+        hears it (never the sender, which could loop); answers how many did."""
+        sender = self._current_plugin
+        sender_id = self._get_plugin_id()
+        sender_name = str(self._plugin_info.get(sender, {}).get("name", ""))
+        heard = 0
+        for plugin_id, hooks in list(self._hooks.items()):
+            if plugin_id == sender or "OnPluginBroadcast" not in hooks:
+                continue
+            if not self._plugin_enabled(plugin_id):
+                continue
+            heard += 1
+            self._call_hook(
+                plugin_id, "OnPluginBroadcast", int(_to_float(message) or 0), sender_id,
+                sender_name, _dialog_text(text),
+            )
+        return heard
 
     def _get_plugin_id(self, *_args: object) -> str:
         return "" if self._current_plugin == "world" else self._current_plugin
@@ -1047,6 +1081,10 @@ class MushclientPack:
         if bool(info.get("enabled", True)) == wanted:
             return _SCRIPT_ERROR_OK
         info["enabled"] = wanted
+        for rules in self._rules.values():
+            for (plugin, _label), rule in rules.items():
+                if plugin == found:
+                    self._sync_engine(rule)
         # As MUSHclient does, the plugin hears it was switched on or off.
         self._call_hook(found, "OnPluginEnable" if wanted else "OnPluginDisable")
         return _SCRIPT_ERROR_OK
@@ -1070,7 +1108,19 @@ class MushclientPack:
         except Exception as exc:  # noqa: BLE001 - dependency failure stays local to that plugin
             self._include_errors.append((name, f"{type(exc).__name__}: {exc}"))
             return ERROR_CODES["eProblemsLoadingPlugin"]
+        self._install_late(target)
         return _SCRIPT_ERROR_OK
+
+    def _install_late(self, path: Path) -> None:
+        """A plugin loaded while playing hears OnPluginInstall then, and OnPluginConnect if
+        the world is connected, as MUSHclient installs one it loads at any time."""
+        if not self._lifecycle_started:
+            return  # the session's own install round will reach it
+        plugin_id, _name, _language = self._plugin_metadata(path)
+        if plugin_id in self._plugin_info:
+            self._call_hook(plugin_id, "OnPluginInstall")
+            if self._connected_at is not None:
+                self._call_hook(plugin_id, "OnPluginConnect")
 
     # --- plugins: their variables, routines, state and lifecycle ---
 
@@ -1167,6 +1217,12 @@ class MushclientPack:
                 state["generation"] += 1
         self._hooks.pop(plugin_id, None)
         self._exposed.pop(plugin_id, None)
+        # Its files load afresh next time: the plugin file and the plain includes it pulled in.
+        for path in self._plugin_files.pop(plugin_id, set()):
+            self._loaded_includes.discard(path)
+        info_path = self._plugin_info.get(plugin_id, {}).get("path")
+        if isinstance(info_path, Path):
+            self._loaded_includes.discard(info_path)
 
     def _reload_plugin(self, plugin_id: object = "", *_args: object) -> int:
         """MUSHclient ``ReloadPlugin``: load a plugin's file again from scratch and install
@@ -1182,6 +1238,7 @@ class MushclientPack:
             return E_OK  # genericMud does that plugin's job; there is nothing to reload
         self._call_hook(found, "OnPluginClose")
         self._forget_plugin(found)
+        self._loaded_includes.add(path)
         try:
             self._load_path(path)
         except Exception as exc:  # noqa: BLE001 - the plugin stays unloaded, the pack goes on
@@ -1255,8 +1312,8 @@ class MushclientPack:
             "ticks": line.ts,
             "elapsed": max(0.0, line.ts - self._opened_at),
         }
-        if info_type is None:
-            return self._lua.table_from(fields)
+        if info_type is None or not _to_float(info_type):
+            return self._lua.table_from(fields)  # 0 or none: every field, as MUSHclient answers
         order = (
             "text", "length", "newline", "note", "user", "log", "bookmark", "hr", "time",
             "line", "styles", "ticks", "elapsed",
@@ -1285,8 +1342,9 @@ class MushclientPack:
             style = int(run["style"])
             return {
                 "text": run["text"], "length": run["length"], "column": run["column"],
+                "actiontype": 0, "action": "", "hint": "", "variable": "",
                 "bold": bool(style & 1), "ul": False, "blink": False, "inverse": False,
-                "changed": False, "textcolour": run["textcolour"],
+                "changed": False, "starttag": False, "textcolour": run["textcolour"],
                 "backcolour": run["backcolour"],
             }
 
@@ -1302,7 +1360,8 @@ class MushclientPack:
         if info_type is None:
             return self._lua.table_from(fields_of(run))
         values = {
-            1: run["text"], 2: run["length"], 3: run["column"], 4: "", 5: "", 6: "", 7: 0,
+            # 4 is the MXP action's type (0, none), 5 to 7 its action, hint and variable.
+            1: run["text"], 2: run["length"], 3: run["column"], 4: 0, 5: "", 6: "", 7: "",
             8: bool(int(run["style"]) & 1), 9: False, 10: False, 11: False, 12: False,
             13: False, 14: run["textcolour"], 15: run["backcolour"],
         }
@@ -2365,16 +2424,13 @@ class MushclientPack:
             self._current_plugin = previous
 
     def _find_timer(self, name: object) -> tuple[tuple[str, str], dict] | tuple[None, None]:
-        """The timer a pack names: its own plugin's first, then any plugin's."""
+        """The timer a plugin names: its own, as in MUSHclient."""
         label = str(name or "").strip().lower()
         if not label:
             return None, None
         key = (self._current_plugin, label)
         if key in self._timers:
             return key, self._timers[key]
-        for other, state in self._timers.items():
-            if other[1] == label:
-                return other, state
         return None, None
 
     def _set_timer_enabled(self, key: tuple[str, str], state: dict, wanted: bool) -> None:
@@ -2413,9 +2469,10 @@ class MushclientPack:
         name = str(group or "")
         if not name:
             return []
-        timers = [(key, state) for key, state in self._timers.items() if state["group"] == name]
-        own = [(key, state) for key, state in timers if key[0] == self._current_plugin]
-        return own or timers
+        return [
+            (key, state) for key, state in self._timers.items()
+            if state["group"] == name and key[0] == self._current_plugin
+        ]
 
     def _enable_timer_group(self, group: object = "", enabled: object = True, *_args) -> int:
         timers = self._timers_in_group(group)
@@ -2896,10 +2953,10 @@ class MushclientPack:
         if existing is not None:
             self._retire_rule(existing)
         rules[(rule.plugin, label)] = rule
-        if rule.script:
-            # Found now when it exists, so a later plugin defining a function of the same name
-            # in the shared script space doesn't take this rule over; otherwise looked for
-            # when the rule fires (Krinnzenn imports its aliases before defining their scripts).
+        if rule.script and not self._loading_plugins.get(rule.plugin):
+            # Added while playing: the plugin's functions exist now. One added while its plugin
+            # loads is bound when the plugin's script has run (_bind_handlers), so a function
+            # of the same name another plugin left in the shared script space isn't taken.
             rule.handler = self._lua_function(rule.script)
         return E_OK
 
@@ -2918,12 +2975,16 @@ class MushclientPack:
                 stop_scope=f"mushclient:{self._api.source}:{rule.plugin}", tiebreak=rule.match,
             )
         else:
+            # The same for aliases, and any alias that matches takes the command, as in
+            # MUSHclient: Mush-Z's cast alias keeps evaluating and sends the cast itself.
             engine_rule = self._api.add_alias(
                 pattern, callback, regex=True, priority=-rule.sequence, name=engine_name,
-                keep_evaluating=rule.keep_evaluating, tiebreak=rule.match,
+                keep_evaluating=rule.keep_evaluating,
+                stop_scope=f"mushclient:{self._api.source}:{rule.plugin}", consumes=True,
+                tiebreak=rule.match,
             )
-        engine_rule.enabled = rule.enabled
         rule.engine_rule, rule.engine_name, rule.pattern = engine_rule, engine_name, pattern
+        self._sync_engine(rule)
         if rule.kind == TRIGGER and rule.expand_variables and "@" in rule.match:
             self._expanding.add(rule)
         else:
@@ -2934,6 +2995,7 @@ class MushclientPack:
         old_engine_rule, old_engine_name = rule.engine_rule, rule.engine_name
         self._register_rule(rule)
         if old_engine_rule is not None:
+            old_engine_rule.enabled = False  # a line already being matched passes it by
             self._remove_engine_rule(rule.kind, old_engine_name)
 
     def _remove_engine_rule(self, kind: str, engine_name: str) -> None:
@@ -2946,6 +3008,8 @@ class MushclientPack:
         """Delete a rule: it stops matching at once and its engine rule goes with it."""
         rule.deleted = True
         rule.enabled = False
+        if rule.engine_rule is not None:
+            rule.engine_rule.enabled = False  # a line already being matched passes it by
         self._expanding.discard(rule)
         rules = self._rules[rule.kind]
         if rules.get((rule.plugin, rule.label)) is rule:
@@ -3005,6 +3069,7 @@ class MushclientPack:
             rule.matched += 1
             rule.last_matched = time.time()
             rule.last_text = ctx.line.plain_text
+            rule.last_wildcards = list(ctx.wildcards)
             if rule.kind == TRIGGER and rule.omit_from_output:
                 ctx.line.gagged = True
                 ctx.line.display_when_gagged = False
@@ -3019,6 +3084,8 @@ class MushclientPack:
                     self._send_rule_text(rule, ctx)
                 if rule.script:
                     self._run_rule_script(rule, ctx)
+            except Exception as error:  # noqa: BLE001 - a fault here mustn't cost the player
+                self._report_error(error)  # the line it fired on, or the rest of the packet
             finally:
                 self._current_plugin = previous
 
@@ -3097,32 +3164,37 @@ class MushclientPack:
             return None
 
     def _find_rule(self, kind: str, name: object) -> PackRule | None:
-        """The rule a pack names: its own plugin's, as MUSHclient looks, else any plugin's."""
+        """The rule a plugin names: its own, as in MUSHclient. Two plugins may well both have
+        a "temp" trigger, and deleting or switching off yours mustn't touch the other's."""
         label = str(name or "").strip().lower()
         if not label:
             return None
-        rules = self._rules[kind]
-        rule = rules.get((self._current_plugin, label))
-        if rule is not None:
-            return rule
-        return next((rule for (_plugin, key), rule in rules.items() if key == label), None)
+        return self._rules[kind].get((self._current_plugin, label))
 
     def _rules_in_group(self, kind: str, group: object) -> list[PackRule]:
-        """A group's rules in the current plugin, as in MUSHclient; when it has none there,
-        the group's rules in every plugin, which is how genericMud has always done it."""
+        """A group's rules in the current plugin, as in MUSHclient."""
         name = str(group or "")
         if not name:
             return []
-        rules = [rule for rule in self._rules[kind].values() if rule.group == name]
-        own = [rule for rule in rules if rule.plugin == self._current_plugin]
-        return own or rules
+        return [
+            rule for rule in self._rules[kind].values()
+            if rule.group == name and rule.plugin == self._current_plugin
+        ]
 
     def _set_rule_enabled(self, rule: PackRule, enabled: bool) -> None:
         rule.enabled = enabled
+        self._sync_engine(rule)
+
+    def _sync_engine(self, rule: PackRule) -> None:
+        """The engine matches a rule only while it's on, not deleted, and its plugin is on,
+        so a switched-off alias or a disabled plugin's alias lets the command through. Never
+        back on if the engine stopped it for running past its match budget."""
         engine_rule = rule.engine_rule
         if engine_rule is not None:
-            # Never back on if the engine stopped it for running past its match budget.
-            engine_rule.enabled = enabled and not engine_rule.timed_out
+            engine_rule.enabled = (
+                rule.enabled and not rule.deleted and self._plugin_enabled(rule.plugin)
+                and not engine_rule.timed_out
+            )
 
     def _not_found(self, kind: str) -> int:
         return E_TRIGGER_NOT_FOUND if kind == TRIGGER else E_ALIAS_NOT_FOUND
@@ -3175,6 +3247,8 @@ class MushclientPack:
         )
         rule.extra["custom_colour"] = int(_to_float(colour) or 0)
         rule.extra["clipboard_arg"] = int(_to_float(wildcard) or 0)
+        if rule.send_to == _SEND_TO_VARIABLE_CODE:
+            rule.variable = rule.name  # MUSHclient's own "kludge": the variable is the name
         try:
             code = self._add_rule(
                 rule, replace=bool(bits & _TRIGGER_FLAGS["Replace"]), skip_repeats=False
@@ -3366,7 +3440,10 @@ class MushclientPack:
             return -1
         text = re.sub(r"<\?xml[^>]*\?>", "", text)
         if "<muclient" not in text.lower():
-            text = f"<muclient>{text}</muclient>"
+            # Wrap the fragment so it has one root, after any DOCTYPE, which must come first.
+            doctype = _DOCTYPE_RE.search(text)
+            split = doctype.end() if doctype is not None else 0
+            text = f"{text[:split]}<muclient>{text[split:]}</muclient>"
         try:
             root = ET.fromstring(_sanitize_attr_markup(text))
         except ET.ParseError as error:
@@ -3659,10 +3736,12 @@ class MushclientPack:
         if self._speech_commands_installed:
             return
         self._speech_commands_installed = True
+        # They stand in for plugins the pack didn't bring, so an alias of the pack's own that
+        # takes the command, in whichever plugin, answers it instead.
         for pattern, interrupt, speaks in _SPEECH_COMMANDS:
             self._api.add_alias(
                 pattern, self._speech_command(interrupt, speaks), regex=True,
-                priority=_SPEECH_COMMAND_PRIORITY,
+                priority=_SPEECH_COMMAND_PRIORITY, fallback=True,
             )
         answers = (
             # Miriani-Next's own MushReader: its Do Not Disturb keeps incoming lines quiet.
@@ -3677,7 +3756,7 @@ class MushclientPack:
         )
         for pattern, callback in answers:
             self._api.add_alias(
-                pattern, callback, regex=True, priority=_SPEECH_COMMAND_PRIORITY
+                pattern, callback, regex=True, priority=_SPEECH_COMMAND_PRIORITY, fallback=True
             )
 
     def _speech_command(self, interrupt: bool, speaks: bool):
@@ -3721,6 +3800,7 @@ class MushclientPack:
             # that plugin; only the world file itself is the world.
             plugin_id = self._current_plugin if self._plain_include_depth > 0 else "world"
         self._current_plugin = plugin_id
+        self._loading_plugins[plugin_id] = self._loading_plugins.get(plugin_id, 0) + 1
         if plugin is not None and plugin_id != "world":
             plugin_name = plugin.get("name", "")
             if not plugin_name and self._current_document is not None:
@@ -3784,9 +3864,13 @@ class MushclientPack:
             script = "\n".join((el.text or "") for el in root.iter("script"))
             if script.strip():
                 self._guard.run_strict(self._execute_lua, script)
-            self._bind_handlers(plugin_id)
+            if self._loading_plugins[plugin_id] == 1:  # its plain includes are loaded too
+                self._bind_handlers(plugin_id)
             self._capture_hooks()
         finally:
+            self._loading_plugins[plugin_id] -= 1
+            if not self._loading_plugins[plugin_id]:
+                del self._loading_plugins[plugin_id]
             self._current_plugin = previous
         for include in root.iter("include"):
             name = include.get("name")
@@ -3847,6 +3931,8 @@ class MushclientPack:
         if target in self._loaded_includes:  # dedup by file (dirs share names)
             return
         self._loaded_includes.add(target)
+        if self._plain_include_depth > 0:  # part of the plugin including it
+            self._plugin_files.setdefault(self._current_plugin, set()).add(target)
         reason = self._plugin_skip_reason(target)
         if reason:
             self._mark_virtual_plugin(target)
@@ -3913,11 +3999,20 @@ class MushclientPack:
         """MUSHclient calls each plugin's ``OnPluginInstall`` at load; packs set their
         variable defaults there (Erion turns every sound toggle on), so skipping it
         leaves the pack loaded but gated silent."""
+        self._lifecycle_started = True  # from now on a plugin loaded is installed at once
         self.dispatch("OnPluginInstall")
 
     def dispatch_connect(self) -> None:
         self._connected_at = time.time()
         self.dispatch("OnPluginConnect")
+
+    def resume_timers(self) -> None:
+        """Schedule every enabled timer again. A dropped connection cancels the session's
+        pending timers, and MUSHclient's carry on through one (Toastush's heartbeat)."""
+        for key, state in list(self._timers.items()):
+            state["generation"] += 1  # anything still pending from before no-ops
+            if state["enabled"]:
+                self._schedule_timer(key, state)
 
     def dispatch_disconnect(self) -> None:
         """The connection dropped; packs stop their music and save in OnPluginDisconnect."""
@@ -3928,9 +4023,13 @@ class MushclientPack:
         """The session is closing: plugins that save their state do it now, through their
         OnPluginSaveState, as MUSHclient does when a world closes, then every plugin hears
         OnPluginClose (Miriani-Next fixes up its settings in both)."""
-        for plugin_id, info in list(self._plugin_info.items()):
-            if info.get("save_state") and not info.get("virtual"):
-                self._call_hook(plugin_id, "OnPluginSaveState")
+        self._saving_state = True  # a SaveState inside the hook doesn't run it again
+        try:
+            for plugin_id, info in list(self._plugin_info.items()):
+                if info.get("save_state") and not info.get("virtual"):
+                    self._call_hook(plugin_id, "OnPluginSaveState")
+        finally:
+            self._saving_state = False
         self.dispatch("OnPluginClose")
 
     def dispatch_line(self, line: str) -> None:
@@ -4023,8 +4122,14 @@ def _escape_attr_values(segment: str) -> str:
             out.append(segment[index:])
             break
         out.append(segment[index:start])
+        if segment.startswith("<!--", start):
+            end = segment.find("-->", start + 4)
+            end = length if end < 0 else end + 3
+            out.append(segment[start:end])  # a comment's text is nobody's markup
+            index = end
+            continue
         if start + 1 >= length or not _starts_name(segment[start + 1]):
-            out.append("<")  # an end tag, comment, declaration, or text
+            out.append("<")  # an end tag, declaration, or text
             index = start + 1
             continue
         index = _copy_start_tag(segment, start, out)

@@ -338,3 +338,29 @@ def test_the_session_lists_its_packs_notepads(tmp_path):
     app, _backend, _posted = _app(store)
     app.on_connect("mud")
     assert app.pack_notepads() == {"comlog": "Bob: hi\r\n"}
+
+
+def test_a_packs_timers_run_again_after_a_reconnect(tmp_path):
+    # A disconnect cancels every pending pack timer; Toastush's heartbeat must come back.
+    store = PackStore(tmp_path / "store")
+    _install_mush(
+        store, tmp_path,
+        "<muclient><plugin id='beat' name='beat'/><script><![CDATA[\n"
+        "AddTimer('heartbeat', 0, 0, 1, '', timer_flag.Enabled, 'beat')\n"
+        "function beat() Note('beat') end\n"
+        "]]></script></muclient>",
+    )
+    scheduled: list[tuple[float, object]] = []
+    backend = RecordingBackend()
+    app = EngineApp(
+        VoiceRouter(backend, clock=lambda: 0.0), packs=store, name="mud",
+        schedule=lambda delay, callback: scheduled.append((delay, callback)),
+    )
+    app.on_connect("mud")
+    app.on_connection_status("disconnected")
+    scheduled.clear()  # what the disconnect cancelled never runs
+    app.on_connection_status("reconnected")
+    backend.spoken.clear()
+    for _delay, callback in [entry for entry in scheduled if entry[0] == 1]:
+        callback()
+    assert "beat" in backend.spoken

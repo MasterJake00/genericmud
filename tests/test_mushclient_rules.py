@@ -578,3 +578,50 @@ def test_a_files_variables_are_its_starting_values():
         "</muclient>"
     )
     assert sink.sent == ["on", "30"]
+
+
+# --- found in review ---
+
+
+def test_a_superscript_digit_after_a_percent_sign_is_just_text():
+    # A latin-1 pack's "%²" used to raise inside the trigger, and the line was never shown.
+    sink, engine, pack = _pack(
+        rules="<triggers><trigger match='^go (.+)$' regexp='y' enabled='y'>"
+        "<send>say %1 is 5%² and %&lt;²&gt; done</send></trigger></triggers>"
+    )
+    line = _line(pack, engine, "go north")
+    assert sink.sent == ["say north is 5%² and  done"]
+    assert line.plain_text == "go north"
+
+
+def test_a_fault_inside_a_rule_is_reported_and_the_line_still_arrives(monkeypatch):
+    from genericmud.scripting import mushclient_compat
+
+    def broken(*_args, **_kwargs):
+        raise ValueError("a bug in genericMud")
+
+    sink, engine, pack = _pack(
+        rules="<triggers><trigger match='ping' enabled='y'><send>pong</send></trigger>"
+        "</triggers>"
+    )
+    monkeypatch.setattr(mushclient_compat, "fill_text", broken)
+    line = _line(pack, engine, "ping")
+    assert line.plain_text == "ping"
+    assert any("script error" in text for text, _channel, _interrupt in sink.spoken)
+
+
+def test_import_xml_takes_a_fragment_that_starts_with_a_doctype():
+    sink, engine, pack = _pack(
+        "Send(tostring(ImportXML([[<!DOCTYPE muclient>\n"
+        "<triggers><trigger match='abc' enabled='y' send_to='12'><send>Send('hit')</send>"
+        "</trigger></triggers>]])))"
+    )
+    _line(pack, engine, "abc")
+    assert sink.sent == ["1", "hit"]
+
+
+def test_markup_inside_a_comment_is_left_alone_by_the_attribute_repair():
+    from genericmud.scripting.mushclient_compat import _sanitize_attr_markup
+
+    xml = "<a><!-- <b c='d --><t m='x'/><u n='(?P<w>.)'/></a>"
+    assert _sanitize_attr_markup(xml) == "<a><!-- <b c='d --><t m='x'/><u n='(?P&lt;w>.)'/></a>"

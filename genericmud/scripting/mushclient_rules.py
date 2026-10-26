@@ -243,7 +243,7 @@ def fill_text(
                 output.append("%")
                 index += 2
                 continue
-            if following.isdigit():
+            if following in "0123456789":
                 number = int(following)
                 value = wildcards[number] if number < len(wildcards) else ""
                 output.append(fix_wildcard(value, to_script=to_script, lower=lower_wildcards))
@@ -253,7 +253,7 @@ def fill_text(
                 end = text.find(">", index + 2)
                 end = length if end < 0 else end
                 name = text[index + 2:end]
-                if name.isdigit():
+                if name.isascii() and name.isdigit():
                     number = int(name)
                     value = wildcards[number] if number < len(wildcards) else ""
                 else:
@@ -585,6 +585,7 @@ class PackRule:
     invocations: int = 0
     last_matched: float = 0.0
     last_text: str = ""
+    last_wildcards: list[str] = field(default_factory=list)  # the whole match, then each
     deleted: bool = False
 
     def definition(self) -> tuple:
@@ -671,7 +672,7 @@ _TRIGGER_INFO = {
     13: ("expand_variables", bool), 14: ("extra:clipboard_arg", int), 15: ("send_to", int),
     16: ("sequence", int), 17: ("extra:match_style", int), 18: ("extra:new_style", int),
     19: ("extra:custom_colour", int), 20: ("invocations", int), 21: ("matched", int),
-    22: ("last_matched", float), 23: ("temporary", bool), 24: ("included", bool),
+    22: ("last_matched", "date"), 23: ("temporary", bool), 24: ("included", bool),
     25: ("lowercase_wildcard", bool), 26: ("group", str), 27: ("variable", str),
     28: ("user", int), 29: ("extra:other_text_colour", int),
     30: ("extra:other_back_colour", int), 32: ("last_text", str), 33: ("executing", bool),
@@ -681,7 +682,7 @@ _ALIAS_INFO = {
     1: ("match", str), 2: ("send", str), 3: ("script", str), 4: ("omit_from_log", bool),
     5: ("omit_from_output", bool), 6: ("enabled", bool), 7: ("regexp", bool),
     8: ("ignore_case", bool), 9: ("expand_variables", bool), 10: ("invocations", int),
-    11: ("matched", int), 12: ("extra:menu", int), 13: ("last_matched", float),
+    11: ("matched", int), 12: ("extra:menu", int), 13: ("last_matched", "date"),
     14: ("temporary", bool), 15: ("included", bool), 16: ("group", str),
     17: ("variable", str), 18: ("send_to", int), 19: ("keep_evaluating", bool),
     20: ("sequence", int), 21: ("extra:echo_alias", bool),
@@ -693,6 +694,9 @@ _ALIAS_INFO = {
 
 def rule_info(rule: PackRule, number: int, *, script_valid: bool) -> object:
     """Get(Trigger|Alias)Info for one number; nil for a number it doesn't have."""
+    if 101 <= number <= 110:  # the last match's wildcards 1 to 9, then the whole match
+        index = number - 100 if number < 110 else 0
+        return rule.last_wildcards[index] if index < len(rule.last_wildcards) else ""
     table = _TRIGGER_INFO if rule.kind == TRIGGER else _ALIAS_INFO
     entry = table.get(number)
     if entry is None:
@@ -712,6 +716,6 @@ def rule_info(rule: PackRule, number: int, *, script_valid: bool) -> object:
         return bool(value)
     if kind is int:
         return int(value)
-    if kind is float:
-        return float(value) if value else None
+    if kind == "date":  # Lua gets a date as whole Unix seconds
+        return int(value) if value else None
     return str(value)

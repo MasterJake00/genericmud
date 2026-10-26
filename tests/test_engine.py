@@ -76,6 +76,54 @@ def test_alias_consumes_or_passes_through():
     assert engine.process_input("north") == ["north"]
 
 
+def test_a_scoped_stop_only_ends_its_own_scope():
+    # A soundpack's rule that stops evaluation ends that pack's rules for the line or command,
+    # not everyone's; a rule with no scope still stops everything after it.
+    engine = AutomationEngine()
+    fired: list[str] = []
+
+    def add(label: str, priority: int, scope: str | None) -> None:
+        engine.add_trigger(
+            "x", lambda c: fired.append(label), priority=priority, keep_evaluating=False,
+            stop_scope=scope,
+        )
+
+    add("a1", 30, "a")
+    add("a2", 20, "a")
+    add("b", 10, "b")
+    add("plain", 5, None)
+    add("after plain", 1, None)
+    engine.process_line(Line("x"))
+    assert fired == ["a1", "b", "plain"]
+
+
+def test_aliases_that_take_the_command_and_fallbacks():
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    said: list[str] = []
+    # Keeps evaluating but still takes the command: what was typed isn't sent as well.
+    engine.add_alias(
+        "c *", lambda c: c.engine.sink.send("cast " + c.wildcards[1]), priority=30,
+        keep_evaluating=True, stop_scope="a", consumes=True,
+    )
+    engine.add_alias("c *", lambda c: said.append("b"), priority=20, stop_scope="b")
+    # Only runs when nothing before it took the command.
+    engine.add_alias("*", lambda c: said.append("fallback"), priority=-10, fallback=True)
+    assert engine.process_input("c fireball") == []
+    assert sink.sent == ["cast fireball"]
+    assert said == ["b"]
+    assert engine.process_input("look") == []
+    assert said == ["b", "fallback"]
+
+
+def test_a_keep_evaluating_alias_that_doesnt_take_the_command_lets_it_through():
+    engine = AutomationEngine()
+    seen: list[str] = []
+    engine.add_alias("north", lambda c: seen.append("noted"), keep_evaluating=True)
+    assert engine.process_input("north") == ["north"]
+    assert seen == ["noted"]
+
+
 def test_key_press():
     sink = RecordingSink()
     engine = AutomationEngine(sink)

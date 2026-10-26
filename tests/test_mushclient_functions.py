@@ -346,3 +346,51 @@ def test_chatpacks_own_bass_wrapper_plays_through_genericmud(tmp_path):
     )
     assert [Path(cue["file"]).name for cue in sink.played] == ["huh.m4a"]
     assert sink.played[0]["gain"] == 0.5
+
+
+def test_add_trigger_ex_sending_to_a_variable_stores_it_under_the_triggers_name():
+    sink, engine, pack = _pack(
+        "AddTriggerEx('hp', 'HP: *', '%1', trigger_flag.Enabled, -1, 0, '', '', "
+        "sendto.variable, 100)"
+    )
+    pack.dispatch_line("HP: 42")
+    engine.process_line(Line("HP: 42"))
+    assert pack._api.get_var("hp") == "42"
+
+
+def test_save_state_at_close_runs_each_plugins_save_hook_once():
+    sink, _engine, pack = _pack(
+        "function OnPluginSaveState() Note('saving'); SaveState() end",
+        rules="",
+    )
+    pack._plugin_info[PLUGIN_ID]["save_state"] = True
+    pack.dispatch_close()
+    assert [text for text, _channel in sink.echoed] == ["saving"]
+
+
+def test_style_and_line_info_types_answer_like_mushclient():
+    sink = RecordingSink()
+    sink.lines.append("hello world")
+    sent = _pack(
+        "Send(type(GetStyleInfo(1, 1, 4)) .. ' ' .. tostring(GetStyleInfo(1, 1, 4)))\n"
+        "Send(type(GetStyleInfo(1, 1, 7)))\n"
+        "Send(type(GetLineInfo(1, 0)))\n"
+        "AddTriggerEx('t', 'a *', '', 1, -1, 0, '', '', 0, 100)\n",
+        sink=sink,
+    )[0].sent
+    assert sent == ["number 0", "string", "table"]
+
+
+def test_trigger_info_gives_the_last_wildcards_and_a_whole_second_time():
+    sink, engine, pack = _pack(
+        "AddTriggerEx('t', 'a * b *', '', trigger_flag.Enabled + trigger_flag.KeepEvaluating, "
+        "-1, 0, '', '', 0, 100)"
+    )
+    pack.dispatch_line("a one b two")
+    engine.process_line(Line("a one b two"))
+    pack._in_plugin(  # the plugin asks about its own trigger
+        PLUGIN_ID, pack._lua.execute,
+        "Send(GetTriggerInfo('t', 101) .. ',' .. GetTriggerInfo('t', 102))\n"
+        "Send(tostring(GetTriggerInfo('t', 22) == math.floor(GetTriggerInfo('t', 22))))",
+    )
+    assert sink.sent[-2:] == ["one,two", "true"]

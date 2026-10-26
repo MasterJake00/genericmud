@@ -1,0 +1,238 @@
+"""MUSHclient plugins as separate units in one shared Lua space.
+
+Each plugin's rules, timers and functions are its own, as in MUSHclient, even though every
+plugin's script runs in one Lua state here. These came out of reviewing the rule store.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from genericmud.automation.engine import AutomationEngine
+from genericmud.model.buffer import Line
+from genericmud.scripting.api import ScriptApi
+from genericmud.scripting.mushclient_compat import MushclientPack
+from tests.helpers import RecordingSink
+
+A = "a" * 24
+B = "b" * 24
+
+
+def _engine() -> tuple[RecordingSink, AutomationEngine]:
+    sink = RecordingSink()
+    return sink, AutomationEngine(sink)
+
+
+def _plugin(plugin_id: str, name: str, script: str = "", rules: str = "") -> str:
+    return (
+        f"<muclient><plugin name='{name}' id='{plugin_id}'/>"
+        f"<script><![CDATA[{script}]]></script>{rules}</muclient>"
+    )
+
+
+def _line(pack: MushclientPack, engine: AutomationEngine, text: str) -> Line:
+    pack.dispatch_line(text)
+    return engine.process_line(Line(text))
+
+
+def _notes(sink: RecordingSink) -> list[str]:
+    return [text for text, _channel in sink.echoed]
+
+
+def test_two_plugins_with_a_function_of_the_same_name_each_call_their_own():
+    # Materia Magica's plugins each define OnHelp for their help alias. A rule must call its
+    # own plugin's function, not one an earlier plugin left in the shared script space.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    for plugin_id, name in ((A, "first"), (B, "second")):
+        pack.load_source(_plugin(
+            plugin_id, name, f"function OnHelp() Note('help for {name}') end",
+            f"<aliases><alias match='{name}:help' enabled='y' script='OnHelp'/></aliases>",
+        ))
+    engine.process_input("first:help")
+    engine.process_input("second:help")
+    assert _notes(sink) == ["help for first", "help for second"]
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="latin-1")
+
+
+def _reloadable(tmp_path: Path, version: str) -> None:
+    _write(tmp_path / "worlds" / "plugins" / "shared.xml", (
+        "<muclient><triggers><trigger match='shared line' enabled='y' send_to='12'>"
+        "<send>Note('shared')</send></trigger></triggers></muclient>"
+    ))
+    _write(tmp_path / "worlds" / "plugins" / "plug.xml", _plugin(
+        B, "plug", f"function handler() Note('handler {version}') end",
+        "<include name='shared.xml'/>"
+        "<aliases><alias match='xtest' enabled='y' script='handler'/></aliases>",
+    ))
+
+
+def test_reload_plugin_runs_the_new_code_and_keeps_its_included_rules(tmp_path):
+    _reloadable(tmp_path, "v1")
+    _write(tmp_path / "worlds" / "world.xml", (
+        "<muclient><include name='plugins/plug.xml' plugin='y'/></muclient>"
+    ))
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
+    pack.load_file(str(tmp_path / "worlds" / "world.xml"))
+    engine.process_input("xtest")
+    _reloadable(tmp_path, "v2")  # the plugin is edited
+    assert pack._lua.eval(f"ReloadPlugin('{B}')") == 0
+    engine.process_input("xtest")
+    _line(pack, engine, "shared line")
+    assert _notes(sink) == ["handler v1", "handler v2", "shared"]
+
+
+def test_unload_then_load_plugin_installs_it_again(tmp_path):
+    # Mush-Z's plugin manager removes and adds plugins this way.
+    _reloadable(tmp_path, "v1")
+    _write(tmp_path / "worlds" / "world.xml", (
+        "<muclient><include name='plugins/plug.xml' plugin='y'/></muclient>"
+    ))
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
+    pack.load_file(str(tmp_path / "worlds" / "world.xml"))
+    assert pack._lua.eval(f"UnloadPlugin('{B}')") == 0
+    assert pack._lua.eval(f"IsPluginInstalled('{B}')") is False
+    engine.process_input("xtest")
+    assert pack._lua.eval("LoadPlugin('worlds/plugins/plug.xml')") == 0
+    assert pack._lua.eval(f"IsPluginInstalled('{B}')") is True
+    engine.process_input("xtest")
+    assert _notes(sink) == ["handler v1"]
+
+
+def test_a_plugin_loaded_while_playing_hears_its_install_hook(tmp_path):
+    _write(tmp_path / "worlds" / "plugins" / "late.xml", _plugin(
+        B, "late", "function OnPluginInstall() Note('late installed') end",
+    ))
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
+    pack.load_source(_plugin(A, "first"))
+    pack.dispatch_install()
+    pack._lua.execute("LoadPlugin('worlds/plugins/late.xml')")
+    assert _notes(sink) == ["late installed"]
+
+
+def test_a_disabled_plugins_alias_lets_the_command_through():
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_plugin(
+        A, "first", "",
+        "<aliases><alias match='hello' enabled='y' send_to='12'><send>Note('alias')</send>"
+        "</alias></aliases>",
+    ))
+    pack._lua.execute(f"EnablePlugin('{A}', false)")
+    assert engine.process_input("hello") == ["hello"]
+    pack._lua.execute(f"EnablePlugin('{A}', true)")
+    assert engine.process_input("hello") == []
+    assert _notes(sink) == ["alias"]
+
+
+def test_a_trigger_deleted_or_changed_earlier_in_the_line_no_longer_acts():
+    rules = (
+        "<triggers>"
+        "<trigger name='a' match='x' enabled='y' keep_evaluating='y' sequence='10' "
+        "send_to='12'><send>CHANGE</send></trigger>"
+        "<trigger name='b' match='x' enabled='y' sequence='20' send_to='12'>"
+        "<send>Note('B')</send></trigger>"
+        "<trigger name='c' match='x' enabled='y' sequence='30' send_to='12'>"
+        "<send>Note('C')</send></trigger>"
+        "</triggers>"
+    )
+    for change in (
+        "DeleteTrigger('b')",
+        "SetTriggerOption('b', 'match', 'zzz')",
+        "AddTriggerEx('b', 'zzz', '', 1+1024+8, -1, 0, '', '', 12, 20)",
+    ):
+        sink, engine = _engine()
+        pack = MushclientPack(ScriptApi(engine, source="m"))
+        pack.load_source(_plugin(A, "p", "", rules.replace("CHANGE", change)))
+        _line(pack, engine, "x")
+        assert _notes(sink) == ["C"], change
+
+
+def test_a_plugin_only_reaches_its_own_rules_and_timers_by_name():
+    # Two plugins both name a trigger "temp", as shared helper libraries do. Deleting or
+    # switching off your own must leave the other plugin's alone, as in MUSHclient.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_plugin(
+        A, "first", "AddTimer('tick', 0, 0, 5, '', 1, '')",
+        "<triggers><trigger name='temp' match='ping' group='g' enabled='y' "
+        "keep_evaluating='y' send_to='12'><send>Note('first')</send></trigger></triggers>",
+    ))
+    pack.load_source(_plugin(
+        B, "second",
+        "Note(tostring(IsTrigger('temp')))\n"
+        "Note(tostring(DeleteTrigger('temp')))\n"
+        "Note(tostring(EnableTriggerGroup('g', false)))\n"
+        "Note(tostring(DeleteTimer('tick')))\n",
+    ))
+    _line(pack, engine, "ping")
+    assert _notes(sink) == ["30005", "30005", "0", "30017", "first"]
+
+
+def test_functions_a_plugin_exposes_run_as_that_plugin():
+    # ppi.Load hands another plugin these functions; they work on their own plugin's rules.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_plugin(
+        A, "helper",
+        "local ppi = require 'ppi'\n"
+        "function quiet() return EnableTrigger('beep', false), GetPluginID() end\n"
+        "ppi.Expose('quiet')\n",
+        "<triggers><trigger name='beep' match='beep' enabled='y' send_to='12'>"
+        "<send>Note('beep')</send></trigger></triggers>",
+    ))
+    pack.load_source(_plugin(
+        B, "user",
+        "local ppi = require 'ppi'\n"
+        f"local helper = ppi.Load('{A}')\n"
+        "local code, who = helper.quiet()\n"
+        "Note(tostring(code) .. ' ' .. who .. ' ' .. GetPluginID())\n",
+    ))
+    _line(pack, engine, "beep")
+    assert _notes(sink) == [f"0 {A} {B}"]
+
+
+def test_broadcast_plugin_reaches_the_others_and_counts_them():
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    for plugin_id, name in ((A, "sender"), (B, "listener")):
+        pack.load_source(_plugin(
+            plugin_id, name,
+            f"function OnPluginBroadcast(msg, id, from, text) Note('{name} heard ' .. text) end",
+        ))
+    pack._current_plugin = A
+    try:
+        assert pack._lua.eval("BroadcastPlugin(1, 'hi')") == 1
+    finally:
+        pack._current_plugin = "world"
+    assert _notes(sink) == ["listener heard hi"]
+
+
+def test_mushclient_aliases_stop_only_their_own_plugin_and_swallow_the_command():
+    # Mush-Z's cast alias keeps evaluating and sends the cast itself; genericMud also sent
+    # what was typed, so every spell went out twice. One plugin's alias no longer stops
+    # another plugin's alias for the same command either.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_plugin(
+        A, "first", "",
+        "<aliases><alias match='^c (.+)$' regexp='y' enabled='y' keep_evaluating='y' "
+        "send_to='12'><send>Send('cast %1')</send></alias>"
+        "<alias match='^c (.+)$' regexp='y' enabled='y' sequence='200' send_to='12'>"
+        "<send>Note('same plugin, later')</send></alias></aliases>",
+    ))
+    pack.load_source(_plugin(
+        B, "second", "",
+        "<aliases><alias match='^c (.+)$' regexp='y' enabled='y' send_to='12'>"
+        "<send>Note('other plugin')</send></alias></aliases>",
+    ))
+    assert engine.process_input("c fireball") == []
+    assert sink.sent == ["cast fireball"]
+    assert sorted(_notes(sink)) == ["other plugin", "same plugin, later"]

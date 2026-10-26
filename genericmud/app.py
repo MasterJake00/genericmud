@@ -581,6 +581,7 @@ class EngineApp:
         self._mush_connected = connected
         for pack in self._mush_packs:
             if connected:
+                pack.resume_timers()  # a terminal drop cancelled them
                 pack.dispatch_connect()
             else:
                 pack.dispatch_disconnect()
