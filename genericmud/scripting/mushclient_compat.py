@@ -734,6 +734,8 @@ class MushclientPack:
                 "audio.bass": bass_bridge,
                 "audio/bass": bass_bridge,
                 "json": json_bridge,
+                "json.decode": json_bridge.decode,
+                "json.encode": json_bridge.encode,
                 "lfs": lfs_bridge,
                 "ltn12": ltn12_bridge,
                 "socket": socket_bridge,
@@ -1002,7 +1004,12 @@ class MushclientPack:
         return bass
 
     def _make_json_bridge(self):
-        """JSON codec for packs whose bundled implementation depends on native LPeg."""
+        """JSON codec for packs whose bundled implementation depends on native LPeg.
+
+        Shaped like LuaJSON, the library those packs ship: json.decode and json.encode are
+        modules that can be called as functions, with decode.decode and encode.encode inside.
+        Packs use both ways, and require "json.decode" and "json.encode" on their own.
+        """
 
         def from_lua(value: object):
             if not hasattr(value, "items"):
@@ -1016,12 +1023,25 @@ class MushclientPack:
                 return [from_lua(by_key[index]) for index in range(1, len(items) + 1)]
             return {str(key): from_lua(item) for key, item in items}
 
-        bridge = self._lua.table()
-        bridge.decode = lambda value="", *_a: self._to_lua_value(json.loads(str(value)))
-        bridge.encode = lambda value=None, *_a: json.dumps(
-            from_lua(value), ensure_ascii=False, separators=(",", ":")
+        def decode(value="", *_a):
+            return self._to_lua_value(json.loads(str(value)))
+
+        def encode(value=None, *_a):
+            return json.dumps(from_lua(value), ensure_ascii=False, separators=(",", ":"))
+
+        luajson_shape = self._lua.eval(
+            "function(decode, encode) "
+            "local function module(fields, run) "
+            "return setmetatable(fields, {__call = function(_self, ...) return run(...) end}) "
+            "end "
+            "local decoder = module({decode = decode}, decode) "
+            "decoder.getDecoder = function() return decode end "
+            "local encoder = module({encode = encode}, encode) "
+            "encoder.getEncoder = function() return encode end "
+            "return {decode = decoder, encode = encoder} "
+            "end"
         )
-        return bridge
+        return luajson_shape(decode, encode)
 
     def _make_socket_bridge(self):
         """Non-network LuaSocket subset used by packs for a sub-second clock."""

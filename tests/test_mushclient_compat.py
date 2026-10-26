@@ -694,6 +694,29 @@ def test_json_bridge_decodes_and_encodes_without_native_lpeg(tmp_path):
     assert sink.sent == ["5:b", "Miriani:true", "number"]
 
 
+def test_json_takes_luajsons_module_shapes_too(tmp_path):
+    # Toastush and Miriani-Next ship LuaJSON, where json.decode and json.encode are modules:
+    # Toastush reads its updater's broadcast with json.decode.decode, and both read their old
+    # index through require("json.decode"). Neither worked when they were plain functions.
+    sink = RecordingSink()
+    pack = MushclientPack(
+        ScriptApi(AutomationEngine(sink), source="m", base_dir=str(tmp_path))
+    )
+    pack.load_source(
+        "<muclient><script><![CDATA["
+        "require('json'); "
+        "Send(json.decode.decode('{\"update\":[[\"a.ogg\",{}]]}').update[1][1]); "
+        "local decoder = require('json.decode'); "
+        "Send(decoder.decode('[7]')[1] .. ':' .. decoder('[8]')[1]); "
+        "local encoder = require('json.encode'); "
+        "Send(encoder.encode({1, 2}) .. ':' .. json.encode.encode({3})); "
+        "local ok, value = pcall(json.decode.decode, '[9]'); "
+        "Send(tostring(ok) .. ':' .. value[1])"
+        "]]></script></muclient>"
+    )
+    assert sink.sent == ["a.ogg", "7:8", "[1,2]:[3]", "true:9"]
+
+
 def test_socket_http_downloads_binary_cue_and_confined_mkdir(tmp_path, monkeypatch):
     class Response:
         status = 200
