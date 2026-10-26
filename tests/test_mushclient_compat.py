@@ -1745,6 +1745,22 @@ def test_history_add_without_a_channel_history_plugin_files_the_line_instead_of_
     assert sink.sent == []
 
 
+def test_history_add_takes_any_channel_name_up_to_the_equals_sign():
+    # channel_history's alias is "history_add *=*", so a channel is everything before the
+    # first "=". Empire files "[/newbie-chat]: ..." under %1 and Chatpack under whatever
+    # ChatMUD calls the channel; a name with a hyphen or a dot went to the MUD instead.
+    sink, engine, pack = _rules("")
+    pack._lua.execute('Execute("history_add newbie-chat=Bob: hi")')
+    pack._lua.execute('Execute("history_add Private Communication=[You to Ann] hey")')
+    pack._lua.execute('Execute("history_add dev.chat=a=b")')
+    assert sink.sent == []
+    assert sink.filed == [
+        ("Bob: hi", "newbie-chat"),
+        ("[You to Ann] hey", "private communication"),
+        ("a=b", "dev.chat"),
+    ]
+
+
 def test_mushreader_commands_are_answered_even_when_the_pack_never_loads_mushreader():
     # Stellarmush and Mystavaria expect MushReader installed globally in MUSHclient, so they
     # never include it. genericMud only answered its commands when a pack included it, so

@@ -2033,9 +2033,10 @@ class MushclientPack:
             # Miriani-Next's own MushReader: its Do Not Disturb keeps incoming lines quiet.
             (r"^tts_disable_silent$", lambda _ctx: self._api.set_line_speech(False)),
             (r"^tts_enable_silent$", lambda _ctx: self._api.set_line_speech(True)),
-            # channel_history.xml: file a line under a channel for the review keys.
+            # channel_history.xml: file a line under a channel for the review keys. Its alias
+            # is "history_add *=*", so the channel is everything before the first "=".
             (
-                r"^history_add (\w[\w ]*)=(.*)$",
+                r"^history_add ([^=]*)=(.*)$",
                 lambda ctx: self._api.file_in_history(ctx.wildcards[1], ctx.wildcards[2]),
             ),
         )
