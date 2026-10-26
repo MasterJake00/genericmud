@@ -1066,3 +1066,28 @@ def test_ungagline_also_stops_the_lines_still_to_be_gagged():
     )
     lines = [engine.process_line(Line(t)) for t in ("Starmap 1", "row", "End of map", "after")]
     assert [line.gagged for line in lines] == [True, True, False, False]
+
+
+def test_reload_starts_the_pack_again_from_its_entry(tmp_path):
+    # The packs' "reload the soundpack" commands (Prometheus's spreload, Star Conquest's
+    # reload key, Miriani's SPReload) end in #Reload: VIPMud clears what the pack defined
+    # and set, then runs its start-up scripts again.
+    entry = tmp_path / "pack.set"
+    entry.write_text(
+        "#math loads {@loads + 1}\n#trigger {boom} {#say bang}\n"
+        "#alias spreload {#var leftover 1;#class extra enable;#reload}\n"
+        "#trigger {extra} {#say extra} extra\n",
+        encoding="latin-1",
+    )
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    pack = VipMudPack(ScriptApi(engine, source="vip", base_dir=str(tmp_path)))
+    pack.load_entry(entry)
+    engine.set_var("usersetting", "mine")  # not the pack's
+    engine.process_input("spreload")
+    engine.process_line(Line("boom"))
+    engine.process_line(Line("extra"))
+    assert _said(sink) == ["bang"]  # one trigger, and the class is off again
+    assert engine.get_var("loads") == "1"
+    assert engine.get_var("leftover", None) is None
+    assert engine.get_var("usersetting") == "mine"

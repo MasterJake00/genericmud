@@ -990,13 +990,22 @@ class VipMudPack:
         # Names this pack has set. VIPMud starts every session without them; the app keeps
         # them out of what it saves for the next session.
         self.written_variables: set[str] = set()
+        self._entry: Path | None = None  # the start-up script, for #Reload
         base = api.base_dir
         if base:
             self._discover_remote_sounds(Path(base))
-            self._link_folders(Path(base))
-        if base and not api.get_var("sppath"):
+        self._wire_paths()
+
+    def _wire_paths(self) -> None:
+        """Tell the pack where it lives. Server-controlled packs build sound paths from
+        @sppath and script paths from @scpath; linked packs read ScriptPath and SoundsPath."""
+        base = self._base_dir
+        if not base:
+            return
+        self._link_folders(Path(base))
+        if not self._api.get_var("sppath"):
             self._set_var("sppath", str(self._remote_sound_root or base))
-        if base and not api.get_var("scpath"):
+        if not self._api.get_var("scpath"):
             self._set_var("scpath", base)
 
     def _set_var(self, name: str, value: object) -> None:
@@ -1481,6 +1490,8 @@ class VipMudPack:
             self._send_file(args, scope)
         elif command == "CLIPBOARD" and args:
             self._clipboard = self._expand(args[0].text, scope)
+        elif command == "RELOAD":
+            self._reload()
         elif command == "DIRECTION" and len(args) > 1:
             way = self._expand(args[0].text, scope).strip().lower()
             back = self._expand(args[1].text, scope).strip()
@@ -1615,7 +1626,33 @@ class VipMudPack:
         that was understood recorded its sounds folder's main.set."""
         linked = linked_vipmud_scripts(self._base_dir) if self._base_dir else None
         real = (linked or Path(path)).resolve()
+        self._entry = real
         self._load_path(real, keep=False, source=real.read_text(encoding="latin-1"))
+
+    def _reload(self) -> None:
+        """``#Reload`` (manual 5.2.44): remove every trigger, alias, key and variable the
+        pack has, then run its start-up script again. Packs' "reload the soundpack" commands
+        end with it."""
+        if self._entry is None:
+            return
+        for key in list(self._triggers):
+            self._remove_trigger(key)
+        for alias_key in list(self._aliases):
+            self._remove_alias(alias_key)
+        for combo in list(self._keys):
+            self._remove_key(combo)
+        for handle in list(self._files):
+            self._close_file(handle)
+        for name in self.written_variables:
+            self._api.delete_var(name)
+        self.written_variables.clear()
+        self._alarms.clear()
+        self._enabled_classes.clear()
+        self._current_classes = ()
+        self._loaded.clear()
+        self._gagging_all, self._gag_left = False, 0
+        self._wire_paths()
+        self.load_entry(self._entry)
 
     def _load_file(self, reference: str, *, keep: bool = False) -> None:
         """``#LOAD {file} [NoRemove]``: run another ``.set`` from the pack, so a loader script
