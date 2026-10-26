@@ -138,7 +138,8 @@ def install_pack_require(
     builtins: dict | None = None,
     fallback: object = None,
     on_error: Callable[[str, Path, Exception], None] | None = None,
-) -> None:
+    scope: Callable[[], tuple[object, object, object]] | None = None,
+) -> Callable[[object], None]:
     """Install a ``require()`` scoped to the pack directory (+ optional builtins).
 
     A trusted pack may load its OWN bundled Lua libraries (``json``, ``ppi``, ...)
@@ -148,10 +149,16 @@ def install_pack_require(
     plugin our own ``ppi`` shim instead of its bundled ``ppi.lua`` (which needs
     ``package.seeall``, stripped by the sandbox). Note: require only makes a file
     *load* — a lib that then calls unimplemented MUSHclient APIs still fails in use.
+
+    ``scope`` answers who is requiring, as (key, globals table, package.loaded table), the
+    tables None for the shared ones. A module then runs once for each key, in that key's
+    globals, the way each MUSHclient plugin loads its own copy into its own Lua state; a
+    module built with ``module()`` registers in that key's loaded table. Returns a function
+    that forgets one key's modules, so they run again for it.
     """
     builtins = dict(builtins or {})
     if not base_dir and not builtins and fallback is None:
-        return
+        return lambda _key: None
     module_paths: list[tuple[str, Path]] = []
     if base_dir:
         root = Path(base_dir)
@@ -173,25 +180,32 @@ def install_pack_require(
         "function(key) local v = rawget(_G, key); if type(v) == 'table' then return v end end"
     )
     _legacy_module = lua.eval(
-        "function(key)"
-        " local current = _G;"
+        "function(key, root)"
+        " local current = root or _G;"
         " for segment in string.gmatch(key, '[^.]+') do"
         "  local child = rawget(current, segment);"
         "  if type(child) ~= 'table' then child = {}; rawset(current, segment, child) end;"
         "  current = child;"
         " end;"
-        " setmetatable(current, {__index = _G});"
-        " if package and package.loaded then package.loaded[key] = current end;"
+        " setmetatable(current, {__index = root or _G});"
+        " if root == nil and package and package.loaded then package.loaded[key] = current end;"
         " return current"
         " end"
     )
+    _setfenv = lua.eval("setfenv")
+    scoped: dict[object, dict[str, object]] = {}  # each scope's own copies of modules
 
     def _require(name: object = "", *_args: object) -> object:
         key = str(name)
         if key in builtins:
             return builtins[key]
-        if key in cache:
-            return cache[key]
+        scope_key, env, loaded = scope() if scope is not None else (None, None, None)
+        shared = env is None
+        # A plugin never gets the world's copy of a module, which would be bound to the
+        # world's globals: it has its own, cached separately.
+        store = cache if shared else scoped.setdefault(scope_key, {})
+        if key in store:
+            return store[key]
         requested = key.replace("\\", ".").replace("/", ".").removesuffix(".lua").casefold()
         candidates: list[tuple[int, str, Path]] = []
         for module_name, candidate in module_paths:
@@ -211,53 +225,69 @@ def install_pack_require(
         if path is None:
             stdlib = _loaded_module(key) or _global_module(key)  # require "string"/"table"/...
             if stdlib is not None:
-                cache[key] = stdlib
+                store[key] = stdlib
                 return stdlib
             if fallback is not None:
                 # A native/external module (socket.core, luacom, ...) we can't provide: hand back
                 # a black-hole so the plugin loads and its sound path runs, that feature no-op'd.
-                cache[key] = fallback
+                store[key] = fallback
                 return fallback
             raise FileNotFoundError(f"pack module {key!r} not found")
-        cache[key] = None  # sentinel: break a require cycle before executing
         try:
             code = path.read_text(encoding="latin-1", errors="ignore")
-            if code.startswith("#!"):
-                code = code.partition("\n")[2]
-            result = lua.eval("function(...)\n" + code + "\nend", name="@" + path.as_posix())(key)
+        except OSError as exc:
+            # Unreadable, as for a module that errors on load below: the plugin goes on.
+            if on_error is not None:
+                on_error(key, path, exc)
+            if fallback is not None:
+                store[key] = fallback
+                return fallback
+            raise
+        if code.startswith("#!"):
+            code = code.partition("\n")[2]
+        store[key] = None  # sentinel: break a require cycle before executing
+        try:
+            chunk = lua.eval("function(...)\n" + code + "\nend", name="@" + path.as_posix())
+            if not shared:
+                _setfenv(chunk, env)
+            result = chunk(key)
         except ScriptTimeout:
             # A runaway loop in a required module is a real failure of a hostile/broken pack, not
             # a missing optional module -- surface it (fail the pack load), don't black-hole it.
-            cache.pop(key, None)
+            store.pop(key, None)
             raise
         except Exception as exc:
             # A bundled module that errors on load (e.g. luasocket's pure-Lua layer without its
             # native core) must not kill the plugin that required it: black-hole it if we can.
             # (Catch Exception, not a specific lupa.LuaError -- the class differs per Lua backend;
             # the loop guard raises BaseException, which still propagates below.)
-            cache.pop(key, None)
+            store.pop(key, None)
             if on_error is not None:
                 on_error(key, path, exc)
             if fallback is not None:
-                cache[key] = fallback
+                store[key] = fallback
                 return fallback
             raise
         except BaseException:
-            cache.pop(key, None)  # a failed load must not stay cached as if it returned nil
+            store.pop(key, None)  # a failed load must not stay cached as if it returned nil
             raise
         if result is None:
             # A module(..., package.seeall)-style lib (Lua 5.1) registers itself in
             # package.loaded under its name and returns nothing; hand back that table.
-            result = _loaded_module(key)
+            if shared:
+                result = _loaded_module(key)
+            elif loaded is not None:
+                result = loaded[key]
+        if result is None and "." in key:
             # Some portable-MUSHclient packs split dotted modules across files that write
             # globals and return nothing, then read them through the dotted namespace. Keep
             # bare no-return modules nil, but provide that legacy namespace for qualified ones.
-            if result is None and "." in key:
-                result = _legacy_module(key)
-        cache[key] = result
+            result = _legacy_module(key, None if shared else env)
+        store[key] = result
         return result
 
     lua.globals().require = _require
+    return lambda scope_key: scoped.pop(scope_key, None)
 
 
 class LuaPackRuntime:

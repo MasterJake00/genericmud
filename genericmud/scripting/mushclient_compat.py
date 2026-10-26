@@ -569,6 +569,11 @@ class MushclientPack:
         self._loading_plugins: dict[str, int] = {}  # plugins whose files are loading now
         self._plugin_files: dict[str, set[Path]] = {}  # plain includes each plugin loaded
         self._lifecycle_started = False  # OnPluginInstall has gone round once
+        self._opening = False  # the session's first OnPluginInstall round is running
+        # Each plugin's own globals (see _env_for) and package.loaded (its modules built
+        # with module()). The world's are the Lua state's own.
+        self._plugin_envs: dict[str, object] = {}
+        self._plugin_loaded: dict[str, object] = {}
         self._headless_window = _HeadlessWindow()  # the window's calls when there's no window
         # MUSHclient targets Lua 5.1; trusted packs keep the full stdlib their
         # libraries assume (os/io/loadstring + the module(..., package.seeall) idiom).
@@ -615,11 +620,15 @@ class MushclientPack:
         # The function a rule or timer names. The first part of the name is read raw: every
         # unknown capitalised global reads as the do-nothing stand-in (set up below), and a
         # handler isn't one until the pack defines it.
+        # A plugin's own name is looked for in its own globals first, then the shared ones
+        # (host functions, the world's script, libraries built with module()).
         self._find_function = self._lua.eval(
-            "function(name)\n"
+            "function(name, env)\n"
             "  local target = nil\n"
             "  for part in string.gmatch(name, '[^%.]+') do\n"
-            "    if target == nil then target = rawget(_G, part)\n"
+            "    if target == nil then\n"
+            "      if env ~= nil then target = rawget(env, part) end\n"
+            "      if target == nil then target = rawget(_G, part) end\n"
             "    elseif type(target) == 'table' then target = target[part]\n"
             "    else return nil end\n"
             "    if target == nil then return nil end\n"
@@ -628,6 +637,30 @@ class MushclientPack:
             "  return nil\n"
             "end"
         )
+        self._new_env = None  # made at the end of setup, from genericMud's own globals
+        self._setfenv = self._lua.eval("setfenv")
+        self._rawget = self._lua.eval("rawget")
+        # A chunk loadstring, load or loadfile makes gets the Lua state's globals, so a
+        # plugin restoring a saved table with loadstring would write it where it can't see
+        # it. They get the plugin's own globals instead. (Only trusted packs have them.)
+        self._lua.eval(
+            "function(current_env)\n"
+            "  local function adopt(original)\n"
+            "    if original == nil then return nil end\n"
+            "    return function(...)\n"
+            "      local chunk, problem = original(...)\n"
+            "      if chunk ~= nil then\n"
+            "        local env = current_env()\n"
+            "        if env ~= nil then setfenv(chunk, env) end\n"
+            "      end\n"
+            "      return chunk, problem\n"
+            "    end\n"
+            "  end\n"
+            "  loadstring = adopt(rawget(_G, 'loadstring'))\n"
+            "  load = adopt(rawget(_G, 'load'))\n"
+            "  loadfile = adopt(rawget(_G, 'loadfile'))\n"
+            "end"
+        )(lambda: self._env_for(self._current_plugin))
         # Hand each plugin our own ppi (its bundled ppi.lua needs package.seeall, which the
         # sandbox strips). Then make any still-unimplemented host name a "black hole" that is
         # callable AND indexable (returns itself) -- so Window/InfoBox/etc. we don't implement
@@ -652,7 +685,7 @@ class MushclientPack:
         self._lua.globals().ltn12 = ltn12_bridge
         self._lua.globals().socket = socket_bridge
         self._lua.globals().sqlite3 = sqlite_bridge
-        install_pack_require(
+        self._forget_scope = install_pack_require(
             self._lua,
             self._base_dir,
             builtins={
@@ -672,9 +705,61 @@ class MushclientPack:
                 "sqlite3": sqlite_bridge,
             },
             fallback=black_hole,
-            on_error=lambda name, path, exc: self._module_errors.append(
-                (f"require({name}) [{path.name}]", f"{type(exc).__name__}: {exc}")
+            on_error=self._module_failed,
+            # A module that defines plain globals runs once in each plugin that requires
+            # it, as each plugin has its own Lua state in MUSHclient.
+            scope=lambda: (
+                self._current_plugin,
+                self._env_for(self._current_plugin),
+                self._loaded_for(self._current_plugin),
             ),
+        )
+        # Lua 5.1's module() and package.seeall put a module in the Lua state's globals and
+        # package.loaded; MUSHclient plugins each have their own, so these put it in the
+        # requiring plugin's (Mush-Z's serialize.save finds the plugin's tables through _G).
+        self._lua.eval(
+            "function(current_env, current_loaded)\n"
+            "  if rawget(_G, 'module') == nil or rawget(_G, 'package') == nil then return end\n"
+            "  local shared_loaded = package.loaded\n"
+            "  module = function(modname, ...)\n"
+            "    local env = current_env()\n"
+            "    local loaded = shared_loaded\n"
+            "    if env ~= nil then loaded = current_loaded() end\n"
+            "    local M = loaded[modname]\n"
+            "    if type(M) ~= 'table' then\n"
+            "      M = env or _G\n"
+            "      for part in string.gmatch(modname, '[^%.]+') do\n"
+            "        local child = rawget(M, part)\n"
+            "        if child == nil then\n"
+            "          child = {}\n"
+            "          rawset(M, part, child)\n"
+            "        elseif type(child) ~= 'table' then\n"
+            "          error(\"name conflict for module '\" .. modname .. \"'\", 2)\n"
+            "        end\n"
+            "        M = child\n"
+            "      end\n"
+            "      loaded[modname] = M\n"
+            "    end\n"
+            "    if rawget(M, '_NAME') == nil then\n"
+            "      M._M = M\n"
+            "      M._NAME = modname\n"
+            "      M._PACKAGE = string.match(modname, '^(.*%.)[^%.]+$') or ''\n"
+            "    end\n"
+            "    setfenv(2, M)\n"
+            "    for index = 1, select('#', ...) do (select(index, ...))(M) end\n"
+            "  end\n"
+            "  package.seeall = function(M)\n"
+            "    local meta = getmetatable(M)\n"
+            "    if meta == nil then\n"
+            "      meta = {}\n"
+            "      setmetatable(M, meta)\n"
+            "    end\n"
+            "    meta.__index = current_env() or _G\n"
+            "  end\n"
+            "end"
+        )(
+            lambda: self._env_for(self._current_plugin),
+            lambda: self._loaded_for(self._current_plugin),
         )
         # Only API-shaped names fall into the black hole: MUSHclient functions are CapWords
         # (Sound, WindowCreate, BroadcastPlugin...) plus a few lowercase host libraries
@@ -695,6 +780,32 @@ class MushclientPack:
             "  end})\n"
             "end"
         )(black_hole)
+        # A plugin's globals: its own table, starting with genericMud's own globals (the host
+        # functions and Lua's libraries, as they stand now, before any pack code runs) and
+        # reading through to the shared ones for the rest (the world's script, unknown host
+        # names). _G names the plugin's table, as in a MUSHclient plugin's own Lua state, so
+        # rawget(_G, "unpack") (Penlight), pairs(_G) and strict.lua see what they expect.
+        self._new_env = self._lua.eval(
+            "function()\n"
+            "  local host = {}\n"
+            "  for name, value in pairs(_G) do host[name] = value end\n"
+            "  return function()\n"
+            "    local env = {}\n"
+            "    for name, value in pairs(host) do env[name] = value end\n"
+            "    env._G = env\n"
+            "    return setmetatable(env, {__index = _G})\n"
+            "  end\n"
+            "end"
+        )()
+        # Its own package.loaded behind package (module() registers there), the rest of
+        # package shared. Trusted packs only; the others have no package.
+        self._package_for = self._lua.eval(
+            "function(loaded)\n"
+            "  local shared = rawget(_G, 'package')\n"
+            "  if shared == nil then return nil end\n"
+            "  return setmetatable({loaded = loaded}, {__index = shared})\n"
+            "end"
+        )
 
     def _install_io_compat(self) -> None:
         """Match MUSHclient's pack-relative file paths and legacy read modes."""
@@ -1019,7 +1130,7 @@ class MushclientPack:
     def _ppi_expose(self, name: object = "", fn: object = None) -> None:
         key = str(name)
         functions = self._exposed.setdefault(self._current_plugin, {})
-        functions[key] = fn if fn is not None else self._lua.globals()[key]
+        functions[key] = fn if fn is not None else self._lua_function(key)
 
     def _ppi_load(self, plugin_id: object = None):
         key = str(plugin_id or "")
@@ -1044,13 +1155,16 @@ class MushclientPack:
         if not functions:
             return None
         # Each runs as the plugin that exposed it, as MUSHclient's ppi (CallPlugin
-        # underneath) runs it, so its EnableTrigger and GetPluginID are that plugin's.
-        return self._lua.table_from({
-            name: self._as_plugin(key, function) for name, function in functions.items()
-        })
+        # underneath) runs it, so its EnableTrigger and GetPluginID are that plugin's. And,
+        # as through CallPlugin, the function is found when it's called, so a reloaded
+        # plugin's new code answers.
+        return self._lua.table_from({name: self._as_plugin(key, name) for name in functions})
 
-    def _as_plugin(self, plugin_id: str, function):
+    def _as_plugin(self, plugin_id: str, name: str):
         def call(*args: object):
+            function = self._exposed.get(plugin_id, {}).get(name)
+            if function is None:
+                return None  # the plugin was unloaded, or no longer exposes it
             previous = self._current_plugin
             info = self._plugin_info.get(plugin_id, {})
             previous_caller = info.get("calling", "")
@@ -1202,15 +1316,15 @@ class MushclientPack:
         return _SCRIPT_ERROR_OK
 
     def _install_late(self, path: Path) -> None:
-        """A plugin loaded while playing hears OnPluginInstall then, and OnPluginConnect if
-        the world is connected, as MUSHclient installs one it loads at any time."""
+        """A plugin loaded while playing hears OnPluginInstall then, as MUSHclient installs
+        one it loads at any time. It doesn't hear OnPluginConnect: MUSHclient calls that only
+        when the world connects, and plugins that need it call it themselves when
+        IsConnected() (Erion's MSDP handler does)."""
         if not self._lifecycle_started:
             return  # the session's own install round will reach it
         plugin_id, _name, _language = self._plugin_metadata(path)
         if plugin_id in self._plugin_info:
             self._call_hook(plugin_id, "OnPluginInstall")
-            if self._connected_at is not None:
-                self._call_hook(plugin_id, "OnPluginConnect")
 
     # --- plugins: their variables, routines, state and lifecycle ---
 
@@ -1252,7 +1366,7 @@ class MushclientPack:
         return (
             self._exposed.get(plugin_id, {}).get(routine)
             or self._hooks.get(plugin_id, {}).get(routine)
-            or self._lua_function(routine)
+            or self._lua_function(routine, plugin_id)
         )
 
     def _plugin_supports(self, plugin_id: object = "", routine: object = "", *_args: object) -> int:
@@ -1307,12 +1421,32 @@ class MushclientPack:
                 state["generation"] += 1
         self._hooks.pop(plugin_id, None)
         self._exposed.pop(plugin_id, None)
+        # Loaded again, it starts with fresh globals and runs its modules again, as a new
+        # Lua state does in MUSHclient.
+        self._plugin_envs.pop(plugin_id, None)
+        self._plugin_loaded.pop(plugin_id, None)
+        self._forget_modules(plugin_id)
         # Its files load afresh next time: the plugin file and the plain includes it pulled in.
         for path in self._plugin_files.pop(plugin_id, set()):
             self._loaded_includes.discard(path)
         info_path = self._plugin_info.get(plugin_id, {}).get("path")
         if isinstance(info_path, Path):
             self._loaded_includes.discard(info_path)
+
+    def _is_connected(self) -> bool:
+        """IsConnected and GetInfo(106): connected, except while the session's plugins are
+        first installed (see dispatch_install)."""
+        return not self._opening and self._api.is_connected()
+
+    def _module_failed(self, name: str, path: Path, error: Exception) -> None:
+        """A bundled module that failed to load, noted once however many plugins need it."""
+        item = (f"require({name}) [{path.name}]", f"{type(error).__name__}: {error}")
+        if item not in self._module_errors:
+            self._module_errors.append(item)
+
+    def _forget_modules(self, plugin_id: str) -> None:
+        if self._forget_scope is not None:
+            self._forget_scope(plugin_id)
 
     def _reload_plugin(self, plugin_id: object = "", *_args: object) -> int:
         """MUSHclient ``ReloadPlugin``: load a plugin's file again from scratch and install
@@ -1334,9 +1468,8 @@ class MushclientPack:
         except Exception as exc:  # noqa: BLE001 - the plugin stays unloaded, the pack goes on
             self._include_errors.append((path.name, f"{type(exc).__name__}: {exc}"))
             return ERROR_CODES["eProblemsLoadingPlugin"]
+        # As MUSHclient loads any plugin: OnPluginInstall, and no OnPluginConnect.
         self._call_hook(found, "OnPluginInstall")
-        if self._connected_at is not None:
-            self._call_hook(found, "OnPluginConnect")
         return E_OK
 
     def _unload_plugin(self, plugin_id: object = "", *_args: object) -> int:
@@ -1658,7 +1791,7 @@ class MushclientPack:
             "DeleteVariable": delete_variable,
             # Real transport state: Erion's OnPluginTick branches on it to run its
             # music engine vs. stop everything (the black hole answered truthy-table).
-            "IsConnected": lambda *_a: api.is_connected(),
+            "IsConnected": lambda *_a: self._is_connected(),
             "Version": lambda *_a: _MUSHCLIENT_VERSION,
             "GetUniqueID": lambda *_a: uuid4().hex[:24],
             "GetUniqueNumber": self._get_unique_number,
@@ -2879,7 +3012,7 @@ class MushclientPack:
 
     def _get_info_value(self, number: int):
         """GetInfo's yes/no (100s), counter (200s) and date (300s) codes."""
-        connected = self._api.is_connected()
+        connected = self._is_connected()
         flags = {
             106: not connected,  # not connected
             107: False,  # connecting
@@ -2942,12 +3075,16 @@ class MushclientPack:
             self._api.remove_key(combo)
             return _SCRIPT_ERROR_OK
         if target == int(_SEND_TO_SCRIPT):
-            callback = self._compile(command)
+            # Compiled when pressed, as MUSHclient finds the plugin by its id then, so after
+            # a ReloadPlugin the key runs the plugin's new code in its new globals.
             plugin = self._current_plugin
-            self._api.add_key(
-                combo,
-                lambda _ctx, fn=callback: self._in_plugin(plugin, self._guard.run, fn),
-            )
+            script = int(_SEND_TO_SCRIPT)
+
+            def press(_ctx: MatchContext) -> None:
+                if not self._plugin_gone(plugin):  # MUSHclient finds no plugin, does nothing
+                    self._in_plugin(plugin, self._deliver, script, command)
+
+            self._api.add_key(combo, press)
         else:
             self._api.add_key(combo, lambda _ctx, cmd=command: self._api.execute(cmd))
         return _SCRIPT_ERROR_OK
@@ -3206,7 +3343,9 @@ class MushclientPack:
             return
         if rule.kind == TRIGGER:
             # Scripts reprint lines in their colours from this (Mush-Z's channel triggers).
-            self._lua.globals().TriggerStyleRuns = self._style_table(ctx.line)
+            env = self._env_for(rule.plugin)
+            target = self._lua.globals() if env is None else env
+            target.TriggerStyleRuns = self._style_table(ctx.line)
         if rule.compiled_text != text:
             # Compiled inside the guard, so a syntax error is reported, not raised into
             # whatever line happened to fire it. Kept while the text stays the same.
@@ -3247,8 +3386,9 @@ class MushclientPack:
             runs[index] = self._lua.table_from(run)
         return runs
 
-    def _lua_function(self, name: str):
-        """The Lua function a rule or timer names, or None while there isn't one.
+    def _lua_function(self, name: str, plugin: str | None = None):
+        """The Lua function a rule or timer names, or None while there isn't one: the
+        plugin's own (``plugin``, else the one running now), else a shared one.
 
         Dotted names reach into tables (wait.lua's "wait.timer_resume"). The first part is
         read raw, so a capitalised name that isn't defined doesn't come back as the
@@ -3256,10 +3396,36 @@ class MushclientPack:
         """
         if not name:
             return None
+        env = self._env_for(self._current_plugin if plugin is None else plugin)
         try:
-            return self._find_function(name)
+            return self._find_function(name, env)
         except Exception:  # noqa: BLE001 - a table that errors when read has no function
             return None
+
+    def _loaded_for(self, plugin_id: str):
+        """A plugin's own package.loaded, for its modules built with module(); None for the
+        world's, which is Lua's."""
+        if not plugin_id or plugin_id == "world":
+            return None
+        loaded = self._plugin_loaded.get(plugin_id)
+        if loaded is None:
+            loaded = self._plugin_loaded[plugin_id] = self._lua.table()
+        return loaded
+
+    def _env_for(self, plugin_id: str):
+        """The table a plugin's globals live in, or None for the world's, which are the Lua
+        state's own. MUSHclient gives every plugin a Lua state of its own; here they share
+        one, and each plugin gets a table of its own that reads through to the shared
+        globals for host functions and anything else it doesn't define."""
+        if not plugin_id or plugin_id == "world":
+            return None
+        env = self._plugin_envs.get(plugin_id)
+        if env is None:
+            env = self._plugin_envs[plugin_id] = self._new_env()
+            package = self._package_for(self._loaded_for(plugin_id))
+            if package is not None:
+                env.package = package
+        return env
 
     def _find_rule(self, kind: str, name: object) -> PackRule | None:
         """The rule a plugin names: its own, as in MUSHclient. Two plugins may well both have
@@ -3648,10 +3814,21 @@ class MushclientPack:
             return E_TIME_INVALID
         content = str(text or "")
         plugin = self._current_plugin
-        # Compiled when it fires, inside the guard (see _deliver), so a syntax error in the
-        # deferred text is reported then instead of raising into the script that queued it.
-        self._api.add_timer(delay, lambda: self._in_plugin(plugin, self._deliver, send_to, content))
+
+        def fire() -> None:
+            if self._plugin_gone(plugin):
+                return  # its plugin was unloaded, which in MUSHclient takes its timers too
+            # Compiled when it fires, inside the guard (see _deliver), so a syntax error in
+            # the deferred text is reported then instead of raising into the script that
+            # queued it.
+            self._in_plugin(plugin, self._deliver, send_to, content)
+
+        self._api.add_timer(delay, fire)
         return E_OK
+
+    def _plugin_gone(self, plugin: str) -> bool:
+        """Whether the plugin that set something up has since been unloaded."""
+        return plugin != "world" and plugin not in self._plugin_info
 
     def _in_plugin(self, plugin: str, action, *args: object) -> None:
         """Run ``action`` as the plugin that set it up, the way MUSHclient runs a plugin's
@@ -3664,8 +3841,13 @@ class MushclientPack:
             self._current_plugin = previous
 
     def _compile(self, code: str):
-        """Host-side compile of a Lua chunk into a zero-arg callable."""
-        return self._lua.eval(f"function()\n{code}\nend")
+        """Host-side compile of a Lua chunk into a zero-arg callable that runs in the
+        current plugin's globals."""
+        chunk = self._lua.eval(f"function()\n{code}\nend")
+        env = self._env_for(self._current_plugin)
+        if env is not None:
+            self._setfenv(chunk, env)
+        return chunk
 
     # --- loading ---
 
@@ -3712,8 +3894,13 @@ class MushclientPack:
             self._current_document = previous
 
     def _execute_lua(self, source: str) -> object:
+        """Run a script file or block in the current plugin's globals."""
         name = "@" + self._current_document.as_posix() if self._current_document else "mushclient"
-        return self._lua.execute(source, name=name)
+        chunk = self._lua.compile(source, name=name)
+        env = self._env_for(self._current_plugin)
+        if env is not None:
+            self._setfenv(chunk, env)
+        return chunk()
 
     def _index_pack_files(self) -> dict[str, list[Path]]:
         if self._file_index is not None:
@@ -3877,8 +4064,12 @@ class MushclientPack:
             self._skipped_plugins.append(item)
 
     def _record_optional_plugins(self) -> None:
-        rawget = self._lua.eval("rawget")
-        table = rawget(self._lua.globals(), "optional_plugins")
+        # Miriani-Next's requirements.xml plugin sets this in its own globals.
+        table = None
+        for env in (*self._plugin_envs.values(), self._lua.globals()):
+            table = self._rawget(env, "optional_plugins")
+            if table is not None:
+                break
         if table is None:
             return
         try:
@@ -4033,11 +4224,15 @@ class MushclientPack:
         if target is None:
             self._skip_plugin(filename, "not bundled with the pack")
             return
-        if target in self._loaded_includes:  # dedup by file (dirs share names)
+        # Once per file, but a plain include once per plugin: each plugin that includes
+        # constants.lua or a shared helper gets its definitions in its own globals.
+        plain = self._plain_include_depth > 0
+        key = (self._current_plugin, target) if plain else target
+        if key in self._loaded_includes:
             return
-        self._loaded_includes.add(target)
-        if self._plain_include_depth > 0:  # part of the plugin including it
-            self._plugin_files.setdefault(self._current_plugin, set()).add(target)
+        self._loaded_includes.add(key)
+        if plain:  # part of the plugin including it
+            self._plugin_files.setdefault(self._current_plugin, set()).add(key)
         reason = self._plugin_skip_reason(target)
         if reason:
             self._mark_virtual_plugin(target)
@@ -4051,18 +4246,19 @@ class MushclientPack:
         """Claim the ``OnPlugin*`` functions the current plugin's script defined.
 
         Must use ``rawget``: the black-hole ``_G`` metatable reports every name as
-        defined. Captured globals are cleared so the next plugin in the shared
-        runtime neither inherits nor overwrites them (MUSHclient gives each plugin
-        its own script space; this is the shared-``_G`` equivalent).
+        defined. A plugin's hooks stay in its own globals, so it can call them itself
+        (packs run OnPluginInstall again from a reset alias). The world's are taken out of
+        the shared globals, where every plugin would otherwise read them as its own.
         """
-        rawget = self._lua.eval("rawget")
-        globals_ = self._lua.globals()
+        env = self._env_for(self._current_plugin)
+        globals_ = self._lua.globals() if env is None else env
         captured = self._hooks.setdefault(self._current_plugin, {})
         for name in _LIFECYCLE_HOOKS:
-            fn = rawget(globals_, name)
+            fn = self._rawget(globals_, name)
             if fn is not None:
                 captured[name] = fn
-                globals_[name] = None
+                if env is None:
+                    globals_[name] = None
 
     def dispatch(self, name: str, *args: object, caller: object | None = None) -> None:
         """Call one lifecycle hook on every plugin that defines it, in load order.
@@ -4105,7 +4301,14 @@ class MushclientPack:
         variable defaults there (Erion turns every sound toggle on), so skipping it
         leaves the pack loaded but gated silent."""
         self._lifecycle_started = True  # from now on a plugin loaded is installed at once
-        self.dispatch("OnPluginInstall")
+        # MUSHclient installs a world's plugins when it opens, before it connects; genericMud
+        # installs them as the connection opens, and then calls OnPluginConnect. Plugins that
+        # run their own OnPluginConnect when IsConnected() would hear it twice.
+        self._opening = True
+        try:
+            self.dispatch("OnPluginInstall")
+        finally:
+            self._opening = False
 
     def dispatch_connect(self) -> None:
         self._connected_at = time.time()

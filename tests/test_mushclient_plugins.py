@@ -117,11 +117,27 @@ def test_a_plugin_loaded_while_playing_hears_its_install_hook(tmp_path):
     assert _notes(sink) == ["late installed"]
 
 
-def test_a_plugin_loaded_while_connected_hears_install_then_connect(tmp_path):
+C = "c" * 24
+
+# Erion's MSDP handler: MUSHclient calls OnPluginConnect only when the world connects, so a
+# plugin that needs it when installed into a connected world calls it itself.
+_RUNS_OWN_CONNECT = (
+    "function OnPluginInstall()\n"
+    "  Note('{name} installed')\n"
+    "  if IsConnected() then OnPluginConnect() end\n"
+    "end\n"
+    "function OnPluginConnect() Note('{name} connected') end"
+)
+
+
+def test_a_plugin_loaded_while_connected_hears_only_its_install(tmp_path):
     _write(tmp_path / "worlds" / "plugins" / "late.xml", _plugin(
-        B, "late",
-        "function OnPluginInstall() Note('late installed') end\n"
-        "function OnPluginConnect() Note('late connected') end",
+        B, "late", _RUNS_OWN_CONNECT.replace("{name}", "late"),
+    ))
+    _write(tmp_path / "worlds" / "plugins" / "quiet.xml", _plugin(
+        C, "quiet",
+        "function OnPluginInstall() Note('quiet installed') end\n"
+        "function OnPluginConnect() Note('quiet connected') end",
     ))
     sink, engine = _engine()
     pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
@@ -129,7 +145,52 @@ def test_a_plugin_loaded_while_connected_hears_install_then_connect(tmp_path):
     pack.dispatch_install()
     pack.dispatch_connect()
     pack._lua.execute("LoadPlugin('worlds/plugins/late.xml')")
+    pack._lua.execute("LoadPlugin('worlds/plugins/quiet.xml')")
+    assert _notes(sink) == ["late installed", "late connected", "quiet installed"]
+
+
+def test_a_reloaded_plugin_hears_only_its_install(tmp_path):
+    # ReloadPlugin loads the plugin as MUSHclient loads any: OnPluginInstall, no connect.
+    _write(tmp_path / "worlds" / "plugins" / "late.xml", _plugin(
+        B, "late", _RUNS_OWN_CONNECT.replace("{name}", "late"),
+    ))
+    _write(tmp_path / "worlds" / "world.xml", (
+        "<muclient><include name='plugins/late.xml' plugin='y'/></muclient>"
+    ))
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
+    pack.load_file(str(tmp_path / "worlds" / "world.xml"))
+    pack.dispatch_install()
+    pack.dispatch_connect()
+    sink.echoed.clear()
+    assert pack._lua.eval(f"ReloadPlugin('{B}')") == 0
     assert _notes(sink) == ["late installed", "late connected"]
+
+
+def test_a_script_hotkey_of_an_unloaded_plugin_does_nothing():
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_plugin(
+        A, "first", "function bump() Note('bump') end\n"
+        "AcceleratorTo('f5', 'bump()', sendto.script)",
+    ))
+    assert pack._lua.eval(f"UnloadPlugin('{A}')") == 0
+    engine.press_key("f5")
+    assert _notes(sink) == []
+    assert not sink.spoken
+
+
+def test_plugins_installed_as_the_session_opens_hear_connect_once():
+    # MUSHclient installs a world's plugins when it opens, before it connects. genericMud
+    # installs them as the connection opens, so IsConnected() answers false until then.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_plugin(A, "msdp", _RUNS_OWN_CONNECT.replace("{name}", "msdp")
+                             + "\nfunction OnPluginEnable() Note(tostring(GetInfo(106))) end"))
+    pack.dispatch_install()
+    pack.dispatch_connect()
+    pack._in_plugin(A, pack._execute_lua, "OnPluginEnable()")
+    assert _notes(sink) == ["msdp installed", "msdp connected", "false"]
 
 
 def test_a_plain_include_that_fails_leaves_its_plugin_working(tmp_path):
@@ -305,7 +366,7 @@ def test_get_plugin_info_answers_every_type_mushclient_does():
         "</trigger></triggers><aliases><alias match='y' enabled='y'/></aliases>",
     ))
     pack.load_source(_plugin(B, "other"))
-    pack._in_plugin(A, pack._lua.execute, "report(1, 2, 3, 5, 7, 8, 9, 10, 11, 15, 16, 17, "
+    pack._in_plugin(A, pack._execute_lua, "report(1, 2, 3, 5, 7, 8, 9, 10, 11, 15, 16, 17, "
                     "18, 19, 21, 23, 25)")
     written = int(datetime.datetime(2012, 4, 27, 18, 46, 16).timestamp())
     modified = int(datetime.datetime(2014, 1, 20).timestamp())
