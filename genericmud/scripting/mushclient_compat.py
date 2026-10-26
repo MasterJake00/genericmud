@@ -105,6 +105,10 @@ _SEND_TO_EXECUTE_CODE = 10
 _SEND_TO_SPEEDWALK_CODE = 11
 _SEND_TO_SCRIPT_CODES = frozenset({12, 14})  # script, and script after omitting the line
 _SEND_TO_LAST_CODE = 14
+_APPEND_TO_NOTEPAD = 5
+_SEND_TO_NOTEPAD_CODES = frozenset({4, _APPEND_TO_NOTEPAD, 7})  # new, append, replace
+_NOTEPAD_LIMIT = 1_000_000  # characters a notepad keeps; the oldest go first
+_BROWSER_SCHEMES = ("http://", "https://", "mailto:")  # all OpenBrowser will open
 # Lua's sendto table: every destination by MUSHclient's name for it.
 _SEND_TO_NAMES = {
     "world": 0, "command": 1, "output": 2, "status": 3, "notepad": 4, "notepadappend": 5,
@@ -513,6 +517,8 @@ class MushclientPack:
         self._opened_at = time.time()  # GetInfo(306): when this world was opened
         self._connected_at: float | None = None  # GetInfo(301) and GetConnectDuration
         self._saving_state = False  # SaveState can't run inside OnPluginSaveState
+        self._notepads: dict[str, str] = {}  # MUSHclient notepads by title
+        self._headless_window = _HeadlessWindow()  # the window's calls when there's no window
         # MUSHclient targets Lua 5.1; trusted packs keep the full stdlib their
         # libraries assume (os/io/loadstring + the module(..., package.seeall) idiom).
         self._script_error_spoken = False  # speak the first fire-time script fault, trace the rest
@@ -1347,6 +1353,20 @@ class MushclientPack:
             "end"
         )
 
+        # AppendToNotepad and its kin join everything after the title the same way
+        # (Mush-Z passes the line ending as a separate argument).
+        titled = self._lua.eval(
+            "function(fn)\n"
+            "  return function(title, ...)\n"
+            "    local parts = {}\n"
+            "    for index = 1, select('#', ...) do\n"
+            "      parts[index] = tostring((select(index, ...)))\n"
+            "    end\n"
+            "    return fn(title, table.concat(parts))\n"
+            "  end\n"
+            "end"
+        )
+
         funcs = {
             "Send": joined(self._send_text, ""),
             "SendNoEcho": joined(self._send_text, ""),
@@ -1425,6 +1445,38 @@ class MushclientPack:
             "GetLineInfo": self._get_line_info,
             "GetStyleInfo": self._get_style_info,
             "AnsiNote": lambda text="", *_a: self._note(strip_ansi(str(text or ""))),
+            "SetClipboard": lambda text="", *_a: self._window().set_clipboard(
+                _dialog_text(text)
+            ),
+            "GetClipboard": lambda *_a: self._window().get_clipboard(),
+            "GetCommand": lambda *_a: self._window().get_command(),
+            "SetCommand": self._set_command,
+            "PasteCommand": lambda text="", *_a: self._window().paste_command(
+                _dialog_text(text)
+            ),
+            "SetCommandSelection": self._set_command_selection,
+            "OpenBrowser": self._open_browser,
+            "AppendToNotepad": titled(
+                lambda title, text: self._notepad_write(title, text, replace=False)
+            ),
+            "ReplaceNotepad": titled(
+                lambda title, text: self._notepad_write(title, text, replace=True)
+            ),
+            "SendToNotepad": titled(
+                lambda title, text: self._notepad_write(title, text, replace=True)
+            ),
+            "ActivateNotepad": self._activate_notepad,
+            "CloseNotepad": self._close_notepad,
+            "GetNotepadList": lambda *_a: self._lua_list(list(self._notepads)),
+            "GetNotepadText": lambda title="", *_a: self._notepads.get(_dialog_text(title), ""),
+            "GetNotepadLength": lambda title="", *_a: len(
+                self._notepads.get(_dialog_text(title), "")
+            ),
+            "NotepadReadOnly": self._notepad_exists,
+            "NotepadSaveMethod": self._notepad_exists,
+            "NotepadColour": self._notepad_exists,
+            "NotepadFont": self._notepad_exists,
+            "MoveNotepadWindow": self._notepad_exists,
             "Hash": self._byte_args(lambda data, *_a: sha0_hex(_table_bytes(data))),
             "Base64Encode": self._byte_args(
                 lambda data, lines=False, *_a: _base64_encode(_table_bytes(data), lines)
@@ -1816,6 +1868,19 @@ class MushclientPack:
             _dialog_text(first), _dialog_text(second)
         )
         utils.getfontfamilies = lambda *_a: self._lua.table()
+        utils.appendtonotepad = lambda title="", text="", replace=False, *_a: (
+            self._notepad_write(title, _dialog_text(text), replace=_lua_true(replace))
+        )
+        utils.activatenotepad = self._activate_notepad
+
+        def shellexecute(target: object = "", *_args: object):
+            # MUSHclient runs anything here; genericMud only opens web and mail links.
+            address = _dialog_text(target).strip()
+            if address.lower().startswith(_BROWSER_SCHEMES) and self._window().open_url(address):
+                return True
+            return None, "genericMud doesn't run programs or open files for soundpacks"
+
+        utils.shellexecute = shellexecute
         self._install_dialogs(utils)
         self._lua.globals().utils = utils
 
@@ -1943,8 +2008,11 @@ class MushclientPack:
         texts = [str(args[i]) for i in range(2, len(args), 3)]
         self._tell("".join(texts))
 
-    def _deliver(self, send_to: int, text: str, *, variable: str = "") -> None:
-        """Do with ``text`` what MUSHclient's send_to code says (see _SEND_TO_*)."""
+    def _deliver(
+        self, send_to: int, text: str, *, variable: str = "", notepad: str = ""
+    ) -> None:
+        """Do with ``text`` what MUSHclient's send_to code says (see _SEND_TO_*). The
+        notepad codes write to the notepad ``notepad`` names, as MUSHclient titles it."""
         if send_to in _SEND_TO_SCRIPT_CODES:
             # Compiled here, inside the guard, so a syntax error is reported, not raised
             # into whatever line or timer happened to fire it.
@@ -1965,6 +2033,64 @@ class MushclientPack:
             steps = expand_speedwalk(text.replace(" ", ""))
             for command in steps or _command_lines(text):
                 self._api.send(command)
+        elif send_to in _SEND_TO_NOTEPAD_CODES and notepad:
+            self._notepad_write(notepad, text + "\r\n", replace=send_to != _APPEND_TO_NOTEPAD)
+
+    # --- the window: clipboard, command box, browser and notepads ---
+
+    def _window(self):
+        """The session's window, or the stand-in kept here when there isn't one."""
+        return self._api.pack_window() or self._headless_window
+
+    def _set_command(self, text: object = "", *_args: object) -> int:
+        """MUSHclient ``SetCommand``: fills the command box only when it's empty."""
+        if self._window().set_command(_dialog_text(text)):
+            return E_OK
+        return ERROR_CODES["eCommandNotEmpty"]
+
+    def _set_command_selection(self, first: object = 1, last: object = -1, *_args) -> int:
+        number = _to_float(last)
+        self._window().select_command(
+            int(_to_float(first) or 1), int(number) if number is not None else -1
+        )
+        return E_OK
+
+    def _open_browser(self, url: object = "", *_args: object) -> int:
+        """MUSHclient ``OpenBrowser``: web and mail links only, as MUSHclient allows, so a
+        pack can't start a program or open a file this way."""
+        address = _dialog_text(url).strip()
+        if not address.lower().startswith(_BROWSER_SCHEMES):
+            return ERROR_CODES["eBadParameter"]
+        if self._window().open_url(address):
+            return E_OK
+        return ERROR_CODES["eCouldNotOpenFile"]
+
+    def _notepad_write(self, title: object, text: str, *, replace: bool) -> bool:
+        """Add to (or replace) a pack's notepad. Nothing is shown: Mush-Z appends every
+        channel message to one, and only ActivateNotepad puts a notepad in front."""
+        name = _dialog_text(title)
+        combined = text if replace else self._notepads.get(name, "") + text
+        self._notepads[name] = combined[-_NOTEPAD_LIMIT:]
+        return True
+
+    def notepads(self) -> dict[str, str]:
+        """This pack's notepads by title, for the window's list of them (a copy)."""
+        return dict(self._notepads)
+
+    def _activate_notepad(self, title: object = "", *_args: object) -> bool:
+        name = _dialog_text(title)
+        if name not in self._notepads:
+            return False
+        self._window().show_notepad(name, self._notepads[name])
+        return True
+
+    def _close_notepad(self, title: object = "", *_args: object) -> int:
+        return 1 if self._notepads.pop(_dialog_text(title), None) is not None else 0
+
+    def _notepad_exists(self, title: object = "", *_args: object) -> int:
+        """Read-only, save method, colour, font and window position: genericMud's notepad
+        window has none of these to set, so they answer whether the notepad exists."""
+        return 1 if _dialog_text(title) in self._notepads else 0
 
     # --- arrays: MUSHclient's named string maps, kept in key order like its std::map ---
 
@@ -2223,7 +2349,10 @@ class MushclientPack:
         self._current_plugin = str(state["plugin"])
         try:
             if state["text"]:
-                self._deliver(state["send_to"], state["text"], variable=state["variable"])
+                self._deliver(
+                    state["send_to"], state["text"], variable=state["variable"],
+                    notepad=f"Timer: {state['name'] or state['label']}",
+                )
             if not state["script"]:
                 return
             handler = self._lua_function(str(state["script"]))
@@ -2899,7 +3028,10 @@ class MushclientPack:
             to_script=to_script, lower_wildcards=rule.lowercase_wildcard,
         )
         if not to_script:
-            self._deliver(rule.send_to, text, variable=rule.variable)
+            self._deliver(
+                rule.send_to, text, variable=rule.variable,
+                notepad=f"{rule.kind.capitalize()}: {rule.name or rule.label}",
+            )
             return
         if rule.kind == TRIGGER:
             # Scripts reprint lines in their colours from this (Mush-Z's channel triggers).
@@ -3930,6 +4062,51 @@ def _copy_start_tag(segment: str, start: int, out: list[str]) -> int:
         position += 1
     out.append(segment[position:])
     return length
+
+
+class _HeadlessWindow:
+    """The window's calls for a session without a window (tests, the census): the clipboard
+    and command box keep what packs put there, and nothing is shown or opened."""
+
+    def __init__(self) -> None:
+        self.clipboard = ""
+        self.command = ""
+        self.selection = (0, 0)
+
+    def get_clipboard(self) -> str:
+        return self.clipboard
+
+    def set_clipboard(self, text: str) -> None:
+        self.clipboard = text
+
+    def get_command(self) -> str:
+        return self.command
+
+    def set_command(self, text: str) -> bool:
+        if self.command:
+            return False
+        self.command = text
+        self.selection = (len(text), len(text))
+        return True
+
+    def paste_command(self, text: str) -> str:
+        start, end = (min(edge, len(self.command)) for edge in self.selection)
+        replaced = self.command[start:end]
+        self.command = self.command[:start] + text + self.command[end:]
+        self.selection = (start + len(text), start + len(text))
+        return replaced
+
+    def select_command(self, first: int, last: int) -> None:
+        length = len(self.command)
+        start = min(max(first - 1, 0), length)
+        end = length if last < 0 else min(max(last, start), length)
+        self.selection = (start, end)
+
+    def open_url(self, url: str) -> bool:
+        return False
+
+    def show_notepad(self, title: str, text: str) -> None:
+        return None
 
 
 def _split_escaped(text: str, separator: str) -> list[str]:

@@ -181,6 +181,9 @@ _VARIABLE_SNAPSHOT_TIMEOUT_S = 2.0
 _PACK_QUESTION_SHOW_TIMEOUT_S = 60.0
 _PACK_QUESTION_ANSWER_TIMEOUT_S = 900.0
 _PACK_QUESTION_POLL_S = 0.05  # how often the asking pack's own timers get a turn meanwhile
+# How long a pack's call that needs an answer from the window (its command box, the
+# clipboard) waits for it. The window answers at once unless it's busy or closing.
+_PACK_WINDOW_TIMEOUT_S = 2.0
 _PACK_SOUND_SUFFIXES = frozenset({".wav", ".ogg", ".mp3", ".flac"})  # bundled-audio detection
 
 # Numpad compass (VIPMud/MUDBall convention): digits walk, 5/0 look, . scans,
@@ -286,6 +289,7 @@ class SessionPanel(wx.Panel):
         self._find_restart = False  # next result starts from an output edge, inclusively
         self._keep_caret_on_focus = False  # one-shot: don't jump to the bottom this time
         self._questions: list[_PackQuestion] = []  # pack dialogs the loop thread waits on
+        self._notepad_windows: dict[str, PackNotepadFrame] = {}  # packs' notepads, by title
 
         # NVDA reads a control's name from a wx.StaticText created immediately
         # before it plus SetName() (the proven ffn-dl pattern). Both are required.
@@ -358,6 +362,7 @@ class SessionPanel(wx.Panel):
             other_worlds=lambda: [world.name for world in load_worlds()],
         )
         self.app.asker = self._ask_from_pack
+        self.app.pack_window = self  # packs' clipboard, command box, notepads and links
         # The address this session reaches may serve its media even on localhost or the LAN.
         self.app.media.trusted_address = self._connection.peer_address
         # One codec for both directions: commands go out in the encoding output is read in.
@@ -425,6 +430,134 @@ class SessionPanel(wx.Panel):
         def snapshot() -> None:
             try:
                 result.set_result(app.variable_listing())
+            except Exception as error:  # noqa: BLE001 - reported to the UI thread, not lost
+                result.set_exception(error)
+
+        try:
+            self._loop.call_soon_threadsafe(snapshot)
+            return result.result(timeout=_VARIABLE_SNAPSHOT_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - timeout, closed loop, or a failed read: say so
+            return None
+
+    # --- packs' MUSHclient window calls (PackWindow); called on the loop thread ---
+
+    def _on_ui_thread(self, action: Callable[[], object], fallback: object) -> object:
+        """Do ``action`` on the window's thread and wait for its answer; ``fallback`` when the
+        tab is closing or the window doesn't answer within _PACK_WINDOW_TIMEOUT_S."""
+        if not self._alive:
+            return fallback
+        if wx.IsMainThread():
+            return action()
+        result: concurrent.futures.Future = concurrent.futures.Future()
+
+        def run() -> None:
+            if not self._alive:
+                result.set_result(fallback)
+                return
+            try:
+                result.set_result(action())
+            except Exception as error:  # noqa: BLE001 - the pack gets the fallback instead
+                result.set_exception(error)
+
+        wx.CallAfter(run)
+        try:
+            return result.result(timeout=_PACK_WINDOW_TIMEOUT_S)
+        except Exception:  # noqa: BLE001 - a busy window or a failed read: the fallback
+            return fallback
+
+    def get_clipboard(self) -> str:
+        return str(self._on_ui_thread(_clipboard_text, ""))
+
+    def set_clipboard(self, text: str) -> None:
+        if self._alive:
+            wx.CallAfter(_set_clipboard_text, text)
+
+    def get_command(self) -> str:
+        return str(self._on_ui_thread(self.input.GetValue, ""))
+
+    def set_command(self, text: str) -> bool:
+        def fill() -> bool:
+            if self.input.GetValue():
+                return False
+            self.input.SetValue(text)
+            self.input.SetInsertionPointEnd()
+            return True
+
+        return bool(self._on_ui_thread(fill, False))
+
+    def paste_command(self, text: str) -> str:
+        def paste() -> str:
+            start, end = self.input.GetSelection()
+            replaced = self.input.GetValue()[start:end]
+            self.input.Replace(start, end, text)
+            return replaced
+
+        return str(self._on_ui_thread(paste, ""))
+
+    def select_command(self, first: int, last: int) -> None:
+        def select() -> None:
+            length = self.input.GetLastPosition()
+            start = min(max(first - 1, 0), length)
+            end = length if last < 0 else min(max(last, start), length)
+            self.input.SetSelection(start, end)
+
+        self._on_ui_thread(select, None)
+
+    def open_url(self, url: str) -> bool:
+        if not self._alive:
+            return False
+        wx.CallAfter(self._open_url, url)
+        return True
+
+    def _open_url(self, url: str) -> None:  # UI thread
+        # Said in the output too: a browser taking the focus is otherwise a surprise.
+        self._post(protocol.echo(f"* Opening {url}"))
+        webbrowser.open(url)
+
+    def show_notepad(self, title: str, text: str) -> None:
+        if self._alive:
+            wx.CallAfter(self._show_notepad, title, text)
+
+    def _show_notepad(self, title: str, text: str) -> None:  # UI thread
+        """A pack's notepad in a window of its own beside the game, as MUSHclient shows it.
+        Showing it again brings the same window back with the newest text."""
+        if not self._alive:
+            return
+        window = self._notepad_windows.get(title)
+        if window is None:
+            window = PackNotepadFrame(
+                wx.GetTopLevelParent(self), f"{title} - {self.world.name}", text
+            )
+            window.Bind(wx.EVT_CLOSE, lambda event, name=title: self._notepad_closed(name, event))
+            self._notepad_windows[title] = window
+        else:
+            window.set_text(text)
+        window.Show()
+        window.Raise()
+        window.text.SetFocus()
+
+    def _notepad_closed(self, title: str, event: wx.CloseEvent) -> None:  # UI thread
+        self._notepad_windows.pop(title, None)
+        event.Skip()  # let the window go
+
+    def close_notepads(self) -> None:  # UI thread
+        for window in list(self._notepad_windows.values()):
+            window.Destroy()
+        self._notepad_windows.clear()
+
+    def notepad_snapshot(self) -> dict[str, str] | None:  # UI thread
+        """This session's soundpack notepads, read on the loop thread like the variables;
+        None when the loop is busy with a pack's dialog or doesn't answer in time."""
+        app = self.app
+        if app is None:
+            return {}
+        if self._questions:
+            return None
+        result: concurrent.futures.Future = concurrent.futures.Future()
+
+        def snapshot() -> None:
+            try:
+                result.set_result(app.pack_notepads())
             except Exception as error:  # noqa: BLE001 - reported to the UI thread, not lost
                 result.set_exception(error)
 
@@ -889,6 +1022,7 @@ class SessionPanel(wx.Panel):
     def close(self) -> None:
         """Tear down the session; safe to call from the wx thread on tab close."""
         self._alive = False
+        self.close_notepads()
         try:
             for question in list(self._questions):  # free the loop thread to tear down
                 self._withdraw_question(question)
@@ -1005,6 +1139,61 @@ class SessionPanel(wx.Panel):
         dialog.Destroy()
         if answer == wx.ID_YES:
             self.reconnect()
+
+
+def _clipboard_text() -> str:  # UI thread
+    """The clipboard's text, or "" when it holds none or can't be opened."""
+    clipboard = wx.TheClipboard
+    if not clipboard.Open():
+        return ""
+    try:
+        data = wx.TextDataObject()
+        return data.GetText() if clipboard.GetData(data) else ""
+    finally:
+        clipboard.Close()
+
+
+def _set_clipboard_text(text: str) -> None:  # UI thread
+    clipboard = wx.TheClipboard
+    if not clipboard.Open():
+        return
+    try:
+        clipboard.SetData(wx.TextDataObject(text))
+        clipboard.Flush()  # Windows keeps it after genericMud closes
+    finally:
+        clipboard.Close()
+
+
+class PackNotepadFrame(wx.Frame):
+    """A soundpack's MUSHclient notepad: text to read in a window of its own, while the game
+    carries on. Read-only; Escape or Close puts it away."""
+
+    def __init__(self, parent: wx.Window | None, title: str, text: str) -> None:
+        super().__init__(parent, title=title, size=(640, 480))
+        panel = wx.Panel(self)
+        label = wx.StaticText(panel, label="&Text:")
+        self.text = wx.TextCtrl(
+            panel, value=text, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2
+        )
+        self.text.SetName(title)
+        close = wx.Button(panel, wx.ID_CLOSE, "&Close")
+        close.Bind(wx.EVT_BUTTON, lambda _event: self.Close())
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer.Add(label, 0, wx.LEFT | wx.TOP, 4)
+        sizer.Add(self.text, 1, wx.EXPAND | wx.ALL, 4)
+        sizer.Add(close, 0, wx.ALIGN_RIGHT | wx.ALL, 4)
+        panel.SetSizer(sizer)
+        self.Bind(wx.EVT_CHAR_HOOK, self._on_key)
+
+    def set_text(self, text: str) -> None:
+        self.text.SetValue(text)
+        self.text.SetInsertionPoint(0)
+
+    def _on_key(self, event: wx.KeyEvent) -> None:
+        if event.GetKeyCode() == wx.WXK_ESCAPE and not event.HasAnyModifiers():
+            self.Close()
+            return
+        event.Skip()
 
 
 class PackQuestionDialog(wx.Dialog):
@@ -3474,6 +3663,11 @@ class GenericMudFrame(wx.Frame):
             wx.ID_ANY, "Browse soundpacks &online...\tCtrl+Shift+B"
         )
         setup_item = packs_menu.Append(wx.ID_ANY, "Set &up a soundpack from a folder...")
+        packs_menu.AppendSeparator()
+        notepads_item = packs_menu.Append(
+            wx.ID_ANY, "Soundpack &notepads...",
+            "Read what this world's soundpacks have written to their notepads",
+        )
         menubar.Append(packs_menu, "Sound&packs")
 
         automation_menu = wx.Menu()
@@ -3534,6 +3728,7 @@ class GenericMudFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self._on_manage_packs, packs_item)
         self.Bind(wx.EVT_MENU, self._on_setup_pack, setup_item)
         self.Bind(wx.EVT_MENU, self._on_browse_online, browse_item)
+        self.Bind(wx.EVT_MENU, self._on_pack_notepads, notepads_item)
         self.Bind(wx.EVT_MENU, self._on_export_world, export_item)
         self.Bind(wx.EVT_MENU, self._on_import_world, import_item)
         self.Bind(wx.EVT_MENU, self._on_automation_manager, automation_item)
@@ -3819,6 +4014,33 @@ class GenericMudFrame(wx.Frame):
         dialog = AutomationManagerDialog(self, panel, announce=self.announce)
         dialog.ShowModal()
         dialog.Destroy()
+
+    def _on_pack_notepads(self, _event: wx.CommandEvent) -> None:
+        """Pick one of this world's soundpack notepads and open it (MUSHclient lists them in
+        its Window menu). Packs write to them as you play; most never open them themselves."""
+        index = self.book.GetSelection()
+        if index == wx.NOT_FOUND or not self.book.GetPageCount():
+            self.announce("Open a session first; notepads belong to a world's soundpacks.")
+            return
+        panel = self.book.GetPage(index)
+        notepads = panel.notepad_snapshot()
+        if notepads is None:
+            self.announce("The session is busy; try again in a moment.")
+            return
+        if not notepads:
+            self.announce("No soundpack notepads yet. Packs write to them as you play.")
+            return
+        titles = list(notepads)
+        dialog = wx.SingleChoiceDialog(
+            self, "Notepad to read:", f"Soundpack notepads - {panel.world.name}", titles
+        )
+        try:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            title = titles[dialog.GetSelection()]
+        finally:
+            dialog.Destroy()
+        panel._show_notepad(title, notepads[title])
 
     def _on_mud_variables(self, _event: wx.CommandEvent) -> None:
         index = self.book.GetSelection()

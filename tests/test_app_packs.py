@@ -324,3 +324,17 @@ def test_a_packs_save_state_writes_its_variables_soon_once_per_burst(tmp_path):
     saves[0]()
     data = json.loads(app._pack_vars_path().read_text(encoding="utf-8"))
     assert data["volume"] == "70"
+
+
+def test_the_session_lists_its_packs_notepads(tmp_path):
+    # Mush-Z writes its channel log to a notepad it never opens; the window lists them.
+    store = PackStore(tmp_path / "store")
+    _install_mush(
+        store, tmp_path,
+        "<muclient><plugin id='np' name='np'/><script><![CDATA[\n"
+        "function OnPluginInstall() AppendToNotepad('comlog', 'Bob: hi', '\\r\\n') end\n"
+        "]]></script></muclient>",
+    )
+    app, _backend, _posted = _app(store)
+    app.on_connect("mud")
+    assert app.pack_notepads() == {"comlog": "Bob: hi\r\n"}

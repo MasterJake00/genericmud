@@ -1118,3 +1118,57 @@ def test_ctrl_d_works_in_the_first_tab_after_a_menu_was_opened_with_none(
         main.Destroy()
         loop.run_until_complete(asyncio.sleep(0.01))
         loop.close()
+
+
+def test_the_soundpacks_menu_opens_a_notepad_the_player_picks(frame, tmp_path, monkeypatch):
+    import asyncio
+
+    from genericmud.ui import wx_app
+    from tests.helpers import RecordingBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(wx_app, "make_voice_backend", RecordingBackend)
+    monkeypatch.setattr(wx_app, "make_diagnostic_log", lambda: None)
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+
+    class _Chooser:
+        def __init__(self, _parent, _message, _caption, choices):
+            self.choices = choices
+
+        def ShowModal(self):
+            return wx.ID_OK
+
+        def GetSelection(self):
+            return self.choices.index("comlog")
+
+        def Destroy(self):
+            pass
+
+    monkeypatch.setattr(wx_app.wx, "SingleChoiceDialog", _Chooser)
+    loop = asyncio.new_event_loop()
+    main = wx_app.GenericMudFrame(loop, {})
+    try:
+        spoken: list[str] = []
+        monkeypatch.setattr(main, "announce", spoken.append)
+        main._on_pack_notepads(None)
+        assert spoken == ["Open a session first; notepads belong to a world's soundpacks."]
+        main.open_session(World("Test", "mud.example", 4000))
+        panel = main.book.GetPage(0)
+        monkeypatch.setattr(panel, "notepad_snapshot", lambda: {})
+        main._on_pack_notepads(None)
+        assert spoken[-1] == "No soundpack notepads yet. Packs write to them as you play."
+        monkeypatch.setattr(
+            panel, "notepad_snapshot", lambda: {"map": "n", "comlog": "Bob: hi\r\n"}
+        )
+        main._on_pack_notepads(None)
+        window = panel._notepad_windows["comlog"]
+        assert window.text.GetValue().replace("\r", "") == "Bob: hi\n"
+    finally:
+        main.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()

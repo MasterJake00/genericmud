@@ -233,6 +233,11 @@ class ScriptApi:
         """Save the packs' variables soon, not only when the session closes."""
         self._engine.sink.save_state()
 
+    def pack_window(self):
+        """The window's clipboard, command box, notepads and browser (a PackWindow), or
+        None when there's no window."""
+        return self._engine.sink.pack_window()
+
     def is_connected(self) -> bool:
         return self._engine.connected
 

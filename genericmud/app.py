@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genericmud.automation.channels import ChannelPolicy
-from genericmud.automation.engine import AutomationEngine, Callback, EngineSink, MatchContext
+from genericmud.automation.engine import (
+    AutomationEngine,
+    Callback,
+    EngineSink,
+    MatchContext,
+    PackWindow,
+)
 from genericmud.automation.variables import VariableEntry, list_variables
 from genericmud.bridge import protocol
 from genericmud.completion import OutputWordIndex
@@ -182,7 +188,7 @@ class AppSink(EngineSink):
     def __init__(
         self, *, send, post, schedule, voice: VoiceRouter, buffer: Buffer, sound: SoundBus,
         diag: DiagnosticLog | None = None, send_raw=None, ask=None, simulate=None,
-        save_state=None,
+        save_state=None, window=None,
     ) -> None:
         self._send = send
         self._send_raw = send_raw
@@ -195,6 +201,7 @@ class AppSink(EngineSink):
         self._ask = ask
         self._simulate = simulate
         self._save_state = save_state
+        self._window = window
         self.cues = 0  # play/music calls reaching the bus -- 0 means no cue ever fired
 
     def send(self, text: str) -> None:
@@ -233,6 +240,9 @@ class AppSink(EngineSink):
     def save_state(self) -> None:
         if self._save_state is not None:
             self._save_state()
+
+    def pack_window(self):
+        return self._window() if self._window is not None else None
 
     def speak(self, text: str, channel: str = "main", interrupt: bool = False) -> None:
         self._voice.speak(text, channel, interrupt)
@@ -347,11 +357,15 @@ class EngineApp:
             ask=self._ask_player,
             simulate=self._simulate,
             save_state=self._request_save,
+            window=lambda: self.pack_window,
         )
         # Set by a front end that can show dialogs (the wx window): called with the question
         # and a function to call while it waits. A window-less session's questions are
         # cancelled.
         self.asker: Callable[[dict, Callable[[], None] | None], object] | None = None
+        # Set by a front end with a window: what packs' clipboard, command box, notepad and
+        # browser calls use. Without one they work on a stand-in kept by the pack.
+        self.pack_window: PackWindow | None = None
         self.engine = AutomationEngine(self.sink, sound=self.sound)
         self.engine.diag = diag  # sound-path trace, reached by ScriptApi/loader via the engine
         if diag is not None:
@@ -436,6 +450,14 @@ class EngineApp:
         values, safe to hand to the UI thread afterwards.
         """
         return list_variables(self.engine.all_mud_vars(), self.engine.all_vars())
+
+    def pack_notepads(self) -> dict[str, str]:
+        """The MUSHclient notepads this session's packs have written, by title (a copy).
+        Mush-Z keeps its channel log in one and never opens it itself. Loop thread."""
+        notepads: dict[str, str] = {}
+        for pack in self._mush_packs:
+            notepads.update(pack.notepads())
+        return notepads
 
     def _ask_player(
         self, request: dict, while_waiting: Callable[[], None] | None = None

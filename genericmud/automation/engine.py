@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from genericmud.automation.channels import ChannelRouter
 from genericmud.model.buffer import Line
@@ -40,6 +40,24 @@ except ImportError:  # pragma: no cover - regex is a declared dependency
 
     class _MatchTimeout(Exception):  # never raised by stdlib re; keeps the except clause valid
         ...
+
+
+class PackWindow(Protocol):
+    """What a window does for soundpacks' MUSHclient window calls: its clipboard, command box,
+    notepads and the browser. Called on the loop thread."""
+
+    def get_clipboard(self) -> str: ...
+    def set_clipboard(self, text: str) -> None: ...
+    def get_command(self) -> str: ...
+    def set_command(self, text: str) -> bool:
+        """Put ``text`` in the command box if it's empty; whether it was."""
+    def paste_command(self, text: str) -> str:
+        """Replace the command box's selection with ``text``; the text replaced."""
+    def select_command(self, first: int, last: int) -> None:
+        """Select columns ``first`` to ``last`` (1 is the first, -1 the end)."""
+    def open_url(self, url: str) -> bool: ...
+    def show_notepad(self, title: str, text: str) -> None:
+        """Show a pack's notepad, read-only, without stopping the game."""
 
 
 class EngineSink:
@@ -74,6 +92,10 @@ class EngineSink:
         return None
     def simulate(self, text: str) -> None:
         """Take ``text`` as if the MUD had sent it (MUSHclient's Simulate)."""
+    def pack_window(self) -> PackWindow | None:
+        """The window, for packs' clipboard, command box, notepad and browser calls; None
+        when there's no window."""
+        return None
     def save_state(self) -> None:
         """Save the packs' variables soon (MUSHclient's SaveState); asks close together
         make one save."""
