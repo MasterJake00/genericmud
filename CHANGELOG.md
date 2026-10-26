@@ -7,6 +7,53 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.18.0 — 2026-10-26
+
+**MUSHclient soundpacks**
+
+* Mush-Z, Miriani-Next and Toastush load all of their triggers. They add most
+  of them while starting up, in a way genericMud didn't support, so Mush-Z
+  ran with about a tenth of its sounds and Miriani-Next and Toastush with
+  almost none.
+* Miriani-Next's sounds play. Every one of them stopped on a time check
+  genericMud answered wrongly.
+* Mush-Z's cast alias no longer sends every spell twice.
+* Krinnzenn's help works: sphelp shows its pages, and readme no longer goes to
+  the MUD as a command.
+* Materia Magica's help commands, like sbrief help, show the plugin's help
+  instead of a blank line.
+* Triggers that watch for a word the pack keeps in a variable, like Mush-Z's
+  channel prefix, now see it.
+* A pack's triggers are tried in MUSHclient's order, and one that matches
+  stops the rest of its plugin's triggers for the line unless it says to keep
+  going. Other plugins' triggers, and your own, still hear every line.
+* A switched-off alias, or one in a switched-off plugin, no longer swallows the
+  command you typed.
+* A pack's timers keep running after the connection drops and comes back.
+* Mush-Z's plugin manager can remove a plugin and add it back. It used to stay
+  removed.
+* Channel histories can copy messages to the clipboard and paste them into the
+  command box for you to edit or send.
+* Packs that keep logs in MUSHclient notepads can show them, and Soundpacks >
+  Soundpack notepads opens any of them. Writing to a notepad never takes your
+  focus.
+* Packs can open their help pages and links in your browser. Only web and
+  email links open; a pack can't start a program this way.
+* Packs save their settings when the session closes and whenever they ask to,
+  and hear when the connection drops and comes back.
+
+**Changed on purpose**
+
+* A MUSHclient pack's trigger that doesn't say to keep evaluating now stops
+  its plugin's later triggers for the line, as in MUSHclient. genericMud used
+  to try every one, which could play two sounds for one line.
+* When one of a MUSHclient pack's aliases matches what you type, the pack
+  decides what's sent, as in MUSHclient. genericMud also sent what you typed
+  when the alias said to keep evaluating. An alias that stops evaluation
+  stops only its own plugin's aliases, not every plugin's.
+* Text a pack's trigger sends is read the way MUSHclient reads it: a
+  backslash sequence like \n becomes the character it stands for.
+
 ## 0.17.0 — 2026-10-26
 
 **Sounds the MUD sends**
