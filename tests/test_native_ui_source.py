@@ -158,8 +158,9 @@ def test_pack_updates_route_curated_sources_through_their_native_sync():
     source = _wx_source()
     assert "manifest_sources.by_id(pack_id)" in source
     assert "setup_pack_from_manifest(" in source
-    assert "git_sources.by_id(pack_id)" in source
-    assert "setup_pack_from_git(" in source
+    # A pack whose upstream is a git repository updates file by file from it.
+    assert "git_sources.update_source(pack_id)" in source
+    assert "update_pack_from_git(" in source
 
 
 def test_pack_compatibility_dialog_accounts_for_skipped_plugins_and_rules():

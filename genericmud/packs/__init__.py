@@ -23,6 +23,7 @@ from genericmud.packs.manifest import (
     slugify,
 )
 from genericmud.packs.setup import (
+    GitUpdateResult,
     SetupResult,
     detect_entry,
     entry_problem,
@@ -30,6 +31,7 @@ from genericmud.packs.setup import (
     setup_pack_from_git,
     setup_pack_from_manifest,
     update_pack,
+    update_pack_from_git,
 )
 from genericmud.packs.store import PackError, PackExists, PackStore, UnknownPack
 from genericmud.packs.world_import import world_from_pack
@@ -39,6 +41,7 @@ __all__ = [
     "MANIFEST_NAME",
     "ActivationResult",
     "Conflict",
+    "GitUpdateResult",
     "PackError",
     "PackExists",
     "PackManifest",
@@ -57,5 +60,6 @@ __all__ = [
     "setup_pack_from_manifest",
     "slugify",
     "update_pack",
+    "update_pack_from_git",
     "world_from_pack",
 ]

@@ -55,6 +55,7 @@ from genericmud.config.worlds import (
     separator_problem,
 )
 from genericmud.packs import (
+    GitUpdateResult,
     PackError,
     PackStore,
     SetupResult,
@@ -69,6 +70,7 @@ from genericmud.packs import (
     setup_pack_from_manifest,
     slugify,
     update_pack,
+    update_pack_from_git,
     vault,
     world_from_pack,
 )
@@ -1894,15 +1896,11 @@ class PackManagerDialog(wx.Dialog):
                 return setup_pack_from_manifest(
                     self._store, manifest_source, diag=self._diag
                 )
-            git_source = git_sources.by_id(pack_id)
-            if git_source is not None:
-                return setup_pack_from_git(
-                    self._store,
-                    git_source,
-                    download=lambda url, dest, **kwargs: vault.download(
-                        url, dest, **kwargs
-                    ),
-                    diag=self._diag,
+            # A pack whose upstream is a git repository fetches only the files that changed.
+            update_source = git_sources.update_source(pack_id)
+            if update_source is not None:
+                return update_pack_from_git(
+                    self._store, pack_id, update_source, diag=self._diag
                 )
             return update_pack(
                 self._store, pack_id,
@@ -1923,6 +1921,8 @@ class PackManagerDialog(wx.Dialog):
                 self._diag.event("update.failed", id=pack_id, error=repr(outcome),
                                  trace="".join(traceback.format_exception(outcome)))
             wx.MessageBox(f"Update failed: {outcome}", "Update", wx.OK | wx.ICON_ERROR)
+        elif isinstance(outcome, GitUpdateResult):
+            wx.MessageBox(_git_update_message(outcome), "Update", wx.OK | wx.ICON_INFORMATION)
         else:
             if self._diag is not None:
                 self._diag.event("update.done", id=pack_id, dialect=outcome.manifest.dialect)
@@ -1930,6 +1930,32 @@ class PackManagerDialog(wx.Dialog):
                 f"Updated {pack_id}. Reconnect to apply.", "Update", wx.OK | wx.ICON_INFORMATION,
             )
         self._refresh_packs()
+
+
+def _git_update_message(result: GitUpdateResult) -> str:
+    """What updating a pack from its repository did, in a sentence or three."""
+    if result.up_to_date:
+        return f"{result.name} is up to date."
+    changes = [f"{result.written} {'file' if result.written == 1 else 'files'} updated"]
+    if result.removed:
+        changes.append(f"{result.removed} removed")
+    lines = [f"Updated {result.name}: {', '.join(changes)}."]
+    count = len(result.new_versions)
+    if count == 1:
+        changed = result.new_versions[0]
+        lines.append(
+            f"You'd changed {changed}, so your copy stayed, and the pack's new version is "
+            f"next to it as {changed}.new."
+        )
+    elif count > 1:
+        named = ", ".join(result.new_versions[:5])
+        more = f" and {count - 5} more" if count > 5 else ""
+        lines.append(
+            f"You'd changed {count} of its files, so your copies stayed, and the pack's new "
+            f"version of each is next to it with .new on the end: {named}{more}."
+        )
+    lines.append("Reconnect to apply.")
+    return " ".join(lines)
 
 
 _SOURCE_MAX_BYTES = 3_000_000_000  # cap when following an installer's source repo (~3 GB)

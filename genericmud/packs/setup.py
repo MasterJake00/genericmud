@@ -12,13 +12,13 @@ import re
 import tempfile
 import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from genericmud.config.atomic import atomic_write_text
 from genericmud.config.worlds import World
-from genericmud.packs import manifest_sync, vault
-from genericmud.packs.git_sources import GitSource
+from genericmud.packs import git_remote, git_sync, manifest_sync, vault
+from genericmud.packs.git_sources import GitSource, UpdateSource
 from genericmud.packs.manifest import CODE_EXEC_DIALECTS, DIALECT_BY_SUFFIX, PackManifest
 from genericmud.packs.manifest_sources import ManifestSource
 from genericmud.packs.store import PackError, PackStore, extract_pack
@@ -326,6 +326,90 @@ def setup_pack_from_git(
     if diag is not None:
         diag.event("pack.git", id=source.id, repo=source.repo_url, entry=source.entry)
     return SetupResult(manifest=manifest, world=world, enabled_for=world.name)
+
+
+@dataclass
+class GitUpdateResult:
+    """What updating a pack from its repository did, for telling the player."""
+
+    name: str
+    up_to_date: bool
+    written: int = 0
+    removed: int = 0
+    new_versions: list[str] = field(default_factory=list)  # player's files, .new beside
+
+
+def update_pack_from_git(
+    store: PackStore,
+    pack_id: str,
+    source: UpdateSource,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+    diag=None,
+    list_tree=git_remote.list_tree,
+    fetch_blobs=git_remote.fetch_blobs,
+) -> GitUpdateResult:
+    """Bring an installed pack up to its repository's latest commit, fetching only the files
+    that changed (see :mod:`genericmud.packs.git_sync`). Files the player changed stay; the
+    pack's new version of each goes beside it as ``<name>.new``. ``list_tree`` and
+    ``fetch_blobs`` are injectable for tests."""
+    manifest = store.manifest(pack_id)
+    pack_dir = store.pack_dir(pack_id)
+    prefix = _repository_prefix(manifest.entry, source)
+    try:
+        tree = list_tree(source.repo_url)
+    except git_remote.RemoteError as error:
+        raise PackError(f"couldn't check {source.name} for updates: {error}") from error
+    if source.entry not in tree.files:
+        raise PackError(
+            f"{source.name}'s repository no longer has {source.entry}, so genericMud won't "
+            "update it from there. Please report this."
+        )
+    baseline = git_sync.read_baseline(pack_dir)
+    plan = git_sync.make_plan(tree.files, pack_dir, prefix, baseline)
+    if plan.up_to_date and baseline is not None and baseline.commit == tree.commit:
+        return GitUpdateResult(name=source.name, up_to_date=True)
+    # Fetched into the pack's own folder, so files move on the same disk.
+    with tempfile.TemporaryDirectory(prefix=".gm-update-", dir=pack_dir) as scratch:
+        try:
+            blobs = fetch_blobs(source.repo_url, plan.blobs, Path(scratch), progress=progress)
+        except git_remote.RemoteError as error:
+            raise PackError(f"couldn't download {source.name}'s update: {error}") from error
+        applied = git_sync.apply_plan(
+            pack_dir, prefix, plan, blobs,
+            repo=source.repo_url, commit=tree.commit, remote=tree.files,
+        )
+    if diag is not None:
+        diag.event(
+            "pack.git_update", id=pack_id, commit=tree.commit, written=len(applied.written),
+            new_versions=len(applied.new_versions), removed=len(applied.removed),
+            missing=len(applied.missing), local_only=plan.local_only,
+        )
+    if not applied.complete:
+        raise PackError(
+            f"{len(applied.missing)} of {source.name}'s updated files didn't arrive. Run the "
+            "update again; it carries on from where it stopped."
+        )
+    return GitUpdateResult(
+        name=source.name,
+        up_to_date=not applied.written and not applied.removed and not applied.new_versions,
+        written=len(applied.written),
+        removed=len(applied.removed),
+        new_versions=applied.new_versions,
+    )
+
+
+def _repository_prefix(installed_entry: str, source: UpdateSource) -> str:
+    """Where the repository's root sits inside the installed pack, found from where the
+    pack's load script is in each."""
+    installed = installed_entry.replace("\\", "/")
+    if not installed.lower().endswith(source.entry.lower()):
+        raise PackError(
+            f"genericMud can't line {source.name}'s install up with its repository (its load "
+            f"script is {installed_entry}, the repository's is {source.entry}). Reinstalling "
+            "the pack fixes this."
+        )
+    return installed[: len(installed) - len(source.entry)]
 
 
 def _write_pack_toml(pack_dir: Path, source: ManifestSource) -> None:

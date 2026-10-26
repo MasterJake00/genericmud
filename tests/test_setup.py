@@ -328,3 +328,100 @@ def test_detect_entry_takes_a_linked_vipmud_packs_scripts_not_its_sounds_marker(
     # The sounds folder's main.set only says which sounds version it is.
     pack = _linked_vipmud_pack(tmp_path)
     assert detect_entry(pack) == "Miriani Soundpack for VIP Mud/Scripts/Main.set"
+
+
+def _git_installed(tmp_path, files: dict[str, bytes], *, wrapper: str = ""):
+    """A pack installed from an archive (``wrapper`` is the folder the archive kept around
+    everything, as Toastush's did), the way the vault browser leaves one."""
+    store = PackStore(tmp_path / "store")
+    source = tmp_path / "toastush"
+    for path, data in files.items():
+        target = source / wrapper / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    store.install(
+        source, entry=wrapper + "worlds/Miriani.MCL", origin="https://example.test/t.zip",
+        pack_id="toastush",
+    )
+    return store
+
+
+def _fake_remote(files: dict[str, bytes]):
+    """A repository's list and blob fetch, from ``files`` (path -> contents)."""
+    from genericmud.packs import git_remote, git_sync
+
+    by_sha = {git_sync.blob_sha(data): data for data in files.values()}
+    fetched: list[set[str]] = []
+
+    def list_tree(_url):
+        return git_remote.RemoteTree(
+            commit="c" * 40, files={path: git_sync.blob_sha(data) for path, data in files.items()}
+        )
+
+    def fetch_blobs(_url, blob_ids, destination, progress=None):
+        wanted = set(blob_ids)
+        fetched.append(wanted)
+        landed = {}
+        for sha in wanted:
+            landed[sha] = destination / sha
+            landed[sha].write_bytes(by_sha[sha])
+        return landed
+
+    return list_tree, fetch_blobs, fetched
+
+
+def test_a_pack_updates_from_its_repository_file_by_file(tmp_path):
+    from genericmud.packs import git_sources
+    from genericmud.packs.setup import update_pack_from_git
+
+    wrapper = "PsudoDeSudo-Toastush-e8cdb7d/"
+    store = _git_installed(tmp_path, {
+        "worlds/Miriani.MCL": b"<world mine/>",
+        "scripts/a.lua": b"old a",
+        "scripts/b.lua": b"b",
+        "sounds/hit.ogg": b"hit",
+    }, wrapper=wrapper)
+    store.trust("toastush")
+    store.enable("toastush", "Miriani")
+    list_tree, fetch_blobs, fetched = _fake_remote({
+        "worlds/Miriani.MCL": b"<world/>",
+        "scripts/a.lua": b"new a",
+        "scripts/b.lua": b"b",
+        "sounds/hit.ogg": b"hit",
+        "sounds/miss.ogg": b"miss",
+    })
+    source = git_sources.update_source("toastush")
+    result = update_pack_from_git(
+        store, "toastush", source, list_tree=list_tree, fetch_blobs=fetch_blobs,
+    )
+    pack = store.pack_dir("toastush") / wrapper
+    assert (pack / "scripts" / "a.lua").read_bytes() == b"new a"
+    assert (pack / "sounds" / "miss.ogg").read_bytes() == b"miss"
+    assert (pack / "worlds" / "Miriani.MCL").read_bytes() == b"<world mine/>"  # the player's
+    assert (pack / "worlds" / "Miriani.MCL.new").read_bytes() == b"<world/>"
+    assert result.written == 2 and result.new_versions == ["worlds/Miriani.MCL"]
+    assert len(fetched[0]) == 3  # only what changed: new a, miss, and the new world file
+    assert store.is_trusted("toastush") and store.is_enabled("toastush", "Miriani")
+    assert not list(store.pack_dir("toastush").glob(".gm-update-*"))
+
+    # Nothing new upstream: nothing fetched, and it says so.
+    again = update_pack_from_git(
+        store, "toastush", source, list_tree=list_tree, fetch_blobs=fetch_blobs,
+    )
+    assert again.up_to_date and len(fetched) == 1
+
+
+def test_an_install_that_doesnt_line_up_with_its_repository_isnt_touched(tmp_path):
+    from genericmud.packs import git_sources
+    from genericmud.packs.git_sources import UpdateSource
+    from genericmud.packs.setup import update_pack_from_git
+
+    store = _git_installed(tmp_path, {"worlds/Miriani.MCL": b"<world/>"})
+    elsewhere = UpdateSource("toastush", "Toastush", "https://example.test/t.git", "other/x.MCL")
+    list_tree, fetch_blobs, fetched = _fake_remote({"other/x.MCL": b"x"})
+    with pytest.raises(PackError, match="Reinstalling"):
+        update_pack_from_git(
+            store, "toastush", elsewhere, list_tree=list_tree, fetch_blobs=fetch_blobs,
+        )
+    assert fetched == []
+    assert git_sources.update_source("toastush") is not None

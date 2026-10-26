@@ -86,3 +86,54 @@ def for_labels(*labels: str) -> GitSource | None:
         if _norm(source.mud) in targets or _norm(source.name) in targets or source.id in targets:
             return source
     return None
+
+
+@dataclass(frozen=True)
+class UpdateSource:
+    """Where an installed pack's files come from, for updating it file by file."""
+
+    id: str  # the installed pack's id
+    name: str  # human label for messages
+    repo_url: str  # the pack's git repository (https)
+    entry: str  # the pack's load script, relative to the repository's root
+
+
+# Packs installed from their vault zips whose upstream is a public git repository. Their
+# installs stay as they are (the vault browser still fetches the zip); updates read the
+# repository. The entry tells the updater where the repository's root sits in the install:
+# Toastush's zip kept GitHub's "PsudoDeSudo-Toastush-e8cdb7d/" folder around everything.
+_UPDATE_ONLY: dict[str, UpdateSource] = {
+    "miriani-next": UpdateSource(
+        id="miriani-next",
+        name="Miriani-Next",
+        repo_url="https://github.com/distantorigin/miriani-next.git",
+        entry="worlds/Miriani.MCL",
+    ),
+    "toastush": UpdateSource(
+        id="toastush",
+        name="Toastush",
+        repo_url="https://github.com/PsudoDeSudo/Toastush.git",
+        entry="worlds/Miriani.MCL",
+    ),
+    "atlan-s-mystavaria-pack": UpdateSource(
+        id="atlan-s-mystavaria-pack",
+        name="Atlan's Mystavaria Pack",
+        repo_url="https://github.com/derbruedi/mystavaria-soundpack.git",
+        entry="mystavaria/worlds/plugins/mystavaria.xml",
+    ),
+}
+
+
+def update_source(pack_id: str) -> UpdateSource | None:
+    """Where to update an installed pack from, file by file, or None when it has no known
+    git repository."""
+    source = _SOURCES.get(pack_id)
+    if source is not None:
+        return UpdateSource(source.id, source.name, _git_url(source.repo_url), source.entry)
+    return _UPDATE_ONLY.get(pack_id)
+
+
+def _git_url(repo_url: str) -> str:
+    """A repository's clone address: its web address with .git on the end."""
+    trimmed = repo_url.rstrip("/")
+    return trimmed if trimmed.endswith(".git") else trimmed + ".git"

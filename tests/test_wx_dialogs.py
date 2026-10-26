@@ -1172,3 +1172,27 @@ def test_the_soundpacks_menu_opens_a_notepad_the_player_picks(frame, tmp_path, m
         main.Destroy()
         loop.run_until_complete(asyncio.sleep(0.01))
         loop.close()
+
+
+def test_a_pack_update_from_its_repository_says_what_it_did():
+    from genericmud.packs import GitUpdateResult
+    from genericmud.ui.wx_app import _git_update_message
+
+    assert _git_update_message(GitUpdateResult("Erion", up_to_date=True)) == "Erion is up to date."
+    message = _git_update_message(GitUpdateResult(
+        "Toastush", up_to_date=False, written=34, removed=2,
+        new_versions=["worlds/Miriani.MCL"],
+    ))
+    assert message == (
+        "Updated Toastush: 34 files updated, 2 removed. You'd changed worlds/Miriani.MCL, so "
+        "your copy stayed, and the pack's new version is next to it as worlds/Miriani.MCL.new. "
+        "Reconnect to apply."
+    )
+    several = _git_update_message(GitUpdateResult(
+        "Erion", up_to_date=False, written=1, new_versions=["a.mcl", "b.ini"],
+    ))
+    assert several == (
+        "Updated Erion: 1 file updated. You'd changed 2 of its files, so your copies stayed, "
+        "and the pack's new version of each is next to it with .new on the end: a.mcl, b.ini. "
+        "Reconnect to apply."
+    )
