@@ -7,6 +7,61 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.13.0 — 2026-10-25
+
+**Escape no longer stops speech**
+
+* Press Ctrl, as you would for your screen reader, or F11. Escape now has a new
+  job at password prompts, below.
+
+**Passwords**
+
+* What you type at a password prompt goes to the MUD exactly as you typed it.
+  With auto-repeat on it used to be replaced by your username, and a semicolon
+  or a leading dot split it or walked you somewhere.
+* Passwords no longer come back when you press Up arrow.
+* While a MUD is hiding what you type, Escape stops hiding it. genericMud
+  mentions this the second time you type while your typing is hidden.
+* MUDs that run on FluffOS now say when the password prompt is over. Before,
+  genericMud treated everything you typed afterwards as a password, so aliases,
+  speedwalks and slash commands stopped working. If a MUD never says so,
+  genericMud stops hiding a minute after your last line, during login only, and
+  tells you.
+
+**Soundpacks**
+
+* MUSHclient soundpacks no longer type their scripts and settings at the MUD.
+  Empire's sent a page of script on every room, Cosmic Rage's sent tts_interrupt
+  lines, and SquareSoft's sent its credits at the login prompt.
+* Lines a MUSHclient soundpack prints are now spoken, as MushReader does, so some
+  packs have more to say. Empire's death message is one.
+* Triggers and aliases match the way MUSHclient and VIPMud match them. Aliases no
+  longer swallow ordinary commands: Prometheus's one-letter aliases ate say,
+  look, north and quit, and Erion's F10 and F12 both ran the same volume alias.
+* MUSHclient soundpack timers now repeat and can be switched on and off, as packs
+  expect.
+* VIPMud hotkeys with Ctrl, Alt or Shift work. Star Conquest went from 8 working
+  hotkeys to all 40, and Cosmic Rage from 11 to all 113.
+* A VIPMud soundpack that downloads its sounds as you play, such as Cosmic Rage,
+  no longer freezes genericMud while it fetches one.
+* Updating a soundpack from its source works for packs that come as a zip of
+  zips, such as Miriani's.
+* A soundpack can no longer write files outside its own folder.
+
+**Fixes**
+
+* One unusual character in a world's name could empty your saved-world list.
+* Pressing Disconnect while genericMud is reconnecting no longer ends with it
+  saying "reconnected".
+* Walking to a mapped room, or a safe walk typed with two dots, no longer gives
+  up or says you've arrived early when the MUD is slow to say which room you're
+  in.
+* The Automation Manager tells you when a hotkey's key is already taken by
+  genericMud, instead of saving a hotkey that would never work.
+* A Windows update that couldn't start no longer reports a failed update the
+  next time you open genericMud, and old update downloads are cleaned out of
+  your temp folder.
+
 ## 0.12.0 — 2026-09-25
 
 **MUDs that don't send UTF-8 read correctly**
