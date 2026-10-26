@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from genericmud.automation.engine import EngineSink
+from genericmud.model.buffer import Line
 
 
 @dataclass
@@ -26,6 +27,9 @@ class RecordingSink(EngineSink):
     lines: list[str] = field(default_factory=list)  # the output window, oldest first
     answers: list[Any] = field(default_factory=list)  # the player's replies to pack dialogs
     asked: list[dict] = field(default_factory=list)  # the dialogs packs asked for
+    styled: dict[int, list] = field(default_factory=dict)  # colour runs for lines[index]
+    simulated: list[str] = field(default_factory=list)  # text packs handed in as if from the MUD
+    save_requests: int = 0
 
     def send(self, text: str) -> None:
         self.sent.append(text)
@@ -72,6 +76,20 @@ class RecordingSink(EngineSink):
 
     def recent_lines(self, count: int) -> list[str]:
         return self.lines[-count:] if count > 0 else []
+
+    def line_count(self) -> int:
+        return len(self.lines)
+
+    def buffered_line(self, number: int) -> Line | None:
+        if not 1 <= number <= len(self.lines):
+            return None
+        return Line(self.lines[number - 1], spans=self.styled.get(number - 1, []))
+
+    def simulate(self, text: str) -> None:
+        self.simulated.append(text)
+
+    def save_state(self) -> None:
+        self.save_requests += 1
 
     def run_pending(self) -> None:
         """Fire all scheduled callbacks (ignoring delay) and clear the queue."""

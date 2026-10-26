@@ -20,7 +20,11 @@ resolves against the pack dir). Out of scope: the full plugin-suite surface
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
+import random
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -30,16 +34,62 @@ from urllib.error import HTTPError
 from urllib.request import Request
 from uuid import uuid4
 
-from genericmud.automation.engine import MatchContext
+from genericmud.automation.engine import MatchContext, compile_pattern
 from genericmud.navigation import expand_speedwalk
+from genericmud.render.ansi import strip_ansi
 from genericmud.scripting.api import MESSAGE_BUTTONS, ScriptApi
 from genericmud.scripting.guard import ScriptGuard
 from genericmud.scripting.lua_runtime import install_pack_require, make_sandboxed_runtime
+from genericmud.scripting.mushclient_rules import (
+    ALIAS,
+    ANSI_BOLD,
+    ANSI_NORMAL,
+    E_ALIAS_ALREADY_EXISTS,
+    E_ALIAS_CANNOT_BE_EMPTY,
+    E_ALIAS_NOT_FOUND,
+    E_ARRAY_ALREADY_EXISTS,
+    E_ARRAY_DOES_NOT_EXIST,
+    E_ARRAY_NOT_EVEN_NUMBER_OF_VALUES,
+    E_BAD_DELIMITER,
+    E_BAD_REGULAR_EXPRESSION,
+    E_ERROR_CALLING_PLUGIN_ROUTINE,
+    E_IMPORTED_WITH_DUPLICATES,
+    E_KEY_DOES_NOT_EXIST,
+    E_NO_SUCH_COMMAND,
+    E_NO_SUCH_PLUGIN,
+    E_NO_SUCH_ROUTINE,
+    E_OK,
+    E_OPTION_OUT_OF_RANGE,
+    E_PLUGIN_CANNOT_SET_OPTION,
+    E_PLUGIN_DISABLED,
+    E_SET_REPLACING_EXISTING_VALUE,
+    E_TIME_INVALID,
+    E_TIMER_ALREADY_EXISTS,
+    E_TIMER_NOT_FOUND,
+    E_TRIGGER_ALREADY_EXISTS,
+    E_TRIGGER_CANNOT_BE_EMPTY,
+    E_TRIGGER_NOT_FOUND,
+    E_UNKNOWN_OPTION,
+    ERROR_CODES,
+    ERROR_DESCRIPTIONS,
+    TRIGGER,
+    PackRule,
+    colour_from_name,
+    colour_to_name,
+    evaluate_speedwalk,
+    fill_text,
+    fixup_escape_sequences,
+    get_option,
+    make_regular_expression,
+    option_number,
+    parse_option,
+    rule_info,
+    set_option,
+    sha0_hex,
+    style_runs,
+)
 from genericmud.scripting.sqlite_compat import make_sqlite_bridge
 
-# What MUSHclient replaces in a rule's send text before using it, scripts included: %0-%9,
-# a named capture %<name>, and %% for a literal percent sign.
-_WILDCARD_RE = re.compile(r"%(?:(\d)|<(\w+)>|(%))")
 _SEND_TO_SCRIPT = "12"
 # MUSHclient's send_to codes (its OtherTypes.h eSendTo*): what a trigger, alias, timer or
 # DoAfterSpecial does with its text. The others (1 command window, 3 status line, 4, 5 and 7
@@ -47,14 +97,42 @@ _SEND_TO_SCRIPT = "12"
 # is dropped. It used to go to the MUD as if the player had typed it, Lua source included.
 _SEND_TO_WORLD_CODE = 0
 # world, command queue, immediate
-_SEND_TO_WORLD_CODES = frozenset({_SEND_TO_WORLD_CODE, 8, 13})
+_SEND_TO_QUEUE_CODE = 8
+_SEND_TO_WORLD_CODES = frozenset({_SEND_TO_WORLD_CODE, _SEND_TO_QUEUE_CODE, 13})
 _SEND_TO_OUTPUT_CODE = 2
 _SEND_TO_VARIABLE_CODE = 9
 _SEND_TO_EXECUTE_CODE = 10
 _SEND_TO_SPEEDWALK_CODE = 11
 _SEND_TO_SCRIPT_CODES = frozenset({12, 14})  # script, and script after omitting the line
-_DEFAULT_TRIGGER_SEQUENCE = "100"
+_SEND_TO_LAST_CODE = 14
+# Lua's sendto table: every destination by MUSHclient's name for it.
+_SEND_TO_NAMES = {
+    "world": 0, "command": 1, "output": 2, "status": 3, "notepad": 4, "notepadappend": 5,
+    "logfile": 6, "notepadreplace": 7, "commandqueue": 8, "variable": 9, "execute": 10,
+    "speedwalk": 11, "script": 12, "immediate": 13, "scriptafteromit": 14,
+}
+_DEFAULT_SEQUENCE = 100
+_MAX_SEQUENCE = 10000
+_FILLED_IN = re.compile(r"%[0-9<%NnCc]")  # what a match fills into send text
 _NO_SOUND = "(No sound)"  # what MUSHclient writes in a trigger's sound attribute when it has none
+# Rule options packs can read back that genericMud keeps but doesn't act on.
+_KEPT_FLAGS = {
+    TRIGGER: ("multi_line", "repeat", "sound_if_inactive"),
+    ALIAS: ("menu", "echo_alias", "omit_from_command_history"),
+}
+_KEPT_NUMBERS = {
+    TRIGGER: (
+        "clipboard_arg", "colour_change_type", "custom_colour", "lines_to_match",
+        "match_style", "new_style",
+    ),
+    ALIAS: (),
+}
+# What ImportXML's text has to start with to be imported at all (MUSHclient's own list).
+_IMPORT_STARTS = (
+    "<?xml", "<!--", "<!doctype", "<muclient", "<world", "<triggers", "<aliases", "<timers",
+    "<macros", "<variables", "<colours", "<keypad", "<printing", "<comment", "<include",
+    "<plugin", "<script",
+)
 # A repeating timer can't fire faster than this, so a zero or tiny interval from a pack can't
 # turn into a busy loop on the event loop every session shares.
 _MIN_TIMER_INTERVAL = 0.1
@@ -145,6 +223,58 @@ def _lua_true(value: object) -> bool:
     return value is not None and value is not False
 
 
+def _lua_flag(value: object, default: bool = True) -> bool:
+    """A yes/no argument the way MUSHclient reads one from Lua: a boolean as itself, a number
+    as true unless 0, and nil as the default (EnableTrigger(name) switches it on)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    number = _to_float(value)
+    return number != 0 if number is not None else default
+
+
+def _lua_bytes(value: object) -> bytes:
+    """A Lua string's bytes: lupa hands over text it could read as UTF-8, bytes otherwise."""
+    if isinstance(value, bytes):
+        return value
+    return _dialog_text(value).encode("utf-8")
+
+
+def _table_bytes(table: object) -> bytes:
+    """The bytes of a Lua string that came over as a table of byte values."""
+    return bytes(bytearray(int(table[index]) for index in range(1, len(table) + 1)))
+
+
+def _base64_encode(data: bytes, lines: object = False) -> str:
+    """MUSHclient's Base64Encode, with CR LF after every 76 characters when asked."""
+    encoded = base64.b64encode(data).decode("ascii")
+    if not _lua_true(lines):
+        return encoded
+    return "\r\n".join(encoded[index:index + 76] for index in range(0, len(encoded), 76))
+
+
+def _base64_decode(value: object) -> bytes | None:
+    try:
+        return base64.b64decode(b"".join(_lua_bytes(value).split()), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _edit_distance(first: str, second: str) -> int:
+    """The Levenshtein distance: how many single-character edits turn one into the other."""
+    previous = list(range(len(second) + 1))
+    for row, left in enumerate(first, 1):
+        current = [row]
+        for column, right in enumerate(second, 1):
+            current.append(min(
+                previous[column] + 1, current[column - 1] + 1,
+                previous[column - 1] + (left != right),
+            ))
+        previous = current
+    return previous[-1]
+
+
 def _dialog_text(value: object, default: str = "") -> str:
     """A dialog argument as text: nil is the default, 5.0 is "5", and CR LF a line break."""
     if value is None:
@@ -165,6 +295,7 @@ def _sorted_choices(choices: object) -> tuple[list[object], list[str]]:
     )
     return [key for key, _caption in pairs], [caption for _key, caption in pairs]
 _MUSHCLIENT_VERSION = "5.06"
+_CLIENT_STARTED = time.time()  # GetInfo(305): near enough when genericMud started
 
 # MUSHclient's AddTrigger/AddTriggerEx flag bits (exposed to packs as `trigger_flag`).
 _TRIGGER_FLAGS = {
@@ -191,6 +322,32 @@ _TIMER_FLAGS = {
     "Replace": 1024,
     "Temporary": 16384,
 }
+# MUSHclient's AddAlias flag bits (exposed to packs as `alias_flag`).
+_ALIAS_FLAGS = {
+    "Enabled": 1,
+    "KeepEvaluating": 8,
+    "IgnoreAliasCase": 32,
+    "OmitFromLogFile": 64,
+    "RegularExpression": 128,
+    "ExpandVariables": 512,
+    "Replace": 1024,
+    "AliasSpeedWalk": 2048,
+    "AliasQueue": 4096,
+    "AliasMenu": 8192,
+    "Temporary": 16384,
+    "OneShot": 32768,
+}
+# Get/SetTimerOption names, from MUSHclient's timer option table.
+_TIMER_TEXT_OPTIONS = ("group", "script", "send", "variable")
+_TIMER_FLAG_OPTIONS = (
+    "enabled", "at_time", "one_shot", "omit_from_output", "omit_from_log", "active_closed",
+    "temporary",
+)
+_TIMER_NUMBER_OPTIONS = {
+    "hour": (0, 23), "minute": (0, 59), "second": (0, 59.9999), "offset_hour": (0, 23),
+    "offset_minute": (0, 59), "offset_second": (0, 59.9999), "send_to": (0, 14),
+    "user": (-(2**31), 2**31 - 1),
+}
 _SCRIPT_ERROR_OK = 0  # MUSHclient eOK; nonzero = failure (packs rarely check)
 _MOD_ORDER = ("ctrl", "alt", "shift")  # canonical combo order, matching the UI's _key_combo
 
@@ -206,6 +363,7 @@ _HOST_PLUGIN_REPLACEMENTS = {
     "mushclient_help.xml": "genericMud provides its own help",
     "mm_gmcp_mapper_gmcp.xml": "genericMud does not load MUSHclient miniwindow mappers",
     "output_functions.xml": "genericMud owns output review windows",
+    "copy_output.xml": "genericMud owns copying from the output window",
     "plugins_updater_v2.xml": "genericMud owns soundpack updates",
     "trace_to_notepad.xml": "genericMud provides diagnostics instead of Notepad tracing",
     "updater.xml": "genericMud owns soundpack updates",
@@ -248,6 +406,12 @@ def _xml_flag(attrs: dict[str, str], name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in _XML_TRUE
+
+
+def _palette_colour(palette: tuple[int, ...], which: object) -> int:
+    """GetNormalColour / GetBoldColour: ANSI colour 1 to 8 (black to white), else 0."""
+    number = int(_to_float(which) or 0)
+    return palette[number - 1] if 1 <= number <= len(palette) else 0
 
 
 def _reduce_ints(args: tuple, op) -> int:
@@ -337,15 +501,18 @@ class MushclientPack:
             "enable_triggers": 1,
         }
         self._alpha_options: dict[str, str] = {}
-        # AddTriggerEx-made rules, by name. One engine rule per name whose callback reads
-        # this state, so a Replace re-registration mutates state instead of stacking a new
-        # engine rule per keypress (Erion re-adds its announce triggers on every F-key).
-        self._dynamic_triggers: dict[str, dict] = {}
-        self._xml_rules: list[dict[str, object]] = []  # enabled state for XML rules/groups
-        self._dyn_counter = 0  # unique engine-rule name per dynamic trigger, so retired ones
+        # Every trigger and alias, however it arrived (a world or plugin file, ImportXML,
+        # AddTriggerEx, AddAlias), by kind then (plugin, label). Each has one engine rule that
+        # goes when the rule does, so replaced and spent rules don't pile up being scanned.
+        self._rules: dict[str, dict[tuple[str, str], PackRule]] = {TRIGGER: {}, ALIAS: {}}
+        self._expanding: set[PackRule] = set()  # triggers whose match has @variables in it
+        self._rule_counter = 0  # engine names and internal labels for rules
         self._unique_number = 0
-        #                        (deleted / one-shot spent / pattern-replaced) get removed from
-        #                        the engine instead of piling up as dead, still-scanned rules
+        self._random = random.Random()  # MtRand's own stream, so MtSrand can't touch others
+        self._note_colours = [ANSI_NORMAL[7], ANSI_NORMAL[0]]  # Get/SetNoteColourFore/Back
+        self._opened_at = time.time()  # GetInfo(306): when this world was opened
+        self._connected_at: float | None = None  # GetInfo(301) and GetConnectDuration
+        self._saving_state = False  # SaveState can't run inside OnPluginSaveState
         # MUSHclient targets Lua 5.1; trusted packs keep the full stdlib their
         # libraries assume (os/io/loadstring + the module(..., package.seeall) idiom).
         self._script_error_spoken = False  # speak the first fire-time script fault, trace the rest
@@ -355,9 +522,18 @@ class MushclientPack:
             self._install_os_compat()
         # Untrusted packs fail closed if the runaway-loop guard can't be installed; a trusted
         # pack is user-vouched arbitrary code, so a missing hook is acceptable there.
+        # The guard's clock leaves out time a script spent waiting on the player's answer to a
+        # dialog, and time genericMud spent doing work the script handed it (ImportXML).
+        self._host_time = 0.0
         self._guard = ScriptGuard(
             install_hook, require_hook=not full_stdlib, report=self._report_error,
-            clock=lambda: time.monotonic() - api.player_time,  # a dialog's wait isn't the script's
+            clock=lambda: time.monotonic() - api.player_time - self._host_time,
+        )
+        # Hands a Python function a Lua string as a table of its byte values (see utils.md5).
+        self._byte_args = self._lua.eval(
+            "function(fn) return function(s, ...) s = tostring(s or '')"
+            " local bytes = {} for i = 1, #s do bytes[i] = string.byte(s, i) end"
+            " return fn(bytes, ...) end end"
         )
         self._install_api()
         # MushReader and the channel_history plugin are often installed globally in
@@ -377,6 +553,22 @@ class MushclientPack:
             "  local parts = {}\n"
             "  for i = 1, #t do parts[i] = string.char(t[i]) end\n"
             "  return fn(option, table.concat(parts))\n"
+            "end"
+        )
+        # The function a rule or timer names. The first part of the name is read raw: every
+        # unknown capitalised global reads as the do-nothing stand-in (set up below), and a
+        # handler isn't one until the pack defines it.
+        self._find_function = self._lua.eval(
+            "function(name)\n"
+            "  local target = nil\n"
+            "  for part in string.gmatch(name, '[^%.]+') do\n"
+            "    if target == nil then target = rawget(_G, part)\n"
+            "    elseif type(target) == 'table' then target = target[part]\n"
+            "    else return nil end\n"
+            "    if target == nil then return nil end\n"
+            "  end\n"
+            "  if type(target) == 'function' then return target end\n"
+            "  return nil\n"
             "end"
         )
         # Hand each plugin our own ppi (its bundled ppi.lua needs package.seeall, which the
@@ -408,8 +600,13 @@ class MushclientPack:
             self._base_dir,
             builtins={
                 "ppi": self._make_ppi(),
+                # The ffi-based BASS wrapper packs ship: Miriani-Next and Toastush under the
+                # Miriani name, Chatpack and the yugioh pack as "audio.bass". It needs
+                # LuaJIT and bass.dll; this plays through genericMud's sound instead.
                 "miriani.lib.audio.bass": bass_bridge,
                 "miriani/lib/audio/bass": bass_bridge,
+                "audio.bass": bass_bridge,
+                "audio/bass": bass_bridge,
                 "json": json_bridge,
                 "lfs": lfs_bridge,
                 "ltn12": ltn12_bridge,
@@ -457,6 +654,10 @@ class MushclientPack:
                 if target is None:
                     return None, "relative file path escapes the soundpack"
                 name = target.as_posix()
+            else:
+                # Packs build Windows paths from GetInfo's folders: Krinnzenn opens its help
+                # pages as GetInfo(66) .. "\docs\...", which only Windows reads as written.
+                name = normalized
             return original_open(name, str(mode or "r"))
 
         self._lua.globals().io.open = open_file
@@ -522,7 +723,9 @@ class MushclientPack:
                 "loop": bool(flags & 4),
             }
             streams.append(state)
-            stream = self._lua.table()
+            stream = self._lua.eval(
+                "setmetatable({}, {__index = function() return function() return 0 end end})"
+            )
 
             def play(*_args: object) -> int:
                 api.play(
@@ -576,8 +779,16 @@ class MushclientPack:
                     state["active"] = False
             return _SCRIPT_ERROR_OK
 
-        bass = self._lua.eval("setmetatable({}, {__call = function(t) return t end})")
+        # Anything of BASS's genericMud doesn't model answers 0, BASS's "fine" and "nothing".
+        bass = self._lua.eval(
+            "setmetatable({}, {__call = function(t) return t end,"
+            " __index = function() return function() return 0 end end})"
+        )
         bass.Init = lambda *_a: _SCRIPT_ERROR_OK
+        # Miriani-Next checks the device before every sound and recovers it on an error.
+        bass.CheckDeviceHealth = lambda *_a: _SCRIPT_ERROR_OK
+        bass.RecoverFromDeviceFailure = lambda *_a: (True, "Recovered")
+        bass.IsInitialized = lambda *_a: True
         bass.Free = free
         bass.GetConfig = lambda *_a: 0
         bass.GetVersion = lambda *_a: 0
@@ -821,10 +1032,16 @@ class MushclientPack:
         return info.get("name", "") if code == 1 else ""
 
     def _enable_plugin(self, plugin_id: object = "", enabled: object = True, *_args: object) -> int:
-        info = self._plugin_info.get(str(plugin_id or ""))
-        if info is None:
-            return 1
-        info["enabled"] = bool(enabled)
+        found = self._find_plugin(plugin_id)
+        if found is None:
+            return E_NO_SUCH_PLUGIN
+        info = self._plugin_info[found]
+        wanted = _lua_flag(enabled)
+        if bool(info.get("enabled", True)) == wanted:
+            return _SCRIPT_ERROR_OK
+        info["enabled"] = wanted
+        # As MUSHclient does, the plugin hears it was switched on or off.
+        self._call_hook(found, "OnPluginEnable" if wanted else "OnPluginDisable")
         return _SCRIPT_ERROR_OK
 
     def _load_plugin_api(self, filename: object = "", *_args: object) -> int:
@@ -832,7 +1049,7 @@ class MushclientPack:
         target = self._resolve_pack_file(name)
         if target is None:
             self._skip_plugin(name, "required plugin is not bundled with the pack")
-            return 1
+            return ERROR_CODES["ePluginFileNotFound"]
         if target in self._loaded_includes:
             return _SCRIPT_ERROR_OK
         self._loaded_includes.add(target)
@@ -845,8 +1062,244 @@ class MushclientPack:
             self._load_path(target)
         except Exception as exc:  # noqa: BLE001 - dependency failure stays local to that plugin
             self._include_errors.append((name, f"{type(exc).__name__}: {exc}"))
-            return 1
+            return ERROR_CODES["eProblemsLoadingPlugin"]
         return _SCRIPT_ERROR_OK
+
+    # --- plugins: their variables, routines, state and lifecycle ---
+
+    def _plugin_enabled(self, plugin_id: str) -> bool:
+        """Whether a plugin is switched on; the world always is. A disabled plugin's
+        triggers, aliases, timers and hooks stay quiet, as in MUSHclient."""
+        info = self._plugin_info.get(plugin_id)
+        return info is None or bool(info.get("enabled", True))
+
+    def _find_plugin(self, plugin_id: object) -> str | None:
+        """A plugin's id from its id or, as MUSHclient also accepts, its name."""
+        key = str(plugin_id or "")
+        if key in self._plugin_info:
+            return key
+        folded = key.casefold()
+        return next(
+            (
+                found for found, info in self._plugin_info.items()
+                if str(info.get("name", "")).casefold() == folded and folded
+            ),
+            None,
+        )
+
+    def _get_plugin_variable(self, plugin_id: object = "", name: object = "", *_args: object):
+        """GetPluginVariable: nil for a plugin that isn't installed or a variable it hasn't
+        set. Every plugin shares one set of variables here, "" naming the world's."""
+        if str(plugin_id or "") and self._find_plugin(plugin_id) is None:
+            return None
+        return self._api.get_var(str(name or ""), None)
+
+    def _get_plugin_variable_list(self, plugin_id: object = "", *_args: object):
+        if str(plugin_id or "") and self._find_plugin(plugin_id) is None:
+            return None
+        return self._lua.table_from(self._api.variables())
+
+    def _plugin_routine(self, plugin_id: str, routine: str):
+        """The function ``routine`` of a plugin: one it exposed, one of its hooks, or a
+        global function of that name."""
+        return (
+            self._exposed.get(plugin_id, {}).get(routine)
+            or self._hooks.get(plugin_id, {}).get(routine)
+            or self._lua_function(routine)
+        )
+
+    def _plugin_supports(self, plugin_id: object = "", routine: object = "", *_args: object) -> int:
+        """PluginSupports: eOK when the plugin has that function (Mush-Z asks before each
+        CallPlugin), else eNoSuchPlugin or eNoSuchRoutine."""
+        found = self._find_plugin(plugin_id)
+        if found is None:
+            return E_NO_SUCH_PLUGIN
+        name = str(routine or "")
+        if not name or self._plugin_routine(found, name) is None:
+            return E_NO_SUCH_ROUTINE
+        return E_OK
+
+    def _call_hook(self, plugin_id: str, name: str, *args: object) -> None:
+        """Run one plugin's own lifecycle hook, as that plugin; a fault is reported, not raised."""
+        fn = self._hooks.get(plugin_id, {}).get(name)
+        if fn is None:
+            return
+        previous = self._current_plugin
+        self._current_plugin = plugin_id
+        try:
+            self._guard.run(fn, *args)
+        finally:
+            self._current_plugin = previous
+
+    def _save_state(self, *_args: object) -> int:
+        """MUSHclient ``SaveState``: the plugin's OnPluginSaveState puts its settings in its
+        variables (Miriani-Next's channel history saves its database there), then genericMud
+        saves the variables. The world isn't a plugin, as MUSHclient answers."""
+        plugin_id = self._current_plugin
+        if plugin_id == "world":
+            return ERROR_CODES["eNotAPlugin"]
+        if self._saving_state:
+            return ERROR_CODES["ePluginCouldNotSaveState"]
+        self._saving_state = True
+        try:
+            self._call_hook(plugin_id, "OnPluginSaveState")
+        finally:
+            self._saving_state = False
+        self._api.save_state()
+        return E_OK
+
+    def _forget_plugin(self, plugin_id: str) -> None:
+        """Drop a plugin's triggers, aliases, timers, hooks and exposed functions."""
+        for kind in (TRIGGER, ALIAS):
+            for (plugin, _label), rule in list(self._rules[kind].items()):
+                if plugin == plugin_id:
+                    self._retire_rule(rule)
+        for key, state in list(self._timers.items()):
+            if key[0] == plugin_id:
+                del self._timers[key]
+                state["generation"] += 1
+        self._hooks.pop(plugin_id, None)
+        self._exposed.pop(plugin_id, None)
+
+    def _reload_plugin(self, plugin_id: object = "", *_args: object) -> int:
+        """MUSHclient ``ReloadPlugin``: load a plugin's file again from scratch and install
+        it. A plugin can't reload itself (Mush-Z does it from a DoAfterSpecial instead)."""
+        found = self._find_plugin(plugin_id)
+        if found is None:
+            return E_NO_SUCH_PLUGIN
+        if found == self._current_plugin:
+            return ERROR_CODES["eBadParameter"]
+        info = self._plugin_info[found]
+        path = info.get("path")
+        if info.get("virtual") or not isinstance(path, Path):
+            return E_OK  # genericMud does that plugin's job; there is nothing to reload
+        self._call_hook(found, "OnPluginClose")
+        self._forget_plugin(found)
+        try:
+            self._load_path(path)
+        except Exception as exc:  # noqa: BLE001 - the plugin stays unloaded, the pack goes on
+            self._include_errors.append((path.name, f"{type(exc).__name__}: {exc}"))
+            return ERROR_CODES["eProblemsLoadingPlugin"]
+        self._call_hook(found, "OnPluginInstall")
+        if self._connected_at is not None:
+            self._call_hook(found, "OnPluginConnect")
+        return E_OK
+
+    def _unload_plugin(self, plugin_id: object = "", *_args: object) -> int:
+        found = self._find_plugin(plugin_id)
+        if found is None:
+            return E_NO_SUCH_PLUGIN
+        if found == self._current_plugin:
+            return ERROR_CODES["eBadParameter"]
+        self._call_hook(found, "OnPluginClose")
+        self._forget_plugin(found)
+        del self._plugin_info[found]
+        return E_OK
+
+    def _replace(
+        self, source: object = "", search: object = "", replacement: object = "",
+        multiple: object = True, *_args: object,
+    ) -> str:
+        """MUSHclient ``Replace``: every match, or only the first when Multiple is false.
+        Chatpack builds its sound file names with it."""
+        text = _dialog_text(source)
+        old = _dialog_text(search)
+        if not old:
+            return text
+        return text.replace(old, _dialog_text(replacement), -1 if _lua_flag(multiple) else 1)
+
+    def _connect_duration(self, *_args: object) -> int:
+        """Seconds connected this time, 0 while disconnected."""
+        if self._connected_at is None:
+            return 0
+        return int(time.time() - self._connected_at)
+
+    def _set_note_colour_fore(self, colour: object = 0, *_args: object) -> None:
+        number = _to_float(colour)
+        if number is not None:
+            self._note_colours[0] = int(number) & 0xFFFFFF
+
+    def _set_note_colour_back(self, colour: object = 0, *_args: object) -> None:
+        number = _to_float(colour)
+        if number is not None:
+            self._note_colours[1] = int(number) & 0xFFFFFF
+
+    # --- reading the output back ---
+
+    def _get_line_info(self, number: object = 0, info_type: object = None, *_args: object):
+        """MUSHclient ``GetLineInfo``: one field of an output line, or all of them as a table
+        when no type is given (Copy_Output reads ``GetLineInfo(n).text``)."""
+        line = self._api.buffered_line(int(_to_float(number) or 0))
+        if line is None:
+            return None
+        runs = style_runs(line.plain_text, line.spans)
+        fields = {
+            "text": line.plain_text,
+            "length": len(line.plain_text),
+            "newline": True,
+            "note": False,
+            "user": False,
+            "log": True,
+            "bookmark": False,
+            "hr": False,
+            "time": int(line.ts),
+            "line": line.seq + 1 if line.seq >= 0 else int(_to_float(number) or 0),
+            "styles": len(runs),
+            "ticks": line.ts,
+            "elapsed": max(0.0, line.ts - self._opened_at),
+        }
+        if info_type is None:
+            return self._lua.table_from(fields)
+        order = (
+            "text", "length", "newline", "note", "user", "log", "bookmark", "hr", "time",
+            "line", "styles", "ticks", "elapsed",
+        )
+        index = int(_to_float(info_type) or 0)
+        return fields[order[index - 1]] if 1 <= index <= len(order) else None
+
+    def _get_style_info(
+        self, number: object = 0, style: object = None, info_type: object = None,
+        *_args: object,
+    ):
+        """MUSHclient ``GetStyleInfo``: one field of one colour run of an output line, every
+        field of a run as a table, or every run when only the line is given."""
+        line = self._api.buffered_line(int(_to_float(number) or 0))
+        if line is None:
+            return None
+        runs = style_runs(line.plain_text, line.spans)
+        column = 1
+        tables = []
+        for run in runs:
+            run = {**run, "column": column}
+            column += int(run["length"])
+            tables.append(run)
+
+        def fields_of(run: dict) -> dict:
+            style = int(run["style"])
+            return {
+                "text": run["text"], "length": run["length"], "column": run["column"],
+                "bold": bool(style & 1), "ul": False, "blink": False, "inverse": False,
+                "changed": False, "textcolour": run["textcolour"],
+                "backcolour": run["backcolour"],
+            }
+
+        if style is None:
+            result = self._lua.table()
+            for index, run in enumerate(tables, 1):
+                result[index] = self._lua.table_from(fields_of(run))
+            return result
+        position = int(_to_float(style) or 0)
+        if not 1 <= position <= len(tables):
+            return None
+        run = tables[position - 1]
+        if info_type is None:
+            return self._lua.table_from(fields_of(run))
+        values = {
+            1: run["text"], 2: run["length"], 3: run["column"], 4: "", 5: "", 6: "", 7: 0,
+            8: bool(int(run["style"]) & 1), 9: False, 10: False, 11: False, 12: False,
+            13: False, 14: run["textcolour"], 15: run["backcolour"],
+        }
+        return values.get(int(_to_float(info_type) or 0))
 
     def _dofile(self, filename: object = "", *_args: object):
         """Pack-confined `dofile`; a missing optional support file is a recorded no-op."""
@@ -867,7 +1320,12 @@ class MushclientPack:
         api = self._api
 
         def set_variable(name: object = "", value: object = "", *_args: object) -> int:
-            api.set_var(str(name), value)
+            if value is None:
+                # MUSHclient raises here; a pack clearing a setting means "no value", and
+                # storing the word "None" would read back as a real one.
+                api.delete_var(str(name))
+            else:
+                api.set_var(str(name), value)
             return _SCRIPT_ERROR_OK
 
         def delete_variable(name: object = "", *_args: object) -> int:
@@ -913,12 +1371,86 @@ class MushclientPack:
             "GetAlphaOptionList": self._get_alpha_option_list,
             "GetGlobalOption": self._get_global_option,
             "GetGlobalOptionList": self._get_global_option_list,
-            # The Array* trio MSDP packs use for state (room name etc.). Real bindings,
+            # The Array* family MSDP packs keep state in (room name etc.). Real bindings,
             # not black-holed: a black-holed ArrayGet returns a table, and concatenating
             # that raises inside the plugin's subnegotiation handler.
             "ArrayCreate": self._array_create,
             "ArraySet": self._array_set,
             "ArrayGet": self._array_get,
+            "ArrayDelete": self._array_delete,
+            "ArrayClear": self._array_clear,
+            "ArrayExists": lambda name="", *_a: str(name) in self._arrays,
+            "ArrayCount": lambda *_a: len(self._arrays),
+            "ArraySize": lambda name="", *_a: len(self._arrays.get(str(name), {})),
+            "ArrayKeyExists": lambda name="", key="", *_a: str(key) in self._arrays.get(
+                str(name), {}
+            ),
+            "ArrayDeleteKey": self._array_delete_key,
+            "ArrayListAll": lambda *_a: self._lua_list(sorted(self._arrays)),
+            "ArrayListKeys": lambda name="", *_a: self._array_listing(name, keys=True),
+            "ArrayListValues": lambda name="", *_a: self._array_listing(name, keys=False),
+            "ArrayGetFirstKey": lambda name="", *_a: self._array_end_key(name, last=False),
+            "ArrayGetLastKey": lambda name="", *_a: self._array_end_key(name, last=True),
+            "ArrayImport": self._array_import,
+            "ArrayExport": lambda name="", delimiter="", *_a: self._array_export(
+                name, delimiter, keys_only=False
+            ),
+            "ArrayExportKeys": lambda name="", delimiter="", *_a: self._array_export(
+                name, delimiter, keys_only=True
+            ),
+            "GetVariableList": lambda *_a: self._lua.table_from(api.variables()),
+            "GetPluginVariable": self._get_plugin_variable,
+            "GetPluginVariableList": self._get_plugin_variable_list,
+            "PluginSupports": self._plugin_supports,
+            "SaveState": self._save_state,
+            "ReloadPlugin": self._reload_plugin,
+            "UnloadPlugin": self._unload_plugin,
+            "Simulate": joined(api.simulate, ""),
+            "Replace": self._replace,
+            "StripANSI": lambda text="", *_a: strip_ansi(str(text or "")),
+            "MakeRegularExpression": lambda text="", *_a: make_regular_expression(
+                str(text or "")
+            ),
+            "FixupEscapeSequences": lambda text="", *_a: fixup_escape_sequences(str(text or "")),
+            "EvaluateSpeedwalk": lambda text="", *_a: evaluate_speedwalk(
+                expand_speedwalk(str(text or ""))
+            ),
+            "ErrorDesc": lambda code=0, *_a: ERROR_DESCRIPTIONS.get(
+                int(_to_float(code) or 0), str(int(_to_float(code) or 0))
+            ),
+            "MtRand": lambda *_a: self._random.random(),
+            "MtSrand": lambda seed=0, *_a: self._random.seed(int(_to_float(seed) or 0)),
+            "GetConnectDuration": self._connect_duration,
+            "GetLinesInBufferCount": lambda *_a: api.line_count(),
+            "GetLineInfo": self._get_line_info,
+            "GetStyleInfo": self._get_style_info,
+            "AnsiNote": lambda text="", *_a: self._note(strip_ansi(str(text or ""))),
+            "Hash": self._byte_args(lambda data, *_a: sha0_hex(_table_bytes(data))),
+            "Base64Encode": self._byte_args(
+                lambda data, lines=False, *_a: _base64_encode(_table_bytes(data), lines)
+            ),
+            "Base64Decode": lambda text="", *_a: _base64_decode(text),
+            "EditDistance": lambda first="", second="", *_a: _edit_distance(
+                _dialog_text(first), _dialog_text(second)
+            ),
+            # MUSHclient windows and settings genericMud has no equivalent of: the status line,
+            # the info bar, its own menu commands, note styling and redrawing. They answer
+            # like MUSHclient so a pack carries on, and do nothing.
+            "SetStatus": lambda *_a: None,
+            "DoCommand": lambda *_a: E_NO_SUCH_COMMAND,
+            "NoteStyle": lambda *_a: None,
+            "GetNoteStyle": lambda *_a: 0,
+            "SetNoteColourFore": self._set_note_colour_fore,
+            "SetNoteColourBack": self._set_note_colour_back,
+            "GetNoteColourFore": lambda *_a: self._note_colours[0],
+            "GetNoteColourBack": lambda *_a: self._note_colours[1],
+            "Repaint": lambda *_a: None,
+            "Redraw": lambda *_a: None,
+            "SetTrace": lambda *_a: None,
+            "Info": lambda *_a: None,
+            "InfoClear": lambda *_a: None,
+            "InfoColour": lambda *_a: None,
+            "InfoBackground": lambda *_a: None,
             # Truly delete: MUSHclient's GetVariable answers nil after a delete, and
             # packs distinguish nil ("use my default") from "" (a saved empty value).
             "DeleteVariable": delete_variable,
@@ -948,18 +1480,59 @@ class MushclientPack:
             "BroadcastPlugin": self._broadcast_plugin,
             "Accelerator": self._accelerator,
             "AcceleratorTo": self._accelerator_to,
+            "AddTrigger": self._add_trigger_api,
             "AddTriggerEx": self._add_trigger_ex,
             "DeleteTrigger": self._delete_trigger,
             "CallPlugin": self._call_plugin,
             "EnableTrigger": self._enable_trigger,
             "EnableTriggerGroup": self._enable_trigger_group,
+            "DeleteTriggerGroup": lambda group="", *_a: self._delete_rule_group(TRIGGER, group),
+            "DeleteTemporaryTriggers": lambda *_a: self._delete_temporary_rules(TRIGGER),
+            "GetTriggerList": lambda *_a: self._rule_list(TRIGGER),
+            "IsTrigger": lambda name="", *_a: self._is_rule(TRIGGER, name),
+            "GetTriggerInfo": lambda name="", number=0, *_a: self._rule_info(
+                TRIGGER, name, number
+            ),
+            "GetTriggerOption": lambda name="", option="", *_a: self._get_rule_option(
+                TRIGGER, name, option
+            ),
+            "SetTriggerOption": lambda name="", option="", value="", *_a: self._set_rule_option(
+                TRIGGER, name, option, value
+            ),
+            "AddAlias": self._add_alias_api,
+            "DeleteAlias": self._delete_alias,
             "EnableAlias": self._enable_alias,
             "EnableAliasGroup": self._enable_alias_group,
+            "DeleteAliasGroup": lambda group="", *_a: self._delete_rule_group(ALIAS, group),
+            "DeleteTemporaryAliases": lambda *_a: self._delete_temporary_rules(ALIAS),
+            "GetAliasList": lambda *_a: self._rule_list(ALIAS),
+            "IsAlias": lambda name="", *_a: self._is_rule(ALIAS, name),
+            "GetAliasInfo": lambda name="", number=0, *_a: self._rule_info(ALIAS, name, number),
+            "GetAliasOption": lambda name="", option="", *_a: self._get_rule_option(
+                ALIAS, name, option
+            ),
+            "SetAliasOption": lambda name="", option="", value="", *_a: self._set_rule_option(
+                ALIAS, name, option, value
+            ),
             "EnableGroup": self._enable_group,
+            "DeleteGroup": self._delete_group,
+            "ImportXML": self._import_xml,
             "AddTimer": self._add_timer_api,
             "EnableTimer": self._enable_timer,
             "DeleteTimer": self._delete_timer,
             "ResetTimer": self._reset_timer,
+            "EnableTimerGroup": self._enable_timer_group,
+            "DeleteTimerGroup": self._delete_timer_group,
+            "DeleteTemporaryTimers": self._delete_temporary_timers,
+            "GetTimerList": self._timer_list,
+            "IsTimer": self._is_timer,
+            "GetTimerInfo": self._timer_info,
+            "GetTimerOption": self._timer_option,
+            "SetTimerOption": self._set_timer_option,
+            "RGBColourToName": lambda colour=None, *_a: colour_to_name(colour),
+            "ColourNameToRGB": lambda name="", *_a: colour_from_name(name),
+            "GetNormalColour": lambda which=0, *_a: _palette_colour(ANSI_NORMAL, which),
+            "GetBoldColour": lambda which=0, *_a: _palette_colour(ANSI_BOLD, which),
             "Hyperlink": lambda *_a: None,
             "GetSoundKeyword": lambda *_a: "",
             "PlaySound": self._play_sound,
@@ -1007,27 +1580,13 @@ class MushclientPack:
         for flag_name, value in _TRIGGER_FLAGS.items():
             trigger_flag[flag_name] = value
         g.trigger_flag = trigger_flag
-        sendto = self._lua.table()
-        sendto.world = 0
-        sendto.execute = 10
-        sendto.script = int(_SEND_TO_SCRIPT)
-        g.sendto = sendto
-        timer_flag = self._lua.table()
-        for flag_name, value in _TIMER_FLAGS.items():
-            timer_flag[flag_name] = value
-        g.timer_flag = timer_flag
-        error_code = self._lua.table()
-        error_code.eOK = _SCRIPT_ERROR_OK
-        error_code.eInvalidObjectLabel = 1
-        error_code.ePluginFileNotFound = 2
-        error_code.eProblemsLoadingPlugin = 3
-        g.error_code = error_code
-        error_desc = self._lua.table()
-        error_desc[_SCRIPT_ERROR_OK] = "No error"
-        error_desc[1] = "Invalid object label"
-        error_desc[2] = "Plugin file not found"
-        error_desc[3] = "Problems loading plugin"
-        g.error_desc = error_desc
+        g.sendto = self._lua.table_from(_SEND_TO_NAMES)
+        g.timer_flag = self._lua.table_from(_TIMER_FLAGS)
+        g.alias_flag = self._lua.table_from(_ALIAS_FLAGS)
+        # MUSHclient's own return codes and their descriptions, so a pack comparing a result
+        # with error_code.eTriggerNotFound, or check.lua reporting error_desc[result], works.
+        g.error_code = self._lua.table_from(ERROR_CODES)
+        g.error_desc = self._lua.table_from(ERROR_DESCRIPTIONS)
         custom_colour = self._lua.table()
         custom_colour.NoChange = -1
         for i in range(1, 17):
@@ -1236,6 +1795,27 @@ class MushclientPack:
         )
         utils.split = split
         utils.readdir = readdir
+        # MUSHclient's hashing and encoding helpers. md5 and sha256 answer the raw digest
+        # (packs pass it to tohex), hash answers SHA-1 in hex, as MUSHclient's do. They take
+        # any bytes, which reach Python as a table of byte values: lupa can't hand over a
+        # Lua string that isn't UTF-8 text, and a digest never is.
+        utils.timer = lambda *_a: time.perf_counter()
+        utils.tohex = self._byte_args(lambda data, *_a: _table_bytes(data).hex().upper())
+        utils.md5 = self._byte_args(
+            lambda data, *_a: hashlib.md5(_table_bytes(data), usedforsecurity=False).digest()
+        )
+        utils.sha256 = self._byte_args(
+            lambda data, *_a: hashlib.sha256(_table_bytes(data)).digest()
+        )
+        utils.hash = self._byte_args(lambda data, *_a: sha0_hex(_table_bytes(data)))
+        utils.base64encode = self._byte_args(
+            lambda data, lines=False, *_a: _base64_encode(_table_bytes(data), lines)
+        )
+        utils.base64decode = lambda value="", *_a: _base64_decode(value)
+        utils.edit_distance = lambda first="", second="", *_a: _edit_distance(
+            _dialog_text(first), _dialog_text(second)
+        )
+        utils.getfontfamilies = lambda *_a: self._lua.table()
         self._install_dialogs(utils)
         self._lua.globals().utils = utils
 
@@ -1386,14 +1966,106 @@ class MushclientPack:
             for command in steps or _command_lines(text):
                 self._api.send(command)
 
-    def _array_create(self, name: object = "") -> None:
-        self._arrays.setdefault(str(name), {})
+    # --- arrays: MUSHclient's named string maps, kept in key order like its std::map ---
 
-    def _array_set(self, name: object = "", key: object = "", value: object = "") -> None:
-        self._arrays.setdefault(str(name), {})[str(key)] = str(value)
+    def _array_create(self, name: object = "", *_args: object) -> int:
+        if str(name) in self._arrays:
+            return E_ARRAY_ALREADY_EXISTS
+        self._arrays[str(name)] = {}
+        return E_OK
 
-    def _array_get(self, name: object = "", key: object = "") -> str | None:
+    def _array_set(
+        self, name: object = "", key: object = "", value: object = "", *_args: object
+    ) -> int:
+        array = self._arrays.get(str(name))
+        if array is None:
+            return E_ARRAY_DOES_NOT_EXIST
+        replacing = str(key) in array
+        array[str(key)] = _dialog_text(value)
+        return E_SET_REPLACING_EXISTING_VALUE if replacing else E_OK
+
+    def _array_get(self, name: object = "", key: object = "", *_args: object) -> str | None:
         return self._arrays.get(str(name), {}).get(str(key))  # nil when absent (MUSHclient)
+
+    def _array_delete(self, name: object = "", *_args: object) -> int:
+        if self._arrays.pop(str(name), None) is None:
+            return E_ARRAY_DOES_NOT_EXIST
+        return E_OK
+
+    def _array_clear(self, name: object = "", *_args: object) -> int:
+        array = self._arrays.get(str(name))
+        if array is None:
+            return E_ARRAY_DOES_NOT_EXIST
+        array.clear()
+        return E_OK
+
+    def _array_delete_key(self, name: object = "", key: object = "", *_args: object) -> int:
+        array = self._arrays.get(str(name))
+        if array is None:
+            return E_ARRAY_DOES_NOT_EXIST
+        if array.pop(str(key), None) is None:
+            return E_KEY_DOES_NOT_EXIST
+        return E_OK
+
+    def _lua_list(self, items: list[str]):
+        """A list as a Lua array, or nil when it's empty (MUSHclient's empty variant)."""
+        return self._lua.table_from(items) if items else None
+
+    def _array_listing(self, name: object, *, keys: bool):
+        array = self._arrays.get(str(name))
+        if array is None:
+            return None
+        ordered = sorted(array)
+        return self._lua_list(ordered if keys else [array[key] for key in ordered])
+
+    def _array_end_key(self, name: object, *, last: bool) -> str | None:
+        array = self._arrays.get(str(name))
+        if not array:
+            return None
+        ordered = sorted(array)
+        return ordered[-1] if last else ordered[0]
+
+    def _array_import(
+        self, name: object = "", values: object = "", delimiter: object = "", *_args: object
+    ) -> int:
+        """ArrayImport: key, value pairs split on a one-character delimiter, which a
+        backslash escapes inside a key or value (and \\\\ is a backslash)."""
+        separator = str(delimiter or "")
+        if len(separator) != 1 or separator == "\\":
+            return E_BAD_DELIMITER
+        array = self._arrays.get(str(name))
+        if array is None:
+            return E_ARRAY_DOES_NOT_EXIST
+        items = _split_escaped(str(values or ""), separator)
+        if len(items) % 2:
+            return E_ARRAY_NOT_EVEN_NUMBER_OF_VALUES
+        duplicates = False
+        for index in range(0, len(items), 2):
+            duplicates = duplicates or items[index] in array
+            array[items[index]] = items[index + 1]
+        return E_IMPORTED_WITH_DUPLICATES if duplicates else E_OK
+
+    def _array_export(self, name: object, delimiter: object, *, keys_only: bool):
+        """ArrayExport(Keys): the array in key order, joined by the delimiter, with the
+        delimiter and backslashes inside keys and values escaped by a backslash."""
+        array = self._arrays.get(str(name))
+        if array is None:
+            return E_ARRAY_DOES_NOT_EXIST
+        if not array:
+            return ""
+        separator = str(delimiter or "")
+        if len(separator) != 1 or separator == "\\":
+            return E_BAD_DELIMITER
+
+        def escape(text: str) -> str:
+            return text.replace("\\", "\\\\").replace(separator, "\\" + separator)
+
+        parts: list[str] = []
+        for key in sorted(array):
+            parts.append(escape(key))
+            if not keys_only:
+                parts.append(escape(array[key]))
+        return separator.join(parts)
 
     def _get_option(self, name: object = "", *_args: object) -> object:
         return self._options.get(str(name), 0)
@@ -1401,6 +2073,8 @@ class MushclientPack:
     def _get_unique_number(self, *_args: object) -> int:
         self._unique_number += 1
         return self._unique_number
+
+    # --- timers ---
 
     def _add_timer_api(
         self,
@@ -1425,63 +2099,55 @@ class MushclientPack:
             send_to = _SEND_TO_SPEEDWALK_CODE
         else:
             send_to = _SEND_TO_WORLD_CODE
-        interval = (
-            (_to_float(hours) or 0.0) * 3600
-            + (_to_float(minutes) or 0.0) * 60
-            + (_to_float(seconds) or 0.0)
-        )
         return self._define_timer(
-            str(name or ""),
-            interval=interval,
-            text=str(response or ""),
-            send_to=send_to,
-            script=str(script_name or ""),
-            enabled=bool(flag_bits & _TIMER_FLAGS["Enabled"]),
-            one_shot=bool(flag_bits & _TIMER_FLAGS["OneShot"]),
-            at_time=bool(flag_bits & _TIMER_FLAGS["AtTime"]),
-            active_closed=bool(flag_bits & _TIMER_FLAGS["ActiveWhenClosed"]),
+            {
+                "name": str(name or "").strip(),
+                "hour": _to_float(hours) or 0.0,
+                "minute": _to_float(minutes) or 0.0,
+                "second": _to_float(seconds) or 0.0,
+                "text": str(response or ""),
+                "send_to": send_to,
+                "script": str(script_name or "").strip(),
+                "enabled": bool(flag_bits & _TIMER_FLAGS["Enabled"]),
+                "one_shot": bool(flag_bits & _TIMER_FLAGS["OneShot"]),
+                "at_time": bool(flag_bits & _TIMER_FLAGS["AtTime"]),
+                "active_closed": bool(flag_bits & _TIMER_FLAGS["ActiveWhenClosed"]),
+                "temporary": bool(flag_bits & _TIMER_FLAGS["Temporary"]),
+            },
             replace=bool(flag_bits & _TIMER_FLAGS["Replace"]),
         )
 
-    def _register_timer(self, element: ET.Element, *, defaults: bool = False) -> None:
-        """An XML <timer> from a world or plugin file, defined like AddTimer."""
+    def _register_timer(self, element: ET.Element, *, defaults: bool = False) -> int:
+        """An XML <timer> from a world or plugin file, or from ImportXML, defined like AddTimer."""
         attrs = element.attrib
         send_element = element.find("send")
-        interval = (
-            (_to_float(attrs.get("hour")) or 0.0) * 3600
-            + (_to_float(attrs.get("minute")) or 0.0) * 60
-            + (_to_float(attrs.get("second")) or 0.0)
-        )
-        self._define_timer(
-            attrs.get("name", ""),
-            interval=interval,
-            text=(send_element.text or "") if send_element is not None else "",
-            send_to=int(_to_float(attrs.get("send_to")) or 0),
-            script=attrs.get("script", ""),
-            enabled=_xml_flag(attrs, "enabled", defaults),
-            one_shot=_xml_flag(attrs, "one_shot"),
-            at_time=_xml_flag(attrs, "at_time"),
-            active_closed=_xml_flag(attrs, "active_closed"),
+        return self._define_timer(
+            {
+                "name": attrs.get("name", "").strip(),
+                "hour": _to_float(attrs.get("hour")) or 0.0,
+                "minute": _to_float(attrs.get("minute")) or 0.0,
+                "second": _to_float(attrs.get("second")) or 0.0,
+                "text": (send_element.text or "") if send_element is not None else "",
+                "send_to": int(_to_float(attrs.get("send_to")) or 0),
+                "script": attrs.get("script", "").strip(),
+                "variable": attrs.get("variable", "").strip(),
+                "group": attrs.get("group", "").strip(),
+                "enabled": _xml_flag(attrs, "enabled", defaults),
+                "one_shot": _xml_flag(attrs, "one_shot"),
+                "at_time": _xml_flag(attrs, "at_time"),
+                "active_closed": _xml_flag(attrs, "active_closed"),
+                "temporary": _xml_flag(attrs, "temporary"),
+                "omit_from_output": _xml_flag(attrs, "omit_from_output"),
+                "omit_from_log": _xml_flag(attrs, "omit_from_log"),
+                "user": int(_to_float(attrs.get("user")) or 0),
+            },
             replace=True,
-            variable=attrs.get("variable", ""),
         )
 
-    def _define_timer(
-        self,
-        name: str,
-        *,
-        interval: float,
-        text: str,
-        send_to: int,
-        script: str,
-        enabled: bool,
-        one_shot: bool,
-        at_time: bool,
-        active_closed: bool,
-        replace: bool,
-        variable: str = "",
-    ) -> int:
-        if at_time:
+    def _define_timer(self, options: dict[str, object], *, replace: bool) -> int:
+        """Add a timer under its lower-case label in the current plugin; MUSHclient's code."""
+        name = str(options["name"])
+        if options.get("at_time"):
             # A timer that fires at a time of day: one place in all the vault's packs uses
             # it. Firing it every N hours instead would be wrong, so it isn't scheduled.
             if self._api.diag is not None:
@@ -1490,93 +2156,251 @@ class MushclientPack:
                     status="skipped", reason="time-of-day timers aren't supported",
                 )
             return _TIMER_ERROR
+        interval = (
+            float(options["hour"]) * 3600 + float(options["minute"]) * 60
+            + float(options["second"])
+        )
         if interval <= 0:
-            return _TIMER_ERROR
-        if name and name in self._timers and not replace:
-            return _TIMER_ERROR  # MUSHclient's eTimerAlreadyExists
-        if not name:
-            name = f"*timer{self._get_unique_number()}"
-        state = {
+            return E_TIME_INVALID
+        label = name.lower()
+        if not label or label.startswith("*"):
+            name, label = "", f"*timer{self._get_unique_number()}"
+        key = (self._current_plugin, label)
+        previous = self._timers.get(key)
+        if previous is not None and not replace:
+            return E_TIMER_ALREADY_EXISTS
+        state: dict[str, object] = {
+            "variable": "", "group": "", "temporary": False, "omit_from_output": False,
+            "omit_from_log": False, "user": 0, "active_closed": False,
+            **options,
+            "name": name,
+            "label": label,
+            "plugin": self._current_plugin,
             "interval": max(interval, _MIN_TIMER_INTERVAL),
-            "text": text,
-            "send_to": send_to,
-            "script": script,
-            "variable": variable,
-            "enabled": enabled,
-            "one_shot": one_shot,
-            "active_closed": active_closed,
             "generation": 0,
+            "invocations": 0,
+            "fired": 0,
+            "last_fired": 0.0,
+            "next_fire": 0.0,
         }
-        self._timers[name] = state  # a replaced timer's pending fire sees it isn't current
-        if enabled:
-            self._schedule_timer(name, state)
-        return _SCRIPT_ERROR_OK
+        if previous is not None:
+            previous["generation"] += 1  # a replaced timer's pending fire sees it isn't current
+        self._timers[key] = state
+        if state["enabled"]:
+            self._schedule_timer(key, state)
+        return E_OK
 
-    def _timer_is_current(self, name: str, state: dict, generation: int) -> bool:
+    def _timer_is_current(self, key: tuple[str, str], state: dict, generation: int) -> bool:
         """Whether a scheduled fire still belongs to a live, enabled, unreset timer."""
         return (
-            self._timers.get(name) is state
+            self._timers.get(key) is state
             and state["generation"] == generation
             and state["enabled"]
         )
 
-    def _schedule_timer(self, name: str, state: dict) -> None:
+    def _schedule_timer(self, key: tuple[str, str], state: dict) -> None:
         generation = state["generation"]
+        state["next_fire"] = time.time() + state["interval"]
 
         def fire() -> None:
-            if not self._timer_is_current(name, state, generation):
+            if not self._timer_is_current(key, state, generation):
                 return  # deleted, replaced, reset or disabled since this was scheduled
             if state["one_shot"]:
-                del self._timers[name]  # before running, so the script can re-add the name
-            if state["active_closed"] or self._api.is_connected():
-                self._run_timer(name, state)
-            if not state["one_shot"] and self._timer_is_current(name, state, generation):
-                self._schedule_timer(name, state)
+                del self._timers[key]  # before running, so the script can re-add the name
+            if (state["active_closed"] or self._api.is_connected()) and self._plugin_enabled(
+                str(state["plugin"])
+            ):
+                self._run_timer(state)
+            if not state["one_shot"] and self._timer_is_current(key, state, generation):
+                self._schedule_timer(key, state)
 
         self._api.add_timer(state["interval"], fire)
 
-    def _run_timer(self, name: str, state: dict) -> None:
-        if state["text"]:
-            self._deliver(state["send_to"], state["text"], variable=state["variable"])
-        script = state["script"]
-        if not script:
-            return
-        # Dotted names reach into tables: wait.lua's timers call "wait.timer_resume".
-        target: object = self._lua.globals()
-        for part in script.split("."):
-            target = target[part]
-            if target is None:
+    def _run_timer(self, state: dict) -> None:
+        state["fired"] += 1
+        state["last_fired"] = time.time()
+        previous = self._current_plugin
+        self._current_plugin = str(state["plugin"])
+        try:
+            if state["text"]:
+                self._deliver(state["send_to"], state["text"], variable=state["variable"])
+            if not state["script"]:
                 return
-        self._guard.run(target, name)
+            handler = self._lua_function(str(state["script"]))
+            if handler is None:
+                return
+            state["invocations"] += 1
+            self._guard.run(handler, state["name"] or state["label"])
+        finally:
+            self._current_plugin = previous
 
-    def _enable_timer(self, name: object = "", enabled: object = True, *_args: object) -> int:
-        state = self._timers.get(str(name or ""))
-        if state is None:
-            return _TIMER_ERROR
-        wanted = bool(_to_float(enabled)) if enabled is not None else True
+    def _find_timer(self, name: object) -> tuple[tuple[str, str], dict] | tuple[None, None]:
+        """The timer a pack names: its own plugin's first, then any plugin's."""
+        label = str(name or "").strip().lower()
+        if not label:
+            return None, None
+        key = (self._current_plugin, label)
+        if key in self._timers:
+            return key, self._timers[key]
+        for other, state in self._timers.items():
+            if other[1] == label:
+                return other, state
+        return None, None
+
+    def _set_timer_enabled(self, key: tuple[str, str], state: dict, wanted: bool) -> None:
         if wanted != state["enabled"]:
             state["enabled"] = wanted
             state["generation"] += 1  # a pending fire from before the change no-ops
             if wanted:
-                self._schedule_timer(str(name), state)
-        return _SCRIPT_ERROR_OK
+                self._schedule_timer(key, state)
+
+    def _enable_timer(self, name: object = "", enabled: object = True, *_args: object) -> int:
+        key, state = self._find_timer(name)
+        if state is None:
+            return E_TIMER_NOT_FOUND
+        self._set_timer_enabled(key, state, _lua_flag(enabled))
+        return E_OK
 
     def _delete_timer(self, name: object = "", *_args: object) -> int:
-        state = self._timers.pop(str(name or ""), None)
+        key, state = self._find_timer(name)
         if state is None:
-            return _TIMER_ERROR
+            return E_TIMER_NOT_FOUND
+        del self._timers[key]
         state["generation"] += 1
-        return _SCRIPT_ERROR_OK
+        return E_OK
 
     def _reset_timer(self, name: object = "", *_args: object) -> int:
         """Start the timer's interval over from now."""
-        state = self._timers.get(str(name or ""))
+        key, state = self._find_timer(name)
         if state is None:
-            return _TIMER_ERROR
+            return E_TIMER_NOT_FOUND
         state["generation"] += 1
         if state["enabled"]:
-            self._schedule_timer(str(name), state)
-        return _SCRIPT_ERROR_OK
+            self._schedule_timer(key, state)
+        return E_OK
+
+    def _timers_in_group(self, group: object) -> list[tuple[tuple[str, str], dict]]:
+        name = str(group or "")
+        if not name:
+            return []
+        timers = [(key, state) for key, state in self._timers.items() if state["group"] == name]
+        own = [(key, state) for key, state in timers if key[0] == self._current_plugin]
+        return own or timers
+
+    def _enable_timer_group(self, group: object = "", enabled: object = True, *_args) -> int:
+        timers = self._timers_in_group(group)
+        for key, state in timers:
+            self._set_timer_enabled(key, state, _lua_flag(enabled))
+        return len(timers)
+
+    def _delete_timer_group(self, group: object = "", *_args: object) -> int:
+        timers = self._timers_in_group(group)
+        for key, state in timers:
+            del self._timers[key]
+            state["generation"] += 1
+        return len(timers)
+
+    def _delete_temporary_timers(self, *_args: object) -> int:
+        timers = [
+            (key, state) for key, state in self._timers.items()
+            if state["temporary"] and key[0] == self._current_plugin
+        ]
+        for key, state in timers:
+            del self._timers[key]
+            state["generation"] += 1
+        return len(timers)
+
+    def _timer_list(self, *_args: object):
+        labels = [label for plugin, label in self._timers if plugin == self._current_plugin]
+        return self._lua.table_from(labels) if labels else None
+
+    def _is_timer(self, name: object = "", *_args: object) -> int:
+        _key, state = self._find_timer(name)
+        return E_OK if state is not None else E_TIMER_NOT_FOUND
+
+    def _timer_info(self, name: object = "", info_type: object = 0, *_args: object):
+        """MUSHclient ``GetTimerInfo``; nil for a timer or number it doesn't have."""
+        _key, state = self._find_timer(name)
+        number = _to_float(info_type)
+        if state is None or number is None:
+            return None
+        hour, minute, second = state["hour"], state["minute"], state["second"]
+        values = {
+            1: int(hour), 2: int(minute), 3: float(second), 4: state["text"],
+            5: state["script"], 6: bool(state["enabled"]), 7: bool(state["one_shot"]),
+            8: False, 9: state["invocations"], 10: state["fired"],
+            11: state["last_fired"] or None, 12: state["next_fire"] or None,
+            13: max(0.0, state["next_fire"] - time.time()) if state["enabled"] else 0.0,
+            14: bool(state["temporary"]),
+            15: state["send_to"] == _SEND_TO_SPEEDWALK_CODE,
+            16: state["send_to"] == _SEND_TO_OUTPUT_CODE,
+            17: bool(state["active_closed"]), 18: False, 19: state["group"],
+            20: state["send_to"], 21: state["user"], 22: state["name"],
+            23: bool(state["omit_from_output"]), 24: bool(state["omit_from_log"]),
+            25: False,
+            26: bool(state["script"]) and self._lua_function(str(state["script"])) is not None,
+        }
+        return values.get(int(number))
+
+    def _timer_option(self, name: object = "", option: object = "", *_args: object):
+        """MUSHclient ``GetTimerOption``: numbers and yes/no as numbers, text as text."""
+        _key, state = self._find_timer(name)
+        if state is None:
+            return None
+        option_name = str(option or "").strip().lower()
+        if option_name in _TIMER_TEXT_OPTIONS:
+            return str(state["text" if option_name == "send" else option_name])
+        if option_name in _TIMER_NUMBER_OPTIONS or option_name in _TIMER_FLAG_OPTIONS:
+            value = state.get(option_name, 0)
+            return value if isinstance(value, float) and not value.is_integer() else int(value)
+        return None
+
+    def _set_timer_option(
+        self, name: object = "", option: object = "", value: object = "", *_args: object
+    ) -> int:
+        """MUSHclient ``SetTimerOption``, with its checks and return codes."""
+        key, state = self._find_timer(name)
+        if state is None:
+            return E_TIMER_NOT_FOUND
+        option_name = str(option or "").strip().lower()
+        text = option_number(value)
+        if option_name in _TIMER_TEXT_OPTIONS:
+            state["text" if option_name == "send" else option_name] = text
+            return E_OK
+        if option_name in _TIMER_FLAG_OPTIONS:
+            if text in ("y", "Y", "n", "N"):
+                text = "1" if text in ("y", "Y") else "0"
+            if not re.fullmatch(r"[+-]?\d+", text.strip()):
+                return E_OPTION_OUT_OF_RANGE
+            wanted = int(text) != 0
+            if option_name == "enabled":
+                self._set_timer_enabled(key, state, wanted)
+            elif option_name == "at_time":
+                return E_OK if not wanted else E_PLUGIN_CANNOT_SET_OPTION
+            else:
+                state[option_name] = wanted
+            return E_OK
+        if option_name not in _TIMER_NUMBER_OPTIONS:
+            return E_UNKNOWN_OPTION
+        number = _to_float(text)
+        low, high = _TIMER_NUMBER_OPTIONS[option_name]
+        if number is None or not low <= number <= high:
+            return E_OPTION_OUT_OF_RANGE
+        value = number if option_name in ("second", "offset_second") else int(number)
+        if option_name not in ("hour", "minute", "second"):
+            state[option_name] = value
+            return E_OK
+        timing = {"hour": state["hour"], "minute": state["minute"], "second": state["second"]}
+        timing[option_name] = value
+        interval = timing["hour"] * 3600 + timing["minute"] * 60 + timing["second"]
+        if interval <= 0:
+            return E_TIME_INVALID
+        state[option_name] = value
+        state["interval"] = max(interval, _MIN_TIMER_INTERVAL)
+        state["generation"] += 1
+        if state["enabled"]:
+            self._schedule_timer(key, state)
+        return E_OK
 
     def _set_option(self, name: object = "", value: object = 0, *_args: object) -> int:
         self._options[str(name)] = value
@@ -1727,12 +2551,20 @@ class MushclientPack:
             # sound category (every future cue) and wouldn't even change the running loop.
             self._api.adjust(_SOUND_CHANNEL, gain=level / _VOLUME_MAX)
 
-    def _get_info(self, code: object = 0) -> str:
-        """Return the file/path/version selectors used by MUSHclient soundpacks."""
+    def _get_info(self, code: object = 0):
+        """MUSHclient ``GetInfo``: folders, names and versions as text, and the yes/no,
+        counter and time codes as Lua booleans and numbers, as MUSHclient answers them.
+
+        A code genericMud has nothing for answers its kind's empty value ("" for text, false,
+        0) rather than raising, and one MUSHclient doesn't have answers nil. Times are Unix
+        seconds, which is what MUSHclient hands Lua for a date.
+        """
         try:
             number = int(code)
         except (TypeError, ValueError):
             return ""
+        if number >= 100:
+            return self._get_info_value(number)
 
         client = self._client_dir
         world_dir = Path(self._world_dir) if self._world_dir else client
@@ -1768,6 +2600,38 @@ class MushclientPack:
             return (client / "MUSHclient_prefs.sqlite").as_posix() if client is not None else ""
         return ""
 
+    def _get_info_value(self, number: int):
+        """GetInfo's yes/no (100s), counter (200s) and date (300s) codes."""
+        connected = self._api.is_connected()
+        flags = {
+            106: not connected,  # not connected
+            107: False,  # connecting
+            113: True,  # this world's window is the active one (it has the player's keys)
+            114: False,  # output paused
+        }
+        if number in flags:
+            return flags[number]
+        if number < 200:
+            return False if number <= 125 else None
+        if number == 232:  # a high-resolution timer, in seconds
+            return time.perf_counter()
+        if number < 300:
+            return 0 if number <= 299 else None
+        dates = {
+            301: self._connected_at,  # when this connection was made (nil if never)
+            304: time.time(),  # now
+            305: _CLIENT_STARTED,  # when the client started
+            306: self._opened_at,  # when this world was opened
+        }
+        if number in dates:
+            value = dates[number]
+            return int(value) if value is not None else None
+        if number in (302, 303):  # last log flush, script file changed: nothing to say
+            return None
+        if number == 310:  # newlines received
+            return 0
+        return None
+
     def _accelerator(self, key: object = "", send: object = "", *_rest: object) -> None:
         """MUSHclient ``Accelerator(key, send)``: bind a hotkey that runs ``send`` as if
         typed. This is how a pack ships its keyboard UI -- Erion binds 54 of these
@@ -1794,158 +2658,650 @@ class MushclientPack:
             return 1
         if int(_to_float(destination) or 0) == int(_SEND_TO_SCRIPT):
             callback = self._compile(command)
-            self._api.add_key(combo, lambda _ctx, fn=callback: self._guard.run(fn))
+            plugin = self._current_plugin
+            self._api.add_key(
+                combo,
+                lambda _ctx, fn=callback: self._in_plugin(plugin, self._guard.run, fn),
+            )
         else:
             self._api.add_key(combo, lambda _ctx, cmd=command: self._api.execute(cmd))
         return _SCRIPT_ERROR_OK
 
-    def _add_trigger_ex(
-        self,
-        name: object = "",
-        match: object = "",
-        response: object = "",
-        flags: object = 0,
-        _colour: object = 0,
-        _wildcard: object = 0,
-        _sound_file: object = "",
-        script_name: object = "",
-        send_to: object = 0,
-        sequence: object = 100,
-        *_rest: object,
-    ) -> int:
-        """MUSHclient ``AddTriggerEx``: register a trigger at runtime.
+    # --- triggers and aliases ---
 
-        Erion's F-key report chain hangs off this: the hotkey alias sends "score hp"
-        and AddTriggerEx's a OneShot+Replace trigger to speak the reply. One engine
-        rule per *name*: a Replace re-registration with the same pattern just rewires
-        the stored state (handler/flags), so hammering F1 doesn't stack a dead rule
-        per press. OneShot deactivates itself on first fire.
+    def _next_rule_number(self) -> int:
+        self._rule_counter += 1
+        return self._rule_counter
+
+    def _rule_from_xml(self, element: ET.Element, kind: str, *, defaults: bool) -> PackRule:
+        """A <trigger> or <alias> read the way MUSHclient's world loader reads it.
+
+        MUSHclient writes a yes/no attribute only when it's yes, so a missing one is no; with
+        the defaults switch on (see _uses_defaults) a missing ``enabled`` is yes instead.
         """
-        flag_bits = int(_to_float(flags) or 0)
-        trigger_name = str(name or "")
-        match_text = str(match or "")
-        if not match_text:
-            return 1  # nonzero = MUSHclient error; packs rarely check
-        regex = bool(flag_bits & _TRIGGER_FLAGS["RegularExpression"])
-        pattern = match_text if regex else mushclient_pattern(match_text)
-        if flag_bits & _TRIGGER_FLAGS["IgnoreCase"]:
-            pattern = "(?i)" + pattern
-        handler = self._lua.globals()[str(script_name)] if str(script_name or "") else None
-        state = {
-            "active": bool(flag_bits & _TRIGGER_FLAGS["Enabled"]),
-            "one_shot": bool(flag_bits & _TRIGGER_FLAGS["OneShot"]),
-            "omit": bool(flag_bits & _TRIGGER_FLAGS["OmitFromOutput"]),
-            "handler": handler,
-            "body": str(response or ""),
-            "send_to": int(_to_float(send_to) or 0),
-            "pattern": pattern,
-            "regex": regex,
-            "name": trigger_name,
-            "retired": False,  # True once its engine rule has been removed (spent/deleted)
-        }
-        previous = self._dynamic_triggers.get(trigger_name) if trigger_name else None
-        same_shape = previous is not None and (previous["pattern"], previous["regex"]) == (
-            pattern, regex
+        attrs = element.attrib
+
+        def number(name: str, default: int, low: int, high: int) -> int:
+            value = _to_float(attrs.get(name))
+            if value is None:
+                return default
+            return max(low, min(high, int(value)))
+
+        send_element = element.find("send")
+        sound = attrs.get("sound", "").strip()
+        rule = PackRule(
+            kind=kind,
+            name=attrs.get("name", "").strip(),
+            plugin=self._current_plugin,
+            match=attrs.get("match", ""),
+            send=(send_element.text or "") if send_element is not None else "",
+            send_to=number("send_to", _SEND_TO_WORLD_CODE, 0, _SEND_TO_LAST_CODE),
+            script=attrs.get("script", "").strip(),
+            sound="" if sound == _NO_SOUND else sound,
+            group=attrs.get("group", "").strip(),
+            variable=attrs.get("variable", "").strip(),
+            enabled=_xml_flag(attrs, "enabled", defaults),
+            regexp=_xml_flag(attrs, "regexp"),
+            ignore_case=_xml_flag(attrs, "ignore_case"),
+            keep_evaluating=_xml_flag(attrs, "keep_evaluating"),
+            omit_from_output=_xml_flag(attrs, "omit_from_output"),
+            omit_from_log=_xml_flag(attrs, "omit_from_log"),
+            expand_variables=_xml_flag(attrs, "expand_variables"),
+            lowercase_wildcard=_xml_flag(attrs, "lowercase_wildcard"),
+            one_shot=_xml_flag(attrs, "one_shot"),
+            temporary=_xml_flag(attrs, "temporary"),
+            sequence=number("sequence", _DEFAULT_SEQUENCE, 0, _MAX_SEQUENCE),
+            user=number("user", 0, -(2**31), 2**31 - 1),
         )
-        if previous is not None and not previous["retired"] and same_shape:
-            previous.update(state)  # same live rule: rewire in place, keep the one engine rule
-            return _SCRIPT_ERROR_OK
-        if previous is not None and not previous["retired"]:
-            # Pattern changed on a still-live rule: retire the callback AND remove its engine
-            # rule, or the dead pattern keeps getting scanned against every line all session.
-            previous["active"] = False
-            previous["retired"] = True
-            self._api.remove_trigger(previous["engine_name"])
-        engine_name = f"mush-dyn-{self._dyn_counter}"
-        self._dyn_counter += 1
-        state["engine_name"] = engine_name
-        if trigger_name:
-            self._dynamic_triggers[trigger_name] = state
+        for option in _KEPT_FLAGS[kind]:  # packs read these back; genericMud doesn't act on them
+            if option in attrs:
+                rule.extra[option] = int(_xml_flag(attrs, option))
+        for option in _KEPT_NUMBERS[kind]:
+            if option in attrs:
+                rule.extra[option] = number(option, 0, -(2**31), 2**31 - 1)
+        if rule.send_to == _SEND_TO_VARIABLE_CODE and not rule.variable:
+            rule.variable = rule.name  # older MUSHclient files send to the rule's own name
+        return rule
+
+    def _compile_fixed_script(self, rule: PackRule) -> None:
+        """Compile a rule's script text now when nothing in it changes from match to match,
+        so a pack's broken rule is reported when the pack loads; raises if it won't compile."""
+        if rule.send_to not in _SEND_TO_SCRIPT_CODES or not rule.send.strip():
+            return
+        text = fixup_escape_sequences(rule.send)
+        if _FILLED_IN.search(text) or (rule.expand_variables and "@" in text):
+            return
+        rule.compiled = self._compile(text)
+        rule.compiled_text = text
+
+    def _add_rule(self, rule: PackRule, *, replace: bool, skip_repeats: bool) -> int | None:
+        """Add a trigger or alias under its label; MUSHclient's return code.
+
+        A pack names its rules in any case, and MUSHclient goes by the lower-case label. One
+        it didn't name gets an internal label ("*trigger12") and, with ``skip_repeats``, is
+        left out when the same unnamed rule already exists (answering None), as MUSHclient
+        does when a file or ImportXML adds it twice. A bad pattern raises; the existing rule
+        of that label stays until the new one has compiled.
+        """
+        if not rule.match:
+            return E_TRIGGER_CANNOT_BE_EMPTY if rule.kind == TRIGGER else E_ALIAS_CANNOT_BE_EMPTY
+        rules = self._rules[rule.kind]
+        label = rule.name.lower()
+        if not label or label.startswith("*"):
+            rule.name = ""
+            if skip_repeats:
+                definition = rule.definition()
+                for (plugin, key), existing in rules.items():
+                    if (
+                        plugin == rule.plugin and key.startswith("*")
+                        and existing.definition() == definition
+                    ):
+                        return None
+            label = f"*{rule.kind}{self._next_rule_number()}"
+        rule.label = label
+        existing = rules.get((rule.plugin, label))
+        if existing is not None and not replace:
+            return E_TRIGGER_ALREADY_EXISTS if rule.kind == TRIGGER else E_ALIAS_ALREADY_EXISTS
+        self._register_rule(rule)
+        if existing is not None:
+            self._retire_rule(existing)
+        rules[(rule.plugin, label)] = rule
+        if rule.script:
+            # Found now when it exists, so a later plugin defining a function of the same name
+            # in the shared script space doesn't take this rule over; otherwise looked for
+            # when the rule fires (Krinnzenn imports its aliases before defining their scripts).
+            rule.handler = self._lua_function(rule.script)
+        return E_OK
+
+    def _register_rule(self, rule: PackRule) -> None:
+        """Give the rule an engine rule compiled from its match as it stands now."""
+        pattern = self._rule_pattern(rule, self._variable_lookup())
+        engine_name = f"mush-{rule.kind}-{self._next_rule_number()}"
+        callback = self._rule_callback(rule)
+        if rule.kind == TRIGGER:
+            # A trigger that doesn't keep evaluating stops only its own plugin's later triggers,
+            # as in MUSHclient, so it can't silence other packs' triggers or the player's.
+            engine_rule = self._api.add_trigger(
+                pattern, callback, regex=True, priority=-rule.sequence, name=engine_name,
+                keep_evaluating=rule.keep_evaluating,
+                stop_scope=f"mushclient:{self._api.source}:{rule.plugin}", tiebreak=rule.match,
+            )
+        else:
+            engine_rule = self._api.add_alias(
+                pattern, callback, regex=True, priority=-rule.sequence, name=engine_name,
+                keep_evaluating=rule.keep_evaluating, tiebreak=rule.match,
+            )
+        engine_rule.enabled = rule.enabled
+        rule.engine_rule, rule.engine_name, rule.pattern = engine_rule, engine_name, pattern
+        if rule.kind == TRIGGER and rule.expand_variables and "@" in rule.match:
+            self._expanding.add(rule)
+        else:
+            self._expanding.discard(rule)
+
+    def _rebuild_rule(self, rule: PackRule) -> None:
+        """Compile the rule afresh after its match or sequence changed; raises on a bad one."""
+        old_engine_rule, old_engine_name = rule.engine_rule, rule.engine_name
+        self._register_rule(rule)
+        if old_engine_rule is not None:
+            self._remove_engine_rule(rule.kind, old_engine_name)
+
+    def _remove_engine_rule(self, kind: str, engine_name: str) -> None:
+        if kind == TRIGGER:
+            self._api.remove_trigger(engine_name)
+        else:
+            self._api.remove_alias(engine_name)
+
+    def _retire_rule(self, rule: PackRule) -> None:
+        """Delete a rule: it stops matching at once and its engine rule goes with it."""
+        rule.deleted = True
+        rule.enabled = False
+        self._expanding.discard(rule)
+        rules = self._rules[rule.kind]
+        if rules.get((rule.plugin, rule.label)) is rule:
+            del rules[(rule.plugin, rule.label)]
+        if rule.engine_rule is not None:
+            self._remove_engine_rule(rule.kind, rule.engine_name)
+            rule.engine_rule = None
+
+    def _rule_pattern(self, rule: PackRule, variables) -> str:
+        """The regular expression a rule matches with, made MUSHclient's way: a trigger that
+        expands variables has them filled in, then a plain match becomes a whole-line one."""
+        text = rule.match
+        if rule.kind == TRIGGER and rule.expand_variables and "@" in text:
+            text = fill_text(text, variables=variables, for_match=True, regexp=rule.regexp)
+        pattern = text if rule.regexp else mushclient_pattern(text)
+        return "(?i)" + pattern if rule.ignore_case else pattern
+
+    def _variable_lookup(self):
+        """Read a variable for @name, the name in any case, as MUSHclient's are."""
+        values = self._api.variables()
+        folded = {name.casefold(): value for name, value in values.items()}
+
+        def lookup(name: str) -> str | None:
+            value = values.get(name)
+            return value if value is not None else folded.get(name.casefold())
+
+        return lookup
+
+    def _refresh_expanding(self) -> None:
+        """Re-fill the @variables in triggers' matches before a line is matched, as MUSHclient
+        does on every line, so a pack changing a variable changes what its triggers catch."""
+        if not self._expanding:
+            return
+        variables = self._variable_lookup()
+        for rule in list(self._expanding):
+            pattern = self._rule_pattern(rule, variables)
+            if pattern == rule.pattern or rule.engine_rule is None:
+                continue
+            try:
+                rule.engine_rule.pattern = compile_pattern(pattern, True)
+            except Exception:  # noqa: BLE001 - a variable can make a bad pattern; keep the last
+                continue
+            rule.pattern = pattern
+
+    def _rule_callback(self, rule: PackRule):
+        """What a matching trigger or alias does, in MUSHclient's order: hide the line if it
+        omits it, play its sound, do what its send_to says with its send text, then call its
+        script function. Its plugin is the current one meanwhile, as in MUSHclient."""
 
         def fire(ctx: MatchContext) -> None:
-            live = self._dynamic_triggers.get(trigger_name, state) if trigger_name else state
-            if live is not state or not live["active"]:
-                return  # replaced by a different rule shape, deleted, or disabled
-            if live["omit"]:
+            if rule.deleted or not rule.enabled or not self._plugin_enabled(rule.plugin):
+                return
+            rule.matched += 1
+            rule.last_matched = time.time()
+            rule.last_text = ctx.line.plain_text
+            if rule.kind == TRIGGER and rule.omit_from_output:
                 ctx.line.gagged = True
                 ctx.line.display_when_gagged = False
-            if live["one_shot"]:
-                live["active"] = False
-                live["retired"] = True
-                # A spent one-shot is dead: drop its engine rule so churny packs (Erion's
-                # "capture the next line" temporaries) don't accumulate dead rules per line.
-                self._api.remove_trigger(live["engine_name"])
-            if live["handler"] is not None:
-                wildcards = self._lua.table_from(ctx.wildcards[1:])
-                self._guard.run(live["handler"], live["name"], ctx.line.plain_text, wildcards)
-            body = live["body"]
-            if body:
-                self._deliver(live["send_to"], _substitute(body, ctx.wildcards, ctx.named))
+            if rule.one_shot:
+                self._retire_rule(rule)  # first, so its script can add the name again
+            previous = self._current_plugin
+            self._current_plugin = rule.plugin
+            try:
+                if rule.sound:
+                    self._api.play(rule.sound)
+                if rule.send:
+                    self._send_rule_text(rule, ctx)
+                if rule.script:
+                    self._run_rule_script(rule, ctx)
+            finally:
+                self._current_plugin = previous
 
-        self._api.add_trigger(
-            pattern, fire, regex=True, priority=-int(_to_float(sequence) or 100),
-            name=engine_name,
+        return fire
+
+    def _send_rule_text(self, rule: PackRule, ctx: MatchContext) -> None:
+        to_script = rule.send_to in _SEND_TO_SCRIPT_CODES
+        text = fixup_escape_sequences(rule.send)
+        text = fill_text(
+            text,
+            variables=self._variable_lookup() if rule.expand_variables and "@" in text else None,
+            wildcards=ctx.wildcards, named=ctx.named, label=rule.name or rule.label,
+            to_script=to_script, lower_wildcards=rule.lowercase_wildcard,
         )
-        return _SCRIPT_ERROR_OK
+        if not to_script:
+            self._deliver(rule.send_to, text, variable=rule.variable)
+            return
+        if rule.kind == TRIGGER:
+            # Scripts reprint lines in their colours from this (Mush-Z's channel triggers).
+            self._lua.globals().TriggerStyleRuns = self._style_table(ctx.line)
+        if rule.compiled_text != text:
+            # Compiled inside the guard, so a syntax error is reported, not raised into
+            # whatever line happened to fire it. Kept while the text stays the same.
+            rule.compiled = self._guard.run(self._compile, text)
+            rule.compiled_text = text if rule.compiled is not None else None
+        if rule.compiled is not None:
+            self._guard.run(rule.compiled)
+
+    def _run_rule_script(self, rule: PackRule, ctx: MatchContext) -> None:
+        if rule.handler is None:
+            rule.handler = self._lua_function(rule.script)
+            if rule.handler is None:
+                return
+        rule.invocations += 1
+        wildcards = self._wildcard_table(ctx)
+        label = rule.name or rule.label
+        if rule.kind == TRIGGER:
+            self._guard.run(
+                rule.handler, label, ctx.line.plain_text, wildcards, self._style_table(ctx.line)
+            )
+        else:
+            self._guard.run(rule.handler, label, ctx.line.plain_text, wildcards)
+
+    def _wildcard_table(self, ctx: MatchContext):
+        """The wildcards a script gets: the whole match at 0, then each capture, and the named
+        captures by name too."""
+        table = self._lua.table()
+        for index, value in enumerate(ctx.wildcards):
+            table[index] = value
+        for name, value in ctx.named.items():
+            table[name] = value
+        return table
+
+    def _style_table(self, line):
+        """The line's colour runs as MUSHclient's scripts get them, never empty."""
+        runs = self._lua.table()
+        for index, run in enumerate(style_runs(line.plain_text, line.spans), 1):
+            runs[index] = self._lua.table_from(run)
+        return runs
+
+    def _lua_function(self, name: str):
+        """The Lua function a rule or timer names, or None while there isn't one.
+
+        Dotted names reach into tables (wait.lua's "wait.timer_resume"). The first part is
+        read raw, so a capitalised name that isn't defined doesn't come back as the
+        do-nothing stand-in every unknown capitalised global reads as.
+        """
+        if not name:
+            return None
+        try:
+            return self._find_function(name)
+        except Exception:  # noqa: BLE001 - a table that errors when read has no function
+            return None
+
+    def _find_rule(self, kind: str, name: object) -> PackRule | None:
+        """The rule a pack names: its own plugin's, as MUSHclient looks, else any plugin's."""
+        label = str(name or "").strip().lower()
+        if not label:
+            return None
+        rules = self._rules[kind]
+        rule = rules.get((self._current_plugin, label))
+        if rule is not None:
+            return rule
+        return next((rule for (_plugin, key), rule in rules.items() if key == label), None)
+
+    def _rules_in_group(self, kind: str, group: object) -> list[PackRule]:
+        """A group's rules in the current plugin, as in MUSHclient; when it has none there,
+        the group's rules in every plugin, which is how genericMud has always done it."""
+        name = str(group or "")
+        if not name:
+            return []
+        rules = [rule for rule in self._rules[kind].values() if rule.group == name]
+        own = [rule for rule in rules if rule.plugin == self._current_plugin]
+        return own or rules
+
+    def _set_rule_enabled(self, rule: PackRule, enabled: bool) -> None:
+        rule.enabled = enabled
+        engine_rule = rule.engine_rule
+        if engine_rule is not None:
+            # Never back on if the engine stopped it for running past its match budget.
+            engine_rule.enabled = enabled and not engine_rule.timed_out
+
+    def _not_found(self, kind: str) -> int:
+        return E_TRIGGER_NOT_FOUND if kind == TRIGGER else E_ALIAS_NOT_FOUND
+
+    def _add_trigger_api(
+        self, name: object = "", match: object = "", response: object = "", flags: object = 0,
+        colour: object = 0, wildcard: object = 0, sound_file: object = "",
+        script_name: object = "", *_rest: object,
+    ) -> int:
+        """MUSHclient ``AddTrigger``: AddTriggerEx sending to the world at sequence 100."""
+        return self._add_trigger_ex(
+            name, match, response, flags, colour, wildcard, sound_file, script_name,
+            _SEND_TO_WORLD_CODE, _DEFAULT_SEQUENCE,
+        )
+
+    def _add_trigger_ex(
+        self, name: object = "", match: object = "", response: object = "", flags: object = 0,
+        colour: object = 0, wildcard: object = 0, sound_file: object = "",
+        script_name: object = "", send_to: object = 0, sequence: object = _DEFAULT_SEQUENCE,
+        *_rest: object,
+    ) -> int:
+        """MUSHclient ``AddTriggerEx``: add a trigger at runtime.
+
+        Erion's F-key report chain hangs off this: the hotkey alias sends "score hp" and adds
+        a OneShot+Replace trigger to speak the reply. A name that's taken is replaced only
+        with the Replace flag, as in MUSHclient.
+        """
+        bits = int(_to_float(flags) or 0)
+        order = _to_float(sequence)
+        rule = PackRule(
+            kind=TRIGGER,
+            name=str(name or "").strip(),
+            plugin=self._current_plugin,
+            match=str(match or ""),
+            send=str(response or ""),
+            send_to=int(_to_float(send_to) or 0),
+            script=str(script_name or "").strip(),
+            sound=str(sound_file or "").strip(),
+            enabled=bool(bits & _TRIGGER_FLAGS["Enabled"]),
+            omit_from_log=bool(bits & _TRIGGER_FLAGS["OmitFromLog"]),
+            omit_from_output=bool(bits & _TRIGGER_FLAGS["OmitFromOutput"]),
+            keep_evaluating=bool(bits & _TRIGGER_FLAGS["KeepEvaluating"]),
+            ignore_case=bool(bits & _TRIGGER_FLAGS["IgnoreCase"]),
+            regexp=bool(bits & _TRIGGER_FLAGS["RegularExpression"]),
+            expand_variables=bool(bits & _TRIGGER_FLAGS["ExpandVariables"]),
+            lowercase_wildcard=bool(bits & _TRIGGER_FLAGS["LowercaseWildcard"]),
+            temporary=bool(bits & _TRIGGER_FLAGS["Temporary"]),
+            one_shot=bool(bits & _TRIGGER_FLAGS["OneShot"]),
+            sequence=int(order) if order is not None else _DEFAULT_SEQUENCE,
+        )
+        rule.extra["custom_colour"] = int(_to_float(colour) or 0)
+        rule.extra["clipboard_arg"] = int(_to_float(wildcard) or 0)
+        try:
+            code = self._add_rule(
+                rule, replace=bool(bits & _TRIGGER_FLAGS["Replace"]), skip_repeats=False
+            )
+        except Exception:  # noqa: BLE001 - the pattern didn't compile
+            return E_BAD_REGULAR_EXPRESSION
+        return E_OK if code is None else code
+
+    def _add_alias_api(
+        self, name: object = "", match: object = "", response: object = "", flags: object = 0,
+        script_name: object = "", *_rest: object,
+    ) -> int:
+        """MUSHclient ``AddAlias`` (Toastush makes its aliases this way)."""
+        bits = int(_to_float(flags) or 0)
+        if bits & _ALIAS_FLAGS["AliasSpeedWalk"]:
+            send_to = _SEND_TO_SPEEDWALK_CODE
+        elif bits & _ALIAS_FLAGS["AliasQueue"]:
+            send_to = _SEND_TO_QUEUE_CODE
+        else:
+            send_to = _SEND_TO_WORLD_CODE
+        rule = PackRule(
+            kind=ALIAS,
+            name=str(name or "").strip(),
+            plugin=self._current_plugin,
+            match=str(match or ""),
+            send=str(response or ""),
+            send_to=send_to,
+            script=str(script_name or "").strip(),
+            enabled=bool(bits & _ALIAS_FLAGS["Enabled"]),
+            keep_evaluating=bool(bits & _ALIAS_FLAGS["KeepEvaluating"]),
+            ignore_case=bool(bits & _ALIAS_FLAGS["IgnoreAliasCase"]),
+            omit_from_log=bool(bits & _ALIAS_FLAGS["OmitFromLogFile"]),
+            regexp=bool(bits & _ALIAS_FLAGS["RegularExpression"]),
+            expand_variables=bool(bits & _ALIAS_FLAGS["ExpandVariables"]),
+            temporary=bool(bits & _ALIAS_FLAGS["Temporary"]),
+            one_shot=bool(bits & _ALIAS_FLAGS["OneShot"]),
+        )
+        rule.extra["menu"] = int(bool(bits & _ALIAS_FLAGS["AliasMenu"]))
+        try:
+            code = self._add_rule(
+                rule, replace=bool(bits & _ALIAS_FLAGS["Replace"]), skip_repeats=False
+            )
+        except Exception:  # noqa: BLE001 - the pattern didn't compile
+            return E_BAD_REGULAR_EXPRESSION
+        return E_OK if code is None else code
+
+    def _delete_rule(self, kind: str, name: object) -> int:
+        rule = self._find_rule(kind, name)
+        if rule is None:
+            return self._not_found(kind)
+        self._retire_rule(rule)
+        return E_OK
 
     def _delete_trigger(self, name: object = "", *_rest: object) -> int:
-        state = self._dynamic_triggers.pop(str(name or ""), None)
-        if state is None:
-            return 1  # unknown (or XML-defined) trigger: MUSHclient errors, packs shrug
-        state["active"] = False
-        state["retired"] = True
-        self._api.remove_trigger(state["engine_name"])  # actually drop it, don't just deactivate
-        return _SCRIPT_ERROR_OK
+        return self._delete_rule(TRIGGER, name)
 
-    def _enable_trigger(self, name: object = "", enabled: object = 1, *_rest: object) -> int:
-        state = self._dynamic_triggers.get(str(name or ""))
-        if state is not None:
-            state["active"] = bool(_to_float(enabled))
-            return _SCRIPT_ERROR_OK
-        changed = self._enable_xml_rules("trigger", str(name or ""), enabled, by_group=False)
-        return _SCRIPT_ERROR_OK if changed else 1
+    def _delete_alias(self, name: object = "", *_rest: object) -> int:
+        return self._delete_rule(ALIAS, name)
 
-    def _enable_xml_rules(
-        self, kind: str | None, token: str, enabled: object, *, by_group: bool
-    ) -> bool:
-        changed = False
-        key = "group" if by_group else "name"
-        for state in self._xml_rules:
-            if (kind is None or state["kind"] == kind) and state[key] == token:
-                state["enabled"] = bool(_to_float(enabled))
-                changed = True
-        return changed
+    def _enable_rule(self, kind: str, name: object, enabled: object) -> int:
+        rule = self._find_rule(kind, name)
+        if rule is None:
+            return self._not_found(kind)
+        self._set_rule_enabled(rule, _lua_flag(enabled))
+        return E_OK
 
-    def _enable_trigger_group(self, group: object = "", enabled: object = 1, *_rest: object) -> int:
-        changed = self._enable_xml_rules(
-            "trigger", str(group or ""), enabled, by_group=True
+    def _enable_trigger(self, name: object = "", enabled: object = True, *_rest: object) -> int:
+        return self._enable_rule(TRIGGER, name, enabled)
+
+    def _enable_alias(self, name: object = "", enabled: object = True, *_rest: object) -> int:
+        return self._enable_rule(ALIAS, name, enabled)
+
+    def _enable_rule_group(self, kind: str, group: object, enabled: object) -> int:
+        """Switch a group's rules on or off; how many there were, as MUSHclient answers."""
+        rules = self._rules_in_group(kind, group)
+        for rule in rules:
+            self._set_rule_enabled(rule, _lua_flag(enabled))
+        return len(rules)
+
+    def _enable_trigger_group(
+        self, group: object = "", enabled: object = True, *_rest: object
+    ) -> int:
+        return self._enable_rule_group(TRIGGER, group, enabled)
+
+    def _enable_alias_group(
+        self, group: object = "", enabled: object = True, *_rest: object
+    ) -> int:
+        return self._enable_rule_group(ALIAS, group, enabled)
+
+    def _enable_group(self, group: object = "", enabled: object = True, *_rest: object) -> int:
+        return (
+            self._enable_rule_group(TRIGGER, group, enabled)
+            + self._enable_rule_group(ALIAS, group, enabled)
+            + self._enable_timer_group(group, enabled)
         )
-        return _SCRIPT_ERROR_OK if changed else 1
 
-    def _enable_alias(self, name: object = "", enabled: object = 1, *_rest: object) -> int:
-        changed = self._enable_xml_rules("alias", str(name or ""), enabled, by_group=False)
-        return _SCRIPT_ERROR_OK if changed else 1
+    def _delete_rule_group(self, kind: str, group: object) -> int:
+        rules = self._rules_in_group(kind, group)
+        for rule in rules:
+            self._retire_rule(rule)
+        return len(rules)
 
-    def _enable_alias_group(self, group: object = "", enabled: object = 1, *_rest: object) -> int:
-        changed = self._enable_xml_rules("alias", str(group or ""), enabled, by_group=True)
-        return _SCRIPT_ERROR_OK if changed else 1
+    def _delete_group(self, group: object = "", *_rest: object) -> int:
+        return (
+            self._delete_rule_group(TRIGGER, group)
+            + self._delete_rule_group(ALIAS, group)
+            + self._delete_timer_group(group)
+        )
 
-    def _enable_group(self, group: object = "", enabled: object = 1, *_rest: object) -> int:
-        changed = self._enable_xml_rules(None, str(group or ""), enabled, by_group=True)
-        return _SCRIPT_ERROR_OK if changed else 1
+    def _delete_temporary_rules(self, kind: str) -> int:
+        rules = [
+            rule for rule in self._rules[kind].values()
+            if rule.temporary and rule.plugin == self._current_plugin
+        ]
+        for rule in rules:
+            self._retire_rule(rule)
+        return len(rules)
 
-    def _call_plugin(self, plugin_id: object = "", func: object = "", *args: object) -> int:
-        """MUSHclient ``CallPlugin``: invoke another plugin's exposed function.
+    def _rule_list(self, kind: str):
+        """Get(Trigger|Alias)List: the current plugin's labels, nil when it has none."""
+        labels = [label for plugin, label in self._rules[kind] if plugin == self._current_plugin]
+        return self._lua.table_from(labels) if labels else None
 
-        Resolved against the ppi Expose registry (the only cross-plugin surface we
-        keep). An unknown target no-ops with a nonzero code -- Erion only CallPlugins
-        its cosmetic messages-window plugin, which may not be loaded at all.
+    def _is_rule(self, kind: str, name: object) -> int:
+        return E_OK if self._find_rule(kind, name) is not None else self._not_found(kind)
+
+    def _rule_info(self, kind: str, name: object, info_type: object):
+        rule = self._find_rule(kind, name)
+        number = _to_float(info_type)
+        if rule is None or number is None:
+            return None
+        script_valid = bool(rule.script) and (
+            rule.handler is not None or self._lua_function(rule.script) is not None
+        )
+        return rule_info(rule, int(number), script_valid=script_valid)
+
+    def _get_rule_option(self, kind: str, name: object, option: object):
+        rule = self._find_rule(kind, name)
+        if rule is None:
+            return None
+        return get_option(rule, str(option or ""))
+
+    def _set_rule_option(self, kind: str, name: object, option: object, value: object) -> int:
+        """Set(Trigger|Alias)Option, with MUSHclient's checks and return codes."""
+        rule = self._find_rule(kind, name)
+        if rule is None:
+            return self._not_found(kind)
+        option_name = str(option or "").strip().lower()
+        code, parsed = parse_option(kind, option_name, value)
+        if code != E_OK:
+            return code
+        if option_name in ("match", "sequence", "expand_variables"):
+            if option_name == "match" and not parsed:
+                return E_TRIGGER_CANNOT_BE_EMPTY if kind == TRIGGER else E_ALIAS_CANNOT_BE_EMPTY
+            previous = getattr(rule, option_name)
+            setattr(rule, option_name, parsed)
+            try:
+                self._rebuild_rule(rule)
+            except Exception:  # noqa: BLE001 - the new pattern didn't compile; keep the old one
+                setattr(rule, option_name, previous)
+                return E_BAD_REGULAR_EXPRESSION
+            return E_OK
+        set_option(rule, option_name, parsed)
+        if option_name == "enabled":
+            self._set_rule_enabled(rule, bool(parsed))
+        elif option_name == "keep_evaluating" and rule.engine_rule is not None:
+            rule.engine_rule.keep_evaluating = bool(parsed)
+        elif option_name == "script":
+            rule.handler = self._lua_function(rule.script)
+        elif option_name in ("send", "send_to"):
+            rule.compiled, rule.compiled_text = None, None
+        return E_OK
+
+    def _import_xml(self, xml: object = "", *_rest: object) -> int:
+        """MUSHclient ``ImportXML``: add the triggers, aliases, timers and variables in an XML
+        fragment, replacing any of the same name. Mush-Z brings in its 857 sound triggers this
+        way. Answers how many were added, -1 if it isn't XML and -2 if it doesn't parse."""
+        started = time.monotonic()
+        try:
+            return self._import_xml_text(str(xml or ""))
+        finally:
+            # Mush-Z imports 857 triggers in one call, which takes seconds on a slow machine:
+            # the module that asked mustn't run out of script time because of it.
+            self._host_time += time.monotonic() - started
+
+    def _import_xml_text(self, text: str) -> int:
+        start = text.lstrip()[:12].lower()
+        if not start.startswith(_IMPORT_STARTS):
+            return -1
+        text = re.sub(r"<\?xml[^>]*\?>", "", text)
+        if "<muclient" not in text.lower():
+            text = f"<muclient>{text}</muclient>"
+        try:
+            root = ET.fromstring(_sanitize_attr_markup(text))
+        except ET.ParseError as error:
+            # MUSHclient shows the parse error in a window; here it goes with the pack's other
+            # load problems, named by the file that called ImportXML.
+            where = self._current_document.name if self._current_document else "ImportXML"
+            self._rule_errors.append((f"ImportXML in {where}", f"ParseError: {error}"))
+            return -2
+        count = 0
+        for kind, group_tag in ((TRIGGER, "triggers"), (ALIAS, "aliases")):
+            for container in root.iter(group_tag):
+                for element in container.iter(kind):
+                    defaults = _xml_flag(
+                        element.attrib, "defaults", _xml_flag(container.attrib, "defaults")
+                    )
+                    try:
+                        rule = self._rule_from_xml(element, kind, defaults=defaults)
+                        self._compile_fixed_script(rule)
+                        code = self._add_rule(rule, replace=True, skip_repeats=True)
+                    except Exception as exc:  # noqa: BLE001 - one bad rule is not the import
+                        label = element.get("name") or element.get("match") or "(unnamed)"
+                        self._rule_errors.append((label, f"{type(exc).__name__}: {exc}"))
+                        continue
+                    if code == E_OK:
+                        count += 1
+        for container in root.iter("timers"):
+            for element in container.iter("timer"):
+                defaults = _xml_flag(
+                    element.attrib, "defaults", _xml_flag(container.attrib, "defaults")
+                )
+                if self._register_timer(element, defaults=defaults) == E_OK:
+                    count += 1
+        for container in root.iter("variables"):
+            for element in container.iter("variable"):
+                name = element.get("name", "").strip()
+                if name:
+                    self._api.set_var(name, element.text or "")
+                    count += 1
+        return count
+
+    def _call_plugin(self, plugin_id: object = "", func: object = "", *args: object):
+        """MUSHclient ``CallPlugin``: run a function of another plugin, as that plugin.
+
+        Answers eOK and then whatever the function returned (Mush-Z's PluginFunction reads
+        ``rc, a = CallPlugin(...)``), or an error code and why. The function is the one the
+        plugin exposed through ppi, one of its OnPlugin hooks, or a global of that name.
+        Erion only CallPlugins its cosmetic messages-window plugin, which may not be loaded.
         """
-        fn = self._exposed.get(str(plugin_id or ""), {}).get(str(func or ""))
+        target = str(plugin_id or "")
+        routine = str(func or "")
+        if not routine:
+            return E_NO_SUCH_ROUTINE, "No function name supplied"
+        info = self._plugin_info.get(target)
+        if info is None:
+            return E_NO_SUCH_PLUGIN, f"Plugin ID ({target}) is not installed"
+        name = str(info.get("name", ""))
+        if not info.get("enabled", True):
+            return E_PLUGIN_DISABLED, f"Plugin '{name}' ({target}) disabled"
+        fn = self._plugin_routine(target, routine)
         if fn is None:
-            return 1
-        self._guard.run(fn, *args)
-        return _SCRIPT_ERROR_OK
+            return E_NO_SUCH_ROUTINE, f"No function '{routine}' in plugin '{name}' ({target})"
+        previous = self._current_plugin
+        self._current_plugin = target
+        try:
+            results = self._guard.run_strict(fn, *args)
+        except Exception as error:  # noqa: BLE001 - reported, and the caller gets the reason
+            self._report_error(error)
+            return E_ERROR_CALLING_PLUGIN_ROUTINE, f"{type(error).__name__}: {error}"
+        finally:
+            self._current_plugin = previous
+        if isinstance(results, tuple):
+            return (E_OK, *results)
+        return E_OK, results
 
     def _do_after_special(
         self, seconds: object = 0, text: object = "", _sendto: object = _SEND_TO_SCRIPT,
@@ -1972,12 +3328,23 @@ class MushclientPack:
     def _do_after_as(self, seconds: object, text: object, send_to: int) -> int:
         delay = _to_float(seconds)
         if delay is None or delay < 0:
-            return _TIMER_ERROR
+            return E_TIME_INVALID
         content = str(text or "")
+        plugin = self._current_plugin
         # Compiled when it fires, inside the guard (see _deliver), so a syntax error in the
         # deferred text is reported then instead of raising into the script that queued it.
-        self._api.add_timer(delay, lambda: self._deliver(send_to, content))
-        return _SCRIPT_ERROR_OK
+        self._api.add_timer(delay, lambda: self._in_plugin(plugin, self._deliver, send_to, content))
+        return E_OK
+
+    def _in_plugin(self, plugin: str, action, *args: object) -> None:
+        """Run ``action`` as the plugin that set it up, the way MUSHclient runs a plugin's
+        timers and hotkeys: GetPluginID, GetTriggerList and the like then answer for it."""
+        previous = self._current_plugin
+        self._current_plugin = plugin
+        try:
+            action(*args)
+        finally:
+            self._current_plugin = previous
 
     def _compile(self, code: str):
         """Host-side compile of a Lua chunk into a zero-arg callable."""
@@ -2144,6 +3511,7 @@ class MushclientPack:
                 "name": name,
                 "path": path,
                 "enabled": True,
+                "virtual": True,  # genericMud does its job; nothing of it is loaded
             }
         if path.name.casefold() in _SPEECH_PLUGINS:
             self._install_speech_commands()
@@ -2208,7 +3576,12 @@ class MushclientPack:
         plugins so they share this runtime and can ppi-message each other."""
         plugin = next(root.iter("plugin"), None)
         previous = self._current_plugin
-        plugin_id = (plugin.get("id") if plugin is not None else "") or "world"
+        if plugin is not None:
+            plugin_id = plugin.get("id") or "world"
+        else:
+            # A plain <include> adds to whatever included it, a plugin's included rules to
+            # that plugin; only the world file itself is the world.
+            plugin_id = self._current_plugin if self._plain_include_depth > 0 else "world"
         self._current_plugin = plugin_id
         if plugin is not None and plugin_id != "world":
             plugin_name = plugin.get("name", "")
@@ -2218,6 +3591,9 @@ class MushclientPack:
                 "name": plugin_name,
                 "path": self._current_document,
                 "enabled": True,
+                # MUSHclient saves only these plugins' state when the world closes, and
+                # calls their OnPluginSaveState to do it.
+                "save_state": _xml_flag(plugin.attrib, "save_state"),
             }
         try:
             # Non-plugin includes are Lua/constants fragments and must exist before the
@@ -2243,33 +3619,20 @@ class MushclientPack:
                 except (TypeError, ValueError):
                     pass
             script_filename = world.get("script_filename", "") if world is not None else ""
-            if script_filename:
-                target = self._resolve_pack_file(script_filename)
-                if target is None:
-                    self._skip_plugin(
-                        script_filename, "external world script is not bundled with the pack"
-                    )
-                else:
-                    try:
-                        self._load_path(target)
-                    except Exception as exc:  # noqa: BLE001 - XML rules can still be useful
-                        self._external_script_errors.append(
-                            (script_filename, f"{type(exc).__name__}: {exc}")
-                        )
-            script = "\n".join((el.text or "") for el in root.iter("script"))
-            if script.strip():
-                self._guard.run_strict(self._execute_lua, script)
-            for is_alias, group_tag, tag in (
-                (False, "triggers", "trigger"), (True, "aliases", "alias"),
-            ):
+            # The file's own variables are its starting values (Erion's MSDP plugin ships
+            # thirteen); ones the player's saved session already restored stay as they are.
+            for container in root.iter("variables"):
+                for element in container.iter("variable"):
+                    name = element.get("name", "").strip()
+                    if name and self._api.get_var(name, None) is None:
+                        self._api.set_var(name, element.text or "")
+            # The file's rules exist before its script runs, as in MUSHclient: a script that
+            # switches a trigger group on as it loads finds the group, and one that imports
+            # a rule of the same name replaces the file's.
+            for kind, group_tag in ((TRIGGER, "triggers"), (ALIAS, "aliases")):
                 for container in root.iter(group_tag):
-                    for element in container.iter(tag):
-                        defaults = self._uses_defaults(container, element)
-                        try:
-                            self._register(element, is_alias=is_alias, defaults=defaults)
-                        except Exception as exc:  # noqa: BLE001 - one malformed rule is not the pack
-                            label = element.get("name") or element.get("match") or "(unnamed)"
-                            self._rule_errors.append((label, f"{type(exc).__name__}: {exc}"))
+                    for element in container.iter(kind):
+                        self._load_rule(container, element, kind)
             for container in root.iter("timers"):
                 for element in container.iter("timer"):
                     defaults = self._uses_defaults(container, element)
@@ -2278,6 +3641,12 @@ class MushclientPack:
                     except Exception as exc:  # noqa: BLE001 - one malformed timer is not the pack
                         label = element.get("name") or "(unnamed timer)"
                         self._rule_errors.append((label, f"{type(exc).__name__}: {exc}"))
+            if script_filename:
+                self._load_world_script(script_filename)
+            script = "\n".join((el.text or "") for el in root.iter("script"))
+            if script.strip():
+                self._guard.run_strict(self._execute_lua, script)
+            self._bind_handlers(plugin_id)
             self._capture_hooks()
         finally:
             self._current_plugin = previous
@@ -2289,6 +3658,48 @@ class MushclientPack:
                 self._load_included(name)
             except Exception as exc:  # noqa: BLE001 - a malformed plugin must not sink the pack
                 self._include_errors.append((name, f"{type(exc).__name__}: {exc}"))
+
+    def _load_world_script(self, script_filename: str) -> None:
+        """The world's external script file, which MUSHclient runs after loading the world."""
+        target = self._resolve_pack_file(script_filename)
+        if target is None:
+            self._skip_plugin(script_filename, "external world script is not bundled with the pack")
+            return
+        try:
+            self._load_path(target)
+        except Exception as exc:  # noqa: BLE001 - XML rules can still be useful
+            self._external_script_errors.append(
+                (script_filename, f"{type(exc).__name__}: {exc}")
+            )
+
+    def _bind_handlers(self, plugin_id: str) -> None:
+        """Find the script functions of a plugin's rules once its script has run.
+
+        Every plugin shares one script space here, so a function found now stays this
+        plugin's even when a later plugin defines another of the same name.
+        """
+        for rules in self._rules.values():
+            for (plugin, _label), rule in rules.items():
+                if plugin == plugin_id and rule.script and rule.handler is None:
+                    rule.handler = self._lua_function(rule.script)
+
+    def _load_rule(self, container: ET.Element, element: ET.Element, kind: str) -> None:
+        """One <trigger> or <alias> from a world or plugin file. A bad one is noted and
+        skipped, and so is a second of the same name, as MUSHclient's loader does."""
+        label = element.get("name") or element.get("match") or "(unnamed)"
+        try:
+            rule = self._rule_from_xml(
+                element, kind, defaults=self._uses_defaults(container, element)
+            )
+            self._compile_fixed_script(rule)
+            code = self._add_rule(rule, replace=False, skip_repeats=True)
+        except Exception as exc:  # noqa: BLE001 - one malformed rule is not the pack
+            self._rule_errors.append((label, f"{type(exc).__name__}: {exc}"))
+            return
+        if code in (E_TRIGGER_ALREADY_EXISTS, E_ALIAS_ALREADY_EXISTS):
+            self._rule_errors.append((label, f"another {kind} is already named {rule.name!r}"))
+        elif code in (E_TRIGGER_CANNOT_BE_EMPTY, E_ALIAS_CANNOT_BE_EMPTY):
+            self._rule_errors.append((label, f"the {kind} has nothing to match"))
 
     def _load_included(self, filename: str) -> None:
         target = self._resolve_pack_file(filename)
@@ -2336,7 +3747,7 @@ class MushclientPack:
         # A list-changed hook can load more plugins, mutating _hooks during dispatch.
         for plugin_id, hooks in list(self._hooks.items()):
             fn = hooks.get(name)
-            if fn is None:
+            if fn is None or not self._plugin_enabled(plugin_id):
                 continue
             previous = self._current_plugin
             self._current_plugin = plugin_id
@@ -2367,12 +3778,28 @@ class MushclientPack:
         self.dispatch("OnPluginInstall")
 
     def dispatch_connect(self) -> None:
+        self._connected_at = time.time()
         self.dispatch("OnPluginConnect")
+
+    def dispatch_disconnect(self) -> None:
+        """The connection dropped; packs stop their music and save in OnPluginDisconnect."""
+        self._connected_at = None
+        self.dispatch("OnPluginDisconnect")
+
+    def dispatch_close(self) -> None:
+        """The session is closing: plugins that save their state do it now, through their
+        OnPluginSaveState, as MUSHclient does when a world closes, then every plugin hears
+        OnPluginClose (Miriani-Next fixes up its settings in both)."""
+        for plugin_id, info in list(self._plugin_info.items()):
+            if info.get("save_state") and not info.get("virtual"):
+                self._call_hook(plugin_id, "OnPluginSaveState")
+        self.dispatch("OnPluginClose")
 
     def dispatch_line(self, line: str) -> None:
         # A Tell that nothing finished still reaches the output, ahead of the MUD's line.
         self._flush_tell()
         self.dispatch("OnPluginLineReceived", line)
+        self._refresh_expanding()  # after the hook, which may have changed a variable
 
     def dispatch_gmcp(self, package: str, value: object) -> None:
         """Expose parsed GMCP data and mirror GMCP_handler_NJG's plugin broadcast."""
@@ -2417,105 +3844,13 @@ class MushclientPack:
             return True
         return _xml_flag(element.attrib, "defaults", _xml_flag(container.attrib, "defaults"))
 
-    def _register(self, element: ET.Element, *, is_alias: bool, defaults: bool = False) -> None:
-        attrs = element.attrib
-        pattern = attrs.get("match", "")
-        if not _xml_flag(attrs, "regexp"):
-            pattern = mushclient_pattern(pattern)
-        if _xml_flag(attrs, "ignore_case"):
-            pattern = "(?i)" + pattern  # MUSHclient compiles these with PCRE_CASELESS
-        try:  # a malformed sequence attribute must not abort the whole world load
-            priority = -int(attrs.get("sequence", _DEFAULT_TRIGGER_SEQUENCE))
-        except ValueError:
-            priority = -int(_DEFAULT_TRIGGER_SEQUENCE)
-        keep_default = "n" if is_alias else "y"  # aliases consume by default
-        # Triggers keep evaluating unless told otherwise, which is not MUSHclient's default:
-        # here every pack and the player's own rules share one trigger list, and a pack's
-        # trigger stopping it would silence other packs' triggers and the player's.
-        keep = attrs.get("keep_evaluating", keep_default) == "y"
-        # omit_from_output hides the matched line, and so keeps it from being read out. Packs
-        # lean on it hard (447 of Materia Magica's 803 triggers), often hiding the line and
-        # printing a reworded copy. Applied here rather than as an engine gag so a trigger
-        # the pack has disabled stops hiding lines too.
-        omit = not is_alias and _xml_flag(attrs, "omit_from_output")
-        callback = self._make_callback(element, attrs)
-        state: dict[str, object] = {
-            "kind": "alias" if is_alias else "trigger",
-            "name": attrs.get("name", ""),
-            "group": attrs.get("group", ""),
-            "enabled": _xml_flag(attrs, "enabled", defaults),
-        }
-        self._xml_rules.append(state)
-
-        def gated(ctx: MatchContext) -> None:
-            if state["enabled"]:
-                if omit:
-                    ctx.line.gagged = True
-                    ctx.line.display_when_gagged = False
-                callback(ctx)
-
-        if is_alias:
-            self._api.add_alias(
-                pattern, gated, regex=True, priority=priority, keep_evaluating=keep
-            )
-        else:
-            self._api.add_trigger(
-                pattern, gated, regex=True, priority=priority, keep_evaluating=keep
-            )
-
-    def _make_callback(self, element: ET.Element, attrs: dict[str, str]):
-        """What a fired XML trigger or alias does, in MUSHclient's order: play its sound, do
-        what its send_to says with its send text, then call its named script function."""
-        lua = self._lua
-        name = attrs.get("name", "")
-        sound = attrs.get("sound", "")
-        if sound == _NO_SOUND:
-            sound = ""
-        send_element = element.find("send")
-        body = (send_element.text or "") if send_element is not None else ""
-        send = self._send_action(body, attrs) if body.strip() else None
-        script_name = attrs.get("script")
-        handler = lua.globals()[script_name] if script_name else None
-
-        def fire(ctx: MatchContext) -> None:
-            if sound:
-                self._api.play(sound)
-            if send is not None:
-                send(ctx)
-            if handler is not None:
-                wildcards = lua.table_from(ctx.wildcards[1:])
-                self._guard.run(handler, name, ctx.line.plain_text, wildcards)
-
-        return fire
-
-    def _send_action(self, body: str, attrs: dict[str, str]):
-        send_to = int(_to_float(attrs.get("send_to")) or 0)
-        variable = attrs.get("variable", "")
-        if send_to in _SEND_TO_SCRIPT_CODES and not _WILDCARD_RE.search(body):
-            compiled = self._compile(body)  # no wildcards: compile once at registration
-
-            def run_compiled(_ctx: MatchContext) -> None:
-                self._guard.run(compiled)
-
-            return run_compiled
-
-        def deliver(ctx: MatchContext) -> None:
-            # MUSHclient substitutes %1.. into the text per match before using it, scripts
-            # included: a bare %1 (Repeat_Command's `for i=1,%1`) isn't valid Lua until then.
-            self._deliver(
-                send_to, _substitute(body, ctx.wildcards, ctx.named), variable=variable
-            )
-
-        return deliver
-
 
 _CDATA_RE = re.compile(r"<!\[CDATA\[.*?\]\]>", re.DOTALL)
-_ATTR_VALUE_RE = re.compile(r'="([^"]*)"')
 _BARE_AMP_RE = re.compile(r"&(?!(?:[A-Za-z][\w.-]*|#\d+|#x[0-9A-Fa-f]+);)")
 
 
 def _sanitize_attr_markup(xml: str) -> str:
-    """Escape raw ``<`` and bare ``&`` inside double-quoted attribute values (outside CDATA).
+    """Escape raw ``<`` and bare ``&`` inside quoted attribute values (outside CDATA).
 
     MUSHclient plugins put regexes with named groups in ``match="(?P<name>...)"`` attributes;
     the raw ``<`` is illegal XML and trips ElementTree even though MUSHclient tolerates it.
@@ -2533,37 +3868,89 @@ def _sanitize_attr_markup(xml: str) -> str:
 
 
 def _escape_attr_values(segment: str) -> str:
-    # A few hand-edited packs omit the required whitespace between adjacent attributes
-    # (`send_to="12"sequence="100"`). MUSHclient accepts that; ElementTree does not.
-    segment = re.sub(r'"(?=[A-Za-z_:][\w:.-]*\s*=)', '" ', segment)
+    """Repair the attribute values in each start tag, and leave everything else alone.
 
-    def fix(match: re.Match[str]) -> str:
-        value = _BARE_AMP_RE.sub("&amp;", match.group(1)).replace("<", "&lt;")
-        return f'="{value}"'
+    Only a value that follows ``=`` inside a tag counts. Text between tags is never touched:
+    send text like Mush-Z's ``Execute("history_add all=" .. msg)`` holds an ``="`` too, and
+    reading that as an attribute escaped every tag up to the next quote, which lost the 857
+    triggers of its sound module. Values may be quoted with " or ', with spaces around the
+    ``=`` (Mush-Z writes ``regexp = "y"``).
+    """
+    out: list[str] = []
+    index = 0
+    length = len(segment)
+    while index < length:
+        start = segment.find("<", index)
+        if start < 0:
+            out.append(segment[index:])
+            break
+        out.append(segment[index:start])
+        if start + 1 >= length or not _starts_name(segment[start + 1]):
+            out.append("<")  # an end tag, comment, declaration, or text
+            index = start + 1
+            continue
+        index = _copy_start_tag(segment, start, out)
+    return "".join(out)
 
-    return _ATTR_VALUE_RE.sub(fix, segment)
+
+def _starts_name(character: str) -> bool:
+    return character.isalpha() or character in "_:"
+
+
+def _copy_start_tag(segment: str, start: int, out: list[str]) -> int:
+    """Copy the start tag at ``start`` with its quoted values repaired; where it ended."""
+    out.append("<")
+    position = start + 1
+    length = len(segment)
+    after_equals = False
+    while position < length:
+        character = segment[position]
+        if character == ">":
+            out.append(">")
+            return position + 1
+        if character in "\"'" and after_equals:
+            end = segment.find(character, position + 1)
+            if end < 0:
+                break  # an unclosed value: leave the rest as it is
+            value = segment[position + 1 : end]
+            value = _BARE_AMP_RE.sub("&amp;", value).replace("<", "&lt;")
+            out.append(f"{character}{value}{character}")
+            position = end + 1
+            after_equals = False
+            # A few hand-edited packs leave out the space before the next attribute
+            # (`send_to="12"sequence="100"`). MUSHclient accepts that; ElementTree does not.
+            if position < length and _starts_name(segment[position]):
+                out.append(" ")
+            continue
+        if character == "=":
+            after_equals = True
+        elif not character.isspace():
+            after_equals = False
+        out.append(character)
+        position += 1
+    out.append(segment[position:])
+    return length
+
+
+def _split_escaped(text: str, separator: str) -> list[str]:
+    """Split ArrayImport's text the way MUSHclient does: a backslash before the separator
+    keeps it inside a key or value, and two backslashes are one."""
+    if not text:
+        return []
+    escaped = "\\" + separator
+    placeholder = ""
+    if escaped in text:
+        placeholder = next((chr(code) for code in range(1, 256) if chr(code) not in text), "")
+        if placeholder:
+            text = text.replace(escaped, placeholder)
+    parts = []
+    for part in text.split(separator):
+        part = part.replace("\\\\", "\\")
+        parts.append(part.replace(placeholder, separator) if placeholder else part)
+    return parts
 
 
 def _command_lines(text: str) -> list[str]:
     """The commands in a send body: one per line, blank lines left out."""
     return [line.rstrip("\r") for line in text.split("\n") if line.strip()]
 
-
-def _substitute(
-    text: str, wildcards: list[str], named: dict[str, str] | None = None
-) -> str:
-    """Fill a rule's send text the way MUSHclient does: %1, %<name>, and %% for "%".
-
-    Materia Magica's health trigger sends "sapi interrupt %1%%", which has to say "85%",
-    not "85%%".
-    """
-
-    def replace(match: re.Match[str]) -> str:
-        if match.group(3) is not None:
-            return "%"
-        if match.group(2) is not None:
-            return (named or {}).get(match.group(2), "")
-        index = int(match.group(1))
-        return wildcards[index] if index < len(wildcards) else ""
-
-    return _WILDCARD_RE.sub(replace, text)

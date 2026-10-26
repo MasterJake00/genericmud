@@ -240,6 +240,24 @@ def test_full_stdlib_anchors_relative_io_to_pack(tmp_path, monkeypatch):
     assert not (process_dir / "Config.txt").exists()
 
 
+def test_full_stdlib_opens_windows_style_absolute_paths(tmp_path):
+    # Krinnzenn's help reads GetInfo(66) .. "/docs/x.txt" with every / turned into \.
+    pack_dir = tmp_path / "pack"
+    (pack_dir / "docs").mkdir(parents=True)
+    (pack_dir / "docs" / "index.txt").write_text("the index", encoding="utf-8")
+    sink = RecordingSink()
+    MushclientPack(
+        ScriptApi(AutomationEngine(sink), source="m", base_dir=str(pack_dir)),
+        full_stdlib=True,
+    ).load_source(
+        "<muclient><script><![CDATA["
+        "local path = (GetInfo(66) .. 'docs/index.txt'):gsub('/', '\\\\')\n"
+        "local f = assert(io.open(path, 'r')); Send(f:read('*a')); f:close()"
+        "]]></script></muclient>"
+    )
+    assert sink.sent == ["the index"]
+
+
 def test_send_to_script_substitutes_wildcards():
     # MUSHclient send-to-script (send_to=12) substitutes %1.. into the script text before
     # running it; a bare %1 (Repeat_Command's "for i=1,%1") must not break compilation.
@@ -1678,11 +1696,11 @@ def test_a_rule_with_no_enabled_attribute_starts_disabled():
     # Magica keeps 211 capture-mode rules that way. defaults="y" restores the class defaults.
     sink, engine, _pack = _rules(
         "<triggers>"
-        '<trigger match="spam" send_to="0"><send>off</send></trigger>'
-        '<trigger match="spam" enabled="1" send_to="0"><send>on</send></trigger>'
-        "</triggers>"
-        '<triggers defaults="y"><trigger match="spam" send_to="0"><send>default</send></trigger>'
-        "</triggers>"
+        '<trigger match="spam" keep_evaluating="y" send_to="0"><send>off</send></trigger>'
+        '<trigger match="spam" enabled="1" keep_evaluating="y" send_to="0"><send>on</send>'
+        "</trigger></triggers>"
+        '<triggers defaults="y"><trigger match="spam" keep_evaluating="y" send_to="0">'
+        "<send>default</send></trigger></triggers>"
     )
     engine.process_line(Line("spam"))
     assert sorted(sink.sent) == ["default", "on"]

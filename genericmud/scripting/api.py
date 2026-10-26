@@ -216,6 +216,23 @@ class ScriptApi:
         """The last ``count`` lines of the output window, oldest first."""
         return self._engine.sink.recent_lines(max(0, count))
 
+    def line_count(self) -> int:
+        """How many lines the output window holds."""
+        return self._engine.sink.line_count()
+
+    def buffered_line(self, number: int):
+        """Output line ``number`` (a Line), 1 being the oldest held; None outside that."""
+        return self._engine.sink.buffered_line(number)
+
+    def simulate(self, text: str) -> None:
+        """Take ``text`` as if the MUD had sent it: triggers, the output and speech all get
+        it (MUSHclient's Simulate)."""
+        self._engine.sink.simulate(str(text))
+
+    def save_state(self) -> None:
+        """Save the packs' variables soon, not only when the session closes."""
+        self._engine.sink.save_state()
+
     def is_connected(self) -> bool:
         return self._engine.connected
 
@@ -353,6 +370,10 @@ class ScriptApi:
         if len(str(value)) > _MAX_VAR_VALUE_LEN:
             return  # refuse an oversized value (memory-exhaustion guard)
         self._engine.set_var(name, value)
+
+    def variables(self) -> dict[str, str]:
+        """Every script variable, by name (a copy)."""
+        return self._engine.all_vars()
 
     def delete_var(self, name: str) -> None:
         """Remove a variable entirely (VIPMud #unvar / MUSHclient DeleteVariable):

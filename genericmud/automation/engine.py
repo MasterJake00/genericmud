@@ -66,6 +66,17 @@ class EngineSink:
     def recent_lines(self, count: int) -> list[str]:
         """The last ``count`` lines of the output, oldest first."""
         return []
+    def line_count(self) -> int:
+        """How many lines the output holds."""
+        return 0
+    def buffered_line(self, number: int) -> Line | None:
+        """Output line ``number``, 1 being the oldest still held; None outside that."""
+        return None
+    def simulate(self, text: str) -> None:
+        """Take ``text`` as if the MUD had sent it (MUSHclient's Simulate)."""
+    def save_state(self) -> None:
+        """Save the packs' variables soon (MUSHclient's SaveState); asks close together
+        make one save."""
     def ask(
         self, request: dict, while_waiting: Callable[[], None] | None = None
     ) -> object | None:
@@ -138,6 +149,17 @@ class _Rule:
     keep_evaluating: bool = True
     source: str = ""
     channel: str | None = None
+    # When a trigger with a stop scope stops evaluation, only the later triggers in the same
+    # scope are skipped. MUSHclient stops within one plugin's list, so a pack's trigger can't
+    # silence another pack's or the player's own. Without one, a stop ends the whole line.
+    stop_scope: str | None = None
+    tiebreak: str = ""  # orders rules of equal priority (MUSHclient sorts them by match text)
+    timed_out: bool = False  # switched off because its pattern ran past the match budget
+
+
+def _rule_order(rule: _Rule) -> tuple[int, str]:
+    """Highest priority first; equal priorities by tiebreak, then in the order added."""
+    return -rule.priority, rule.tiebreak
 
 
 def _wildcards(match: re.Match[str]) -> list[str]:
@@ -197,6 +219,8 @@ class AutomationEngine:
         keep_evaluating: bool = True,
         source: str = "",
         channel: str | None = None,
+        stop_scope: str | None = None,
+        tiebreak: str = "",
     ) -> _Rule:
         rule = _Rule(
             compile_pattern(pattern, regex),
@@ -209,9 +233,11 @@ class AutomationEngine:
             keep_evaluating,
             source,
             channel,
+            stop_scope,
+            tiebreak,
         )
         self._triggers.append(rule)
-        self._triggers.sort(key=lambda r: -r.priority)
+        self._triggers.sort(key=_rule_order)
         return rule
 
     def add_alias(
@@ -224,14 +250,15 @@ class AutomationEngine:
         name: str = "",
         keep_evaluating: bool = False,
         source: str = "",
+        tiebreak: str = "",
     ) -> _Rule:
         # process_input anchors every alias at the start; a wildcard alias is anchored at the
         # end too, so it has to be the whole command. Regex aliases keep whatever their
         # author wrote.
         rule = _Rule(compile_pattern(pattern, regex, whole=True), callback, priority, name, True,
-                     source=source, keep_evaluating=keep_evaluating)
+                     source=source, keep_evaluating=keep_evaluating, tiebreak=tiebreak)
         self._aliases.append(rule)
-        self._aliases.sort(key=lambda r: -r.priority)
+        self._aliases.sort(key=_rule_order)
         return rule
 
     def remove_trigger(self, name: str) -> None:
@@ -431,13 +458,15 @@ class AutomationEngine:
             self.current_line = previous
 
     def _run_triggers(self, line: Line) -> Line:
+        stopped: set[str] = set()  # scopes a trigger has stopped evaluating for this line
         for rule in list(self._triggers):
-            if not rule.enabled:
+            if not rule.enabled or rule.stop_scope in stopped:
                 continue
             try:
                 match = rule.pattern.search(line.plain_text, **_MATCH_KWARGS)
             except _MatchTimeout:
                 rule.enabled = False  # a pattern that backtracks past the budget is disabled
+                rule.timed_out = True
                 if self.diag is not None:
                     # A trigger silently disabling itself is a soundpack going quiet -- trace it.
                     self.diag.event("trigger.timeout_disabled", source=rule.source or "?",
@@ -458,7 +487,9 @@ class AutomationEngine:
             if rule.callback is not None:
                 rule.callback(MatchContext(line, _wildcards(match), _named(match), self))
             if not rule.keep_evaluating:
-                break
+                if rule.stop_scope is None:
+                    break
+                stopped.add(rule.stop_scope)
         return line
 
     def process_input(self, text: str) -> list[str]:
@@ -474,6 +505,7 @@ class AutomationEngine:
                 match = rule.pattern.match(text, **_MATCH_KWARGS)
             except _MatchTimeout:
                 rule.enabled = False  # a pattern that backtracks past the budget is disabled
+                rule.timed_out = True
                 if self.diag is not None:
                     self.diag.event("alias.timeout_disabled", source=rule.source or "?",
                                     pattern=rule.pattern.pattern, line=text)

@@ -426,6 +426,9 @@ def test_plugin_tick_chain_dispatches_and_pauses_when_disconnected():
             if name == "OnPluginTick":
                 self.ticks += 1
 
+        def dispatch_close(self):
+            pass
+
     scheduled = []
     voice = VoiceRouter(RecordingBackend(), clock=lambda: 0.0)
     app = EngineApp(voice, keymap=load_keymap("vipmud"),

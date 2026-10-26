@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from genericmud.app import EngineApp
 from genericmud.packs import PackStore
 from genericmud.packs.__main__ import main as packs_main
@@ -236,3 +238,89 @@ def test_a_vipmud_pack_that_keeps_no_files_keeps_its_variables(tmp_path):
     second.on_connect("cogg")
     second.engine.press_key("f10")
     assert second.engine.get_var("vol") == "20"
+
+
+def _install_mush(store, tmp_path, xml: str, world: str = "mud") -> None:
+    src = tmp_path / "pack.xml"
+    src.write_text(xml, encoding="latin-1")
+    store.install(src, world=world, trust=True)
+
+
+def test_a_mushclient_packs_connect_disconnect_and_close_hooks_follow_the_session(tmp_path):
+    # Miriani-Next fixes its settings up in OnPluginSaveState and OnPluginClose, and packs
+    # stop their music in OnPluginDisconnect; genericMud ran none of them.
+    store = PackStore(tmp_path / "store")
+    _install_mush(
+        store, tmp_path,
+        "<muclient><plugin id='hooks' name='hooks' save_state='y'/><script><![CDATA[\n"
+        "function OnPluginConnect() Note('hello') end\n"
+        "function OnPluginDisconnect() Note('goodbye') end\n"
+        "function OnPluginSaveState() SetVariable('volume', '70') end\n"
+        "function OnPluginClose() Note('closing') end\n"
+        "]]></script></muclient>",
+    )
+
+    def session():
+        backend = RecordingBackend()
+        voice = VoiceRouter(backend, clock=lambda: 0.0)
+        return EngineApp(voice, packs=store, name="mud"), backend
+
+    app, backend = session()
+    app.on_connect("mud")
+    assert backend.spoken.count("hello") == 1
+    app.on_connection_status("connection lost; reconnecting in 5s (attempt 1)")
+    app.on_connection_status("connection lost; reconnecting in 10s (attempt 2)")
+    assert backend.spoken.count("goodbye") == 1  # once per drop, not once per attempt
+    app.on_connection_status("reconnected")
+    assert backend.spoken.count("hello") == 2
+    app.shutdown()
+    assert backend.spoken[-2:] == ["goodbye", "closing"]
+    second, _backend = session()
+    second.on_connect("mud")
+    assert second.engine.get_var("volume") == "70"  # saved by its OnPluginSaveState
+
+
+def test_simulate_sends_text_through_triggers_the_output_and_speech(tmp_path):
+    # Mush-Z strips its zchn: channel prefix and simulates the rest, so its other triggers
+    # catch the line as if the MUD had sent it without one.
+    store = PackStore(tmp_path / "store")
+    _install_mush(
+        store, tmp_path,
+        "<muclient><plugin id='sim' name='sim'/><triggers>"
+        "<trigger match='^zchn:(.+)$' regexp='y' enabled='y' omit_from_output='y' "
+        "send_to='14' sequence='200'><send>Simulate(\"%1\\\\r\\\\n\")</send></trigger>"
+        "<trigger match='^You warn the group$' regexp='y' enabled='y' send_to='12'>"
+        "<send>Note('warned')</send></trigger>"
+        "</triggers></muclient>",
+    )
+    app, backend, posted = _app(store)
+    app.on_connect("mud")
+    backend.spoken.clear()
+    app.on_telnet_event(DataReceived(b"zchn:You warn the group\r\n"))
+    assert "You warn the group" in backend.spoken
+    assert "warned" in backend.spoken
+    assert not any("zchn:" in text for text in backend.spoken)
+
+
+def test_a_packs_save_state_writes_its_variables_soon_once_per_burst(tmp_path):
+    store = PackStore(tmp_path / "store")
+    _install_mush(
+        store, tmp_path,
+        "<muclient><plugin id='saver' name='saver' save_state='y'/><script><![CDATA[\n"
+        "function OnPluginSaveState() SetVariable('volume', '70') end\n"
+        "]]></script><aliases><alias match='save' enabled='y' send_to='12'>"
+        "<send>SaveState() SaveState()</send></alias></aliases></muclient>",
+    )
+    scheduled: list[tuple[float, object]] = []
+    app = EngineApp(
+        VoiceRouter(RecordingBackend(), clock=lambda: 0.0), packs=store, name="mud",
+        schedule=lambda delay, callback: scheduled.append((delay, callback)),
+    )
+    app.on_connect("mud")
+    scheduled.clear()
+    app.on_ws_message({"type": "input", "text": "save"})
+    saves = [callback for _delay, callback in scheduled]
+    assert len(saves) == 1  # two asks, one write
+    saves[0]()
+    data = json.loads(app._pack_vars_path().read_text(encoding="utf-8"))
+    assert data["volume"] == "70"

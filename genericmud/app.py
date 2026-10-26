@@ -69,6 +69,8 @@ MAX_ALIAS_DEPTH = 20  # guard against an alias/trigger that re-fires itself fore
 _MAP_SAVE_INTERVAL = 25
 _PLUGIN_TICK_SECONDS = 0.25  # OnPluginTick cadence (MUSHclient ticks faster; see _arm_plugin_ticks)
 _PROMPT_IDLE_FLUSH_SECONDS = 0.25  # emit a newline-less prompt if the server sends no more data
+_MAX_SIMULATE_DEPTH = 8  # Simulate within a simulated line, this many deep at most
+_STATE_SAVE_DELAY_SECONDS = 2.0  # a pack's SaveState is written this soon after it asks
 # A MUD that never sends WONT ECHO after the login password would leave every command going
 # out as a password. Mudlet's answer, copied here: during the first five minutes of a
 # connection, a minute after the last line typed while hidden, stop hiding and say so. Later
@@ -179,7 +181,8 @@ class AppSink(EngineSink):
 
     def __init__(
         self, *, send, post, schedule, voice: VoiceRouter, buffer: Buffer, sound: SoundBus,
-        diag: DiagnosticLog | None = None, send_raw=None, ask=None,
+        diag: DiagnosticLog | None = None, send_raw=None, ask=None, simulate=None,
+        save_state=None,
     ) -> None:
         self._send = send
         self._send_raw = send_raw
@@ -190,6 +193,8 @@ class AppSink(EngineSink):
         self._sound = sound
         self._diag = diag
         self._ask = ask
+        self._simulate = simulate
+        self._save_state = save_state
         self.cues = 0  # play/music calls reaching the bus -- 0 means no cue ever fired
 
     def send(self, text: str) -> None:
@@ -214,6 +219,20 @@ class AppSink(EngineSink):
     def recent_lines(self, count: int) -> list[str]:
         start = max(0, len(self._buffer) - count)
         return [self._buffer[index].plain_text for index in range(start, len(self._buffer))]
+
+    def line_count(self) -> int:
+        return len(self._buffer)
+
+    def buffered_line(self, number: int) -> Line | None:
+        return self._buffer[number - 1] if 1 <= number <= len(self._buffer) else None
+
+    def simulate(self, text: str) -> None:
+        if self._simulate is not None:
+            self._simulate(text)
+
+    def save_state(self) -> None:
+        if self._save_state is not None:
+            self._save_state()
 
     def speak(self, text: str, channel: str = "main", interrupt: bool = False) -> None:
         self._voice.speak(text, channel, interrupt)
@@ -326,6 +345,8 @@ class EngineApp:
             sound=self.sound,
             diag=diag,
             ask=self._ask_player,
+            simulate=self._simulate,
+            save_state=self._request_save,
         )
         # Set by a front end that can show dialogs (the wx window): called with the question
         # and a function to call while it waits. A window-less session's questions are
@@ -383,6 +404,9 @@ class EngineApp:
         self._mush_packs: list[MushclientPack] = []  # loaded MUSHclient packs (hook dispatch)
         self._vip_packs: list[VipMudPack] = []  # loaded VIPMud packs (OnConnect/OnDisconnect)
         self._vip_connected = False  # which of the two the VIPMud packs last heard
+        self._mush_connected = False  # the same for the MUSHclient packs' hooks
+        self._simulate_depth = 0  # Simulate inside a line that was itself simulated
+        self._save_scheduled = False  # a pack's SaveState is waiting to be written
         self._user_script_runtimes: list[user_scripts.LoadedUserScript] = []
         self._user_script_generation = 0
         self._msdp_offered = False  # server sent WILL MSDP (replayed to late-loading packs)
@@ -448,6 +472,7 @@ class EngineApp:
         ]
         self._vip_packs = [pack for pack in result.packs.values() if isinstance(pack, VipMudPack)]
         self._vip_connected = False
+        self._mush_connected = False
         self._announce_activation(result)
         return result
 
@@ -501,12 +526,14 @@ class EngineApp:
         return result
 
     def _vip_connection_changed(self, connected: bool) -> None:
-        """Run the VIPMud packs' OnConnect or OnDisconnect alias, once per change.
+        """Run the VIPMud packs' OnConnect or OnDisconnect alias, once per change, and the
+        MUSHclient packs' connect and disconnect hooks.
 
         The unofficial Prometheus pack loads its settings and switches its sound classes on
         in OnConnect and saves them in OnDisconnect, so without these it stays silent and
         forgets every setting.
         """
+        self._mush_connection_changed(connected)
         if connected == self._vip_connected:
             return
         self._vip_connected = connected
@@ -520,6 +547,53 @@ class EngineApp:
                         error=f"{type(exc).__name__}: {exc}",
                         traceback=traceback.format_exc(),
                     )
+
+    def _mush_connection_changed(self, connected: bool) -> None:
+        """Run the MUSHclient packs' OnPluginDisconnect or OnPluginConnect, once per change.
+
+        Their first connect is announced along with their install hook when the session
+        starts; after that they hear every drop and reconnect, as in MUSHclient.
+        """
+        if connected == self._mush_connected:
+            return
+        self._mush_connected = connected
+        for pack in self._mush_packs:
+            if connected:
+                pack.dispatch_connect()
+            else:
+                pack.dispatch_disconnect()
+
+    def _simulate(self, text: str) -> None:
+        """A pack's Simulate: the text goes through triggers, the output and speech as if
+        the MUD had sent it, a line at a time. A trigger simulating the line it matched would
+        go round forever, so it stops a few deep."""
+        if self._simulate_depth >= _MAX_SIMULATE_DEPTH:
+            if self._diag is not None:
+                self._diag.event("pack.simulate", status="refused", reason="nested too deep")
+            return
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if lines and not lines[-1]:
+            lines.pop()  # the text's own line ending
+        self._simulate_depth += 1
+        try:
+            for line in lines:
+                self._emit_line(line)
+        finally:
+            self._simulate_depth -= 1
+
+    def _request_save(self) -> None:
+        """A pack's SaveState: save the packs' variables shortly. Aardwolf's pack saves on
+        every setting it changes, so asks close together make one write."""
+        if self._save_scheduled or self._closed:
+            return
+        self._save_scheduled = True
+
+        def save() -> None:
+            self._save_scheduled = False
+            if not self._closed:
+                self._persist_pack_vars()
+
+        self._schedule(_STATE_SAVE_DELAY_SECONDS, save)
 
     def _dispatch_plugin_lifecycle(self) -> None:
         """Run each MUSHclient pack's install/connect hooks (MUSHclient calls these
@@ -535,6 +609,7 @@ class EngineApp:
         for pack in self._mush_packs:
             pack.dispatch_install()
             pack.dispatch_connect()
+        self._mush_connected = True
         if self._msdp_offered:  # negotiation happened before packs were ready: replay it
             self._dispatch_msdp_start()
         self._arm_plugin_ticks()
@@ -602,8 +677,10 @@ class EngineApp:
     def shutdown(self) -> None:
         """Release session resources on close: leave the hub and stop logging."""
         self._closed = True  # ends the OnPluginTick chain
-        self.engine.cancel_timers()  # cancel pending pack timers so none fire post-close
         self._vip_connection_changed(False)  # closing the tab drops the connection too
+        for pack in self._mush_packs:
+            pack.dispatch_close()  # plugins put their settings in variables to be saved
+        self.engine.cancel_timers()  # cancel pending pack timers so none fire post-close
         self._persist_pack_vars()
         self._save_map()
         if self.hub is not None and self.name:
