@@ -23,6 +23,7 @@ from genericmud.packs.manifest import CODE_EXEC_DIALECTS, DIALECT_BY_SUFFIX, Pac
 from genericmud.packs.manifest_sources import ManifestSource
 from genericmud.packs.store import PackError, PackStore, extract_pack
 from genericmud.packs.world_import import world_from_pack
+from genericmud.scripting.vipmud_dialect import linked_vipmud_scripts
 
 _GIT_ARCHIVE_MAX_BYTES = 3 * 1000 * 1000 * 1000  # a full pack repo (Erion ~1 GB); generous cap
 
@@ -130,6 +131,9 @@ def detect_entry(pack_dir: str | Path, *, mud_name: str | None = None) -> str | 
             return rel(worlds[0])
     inert_worlds = {world for world in worlds if not _mush_world_score(world)}
     candidates = [script for script in scripts if script not in inert_worlds]
+    linked = linked_vipmud_scripts(pack_dir)
+    if linked is not None:
+        return rel(linked)
     for preferred in _ENTRY_PREFERENCE:
         for script in candidates:
             if script.name.lower() == preferred:

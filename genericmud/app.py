@@ -686,8 +686,10 @@ class EngineApp:
         if path is None:
             return
         # sppath is wiring (where THIS install keeps its sounds), not a user setting;
-        # persisting it would pin a moved/reinstalled pack to its old location.
-        data = {k: v for k, v in self.engine.all_vars().items() if k != "sppath"}
+        # persisting it would pin a moved/reinstalled pack to its old location. VIPMud packs
+        # start each session without their variables and save what they want themselves.
+        transient = {"sppath"}.union(*(pack.written_variables for pack in self._vip_packs))
+        data = {k: v for k, v in self.engine.all_vars().items() if k not in transient}
         try:
             atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True))
         except OSError:

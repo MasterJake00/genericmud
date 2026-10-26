@@ -1008,3 +1008,26 @@ def test_commands_can_be_abbreviated_like_in_vipmud(tmp_path):
     assert engine.get_var("loaded") == "yes"
     assert engine.get_var("itemx") == "x"
     assert sink.sent == ["pong"]
+
+
+# --- packs set up the way VIP Mud's own installers set them up ---
+
+
+def test_a_linked_pack_knows_where_its_scripts_sounds_and_themes_are(tmp_path):
+    # Miriani's and the official Prometheus pack's setup scripts write ScriptPath,
+    # SoundsPath and ThemesPath into a Conf.set. genericMud doesn't run batch files, so it
+    # finds the folders those scripts would have linked, and loads the scripts' Main.set
+    # even where an older install recorded the sounds folder's main.set as the entry.
+    from tests.test_setup import _linked_vipmud_pack
+
+    pack_dir = _linked_vipmud_pack(tmp_path)
+    sink = RecordingSink()
+    engine = AutomationEngine(sink)
+    pack = VipMudPack(ScriptApi(engine, source="vip", base_dir=str(pack_dir)))
+    pack.load_entry(pack_dir / "Miriani Soundpack Sounds Version 7" / "main.set")
+    scripts = pack_dir / "Miriani Soundpack for VIP Mud" / "Scripts"
+    sounds = pack_dir / "Miriani Soundpack Sounds Version 7"
+    assert engine.get_var("scriptpath") == str(scripts)
+    assert engine.get_var("soundspath") == str(sounds)
+    assert engine.get_var("themespath") == str(sounds / "Themes")
+    assert engine.get_var("linked") == str(scripts)  # the scripts' Main.set ran

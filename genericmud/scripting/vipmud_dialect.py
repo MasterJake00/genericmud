@@ -264,6 +264,32 @@ def tokenize_statements(source: str) -> list[tuple[str | None, list[_Tok]]]:
     return statements
 
 
+# VIPMud packs from Miriani's and Prometheus's makers ship a scripts folder and a sounds
+# folder, each with a batch file that writes its path into the player's Conf.set.
+LINK_SCRIPTS = "link the scripts for vip mud 2.0.bat"
+LINK_SOUNDS = "link the sounds folder.bat"
+LINK_THEMES = "link the themes folder.bat"
+
+
+def linked_folder(pack_dir: str | Path, batch_name: str) -> Path | None:
+    """The folder holding ``batch_name`` (any case), shallowest first."""
+    found = [
+        path.parent for path in Path(pack_dir).rglob("*.bat") if path.name.lower() == batch_name
+    ]
+    return min(found, key=lambda folder: (len(folder.parts), str(folder))) if found else None
+
+
+def linked_vipmud_scripts(pack_dir: str | Path) -> Path | None:
+    """A linked pack's real entry, Scripts/Main.set beside its link batch file. Its sounds
+    folder has a main.set too, which only says which sounds version it is."""
+    folder = linked_folder(pack_dir, LINK_SCRIPTS)
+    scripts = folder / "Scripts" if folder is not None else None
+    if scripts is None or not scripts.is_dir():
+        return None
+    mains = [path for path in sorted(scripts.iterdir()) if path.name.lower() == "main.set"]
+    return mains[0] if mains else None
+
+
 def _scan_char_class(pattern: str, start: int) -> int | None:
     """End index (exclusive) of the ``[...]`` class opening at ``start``, or None if unclosed.
 
@@ -948,13 +974,36 @@ class VipMudPack:
         # script path) to the pack dir so @sppath/x.wav resolves to bundled sounds.
         # Default @sppath/@scpath to the pack dir, but don't clobber a value the session
         # pre-set from world.sounds (so a world can point at its own sound folder).
+        # Names this pack has set. VIPMud starts every session without them; the app keeps
+        # them out of what it saves for the next session.
+        self.written_variables: set[str] = set()
         base = api.base_dir
         if base:
             self._discover_remote_sounds(Path(base))
+            self._link_folders(Path(base))
         if base and not api.get_var("sppath"):
-            api.set_var("sppath", self._remote_sound_root or base)
+            self._set_var("sppath", str(self._remote_sound_root or base))
         if base and not api.get_var("scpath"):
-            api.set_var("scpath", base)
+            self._set_var("scpath", base)
+
+    def _set_var(self, name: str, value: object) -> None:
+        self.written_variables.add(name)
+        self._api.set_var(name, value)
+
+    def _link_folders(self, base: Path) -> None:
+        """Do what a linked pack's setup scripts do: tell it where its scripts, sounds and
+        themes are (ScriptPath, SoundsPath, ThemesPath). The paths belong to this install,
+        so they replace whatever an earlier session had."""
+        scripts = linked_vipmud_scripts(base)
+        sounds = linked_folder(base, LINK_SOUNDS)
+        themes = linked_folder(base, LINK_THEMES)
+        for name, folder in (
+            ("scriptpath", scripts.parent if scripts is not None else None),
+            ("soundspath", sounds),
+            ("themespath", themes),
+        ):
+            if folder is not None:
+                self._set_var(name, str(folder))
 
     def _discover_remote_sounds(self, base: Path) -> None:
         """Read an official VIPMud installer's lazy sound-repository declaration."""
@@ -1242,7 +1291,7 @@ class VipMudPack:
     def _runner(self, body: str):
         def run(ctx: MatchContext) -> None:
             for name, value in ctx.named.items():  # named wildcards become @vars
-                self._api.set_var(_fold(name), value or "")
+                self._set_var(_fold(name), value or "")
             self._run_rule(body, _Scope(ctx.wildcards, ctx.line))
 
         return run
@@ -1345,7 +1394,7 @@ class VipMudPack:
             if command == "GVARIABLE":  # global namespace; @-reads still resolve it
                 self._api.set_gvar(name, value)
             else:
-                self._api.set_var(name, value)
+                self._set_var(name, value)
         elif command in ("UNVARIABLE", "GUNVARIABLE") and args:
             self._api.delete_var(_fold(self._expand(args[0].text, scope)))
         elif command in ("MATH", "GMATH") and len(args) > 1:
@@ -1526,8 +1575,11 @@ class VipMudPack:
 
     def load_entry(self, path: str | Path) -> None:
         """Load the pack's own load script, remembered as a file like any #Load'ed one. An
-        unreadable entry raises, so activation reports the pack as failed."""
-        real = Path(path).resolve()
+        unreadable entry raises, so activation reports the pack as failed. A linked pack
+        always starts at its scripts' Main.set, as its setup scripts arrange; installs before
+        that was understood recorded its sounds folder's main.set."""
+        linked = linked_vipmud_scripts(self._base_dir) if self._base_dir else None
+        real = (linked or Path(path)).resolve()
         self._load_path(real, keep=False, source=real.read_text(encoding="latin-1"))
 
     def _load_file(self, reference: str, *, keep: bool = False) -> None:
@@ -1589,7 +1641,7 @@ class VipMudPack:
             existing.casefold() == item.casefold() for existing in items
         ):
             return
-        self._api.set_var(name, f"{current}|{item}" if current else item)
+        self._set_var(name, f"{current}|{item}" if current else item)
 
     def _open_file(self, args: list[_Tok], scope: _Scope) -> None:
         """``#File handle {path} [record-length]``. Handles 1 to 5 are text files, read a
@@ -1631,11 +1683,11 @@ class VipMudPack:
             lines = self._text_lines(opened)
             value = lines[opened.position] if opened.position < len(lines) else "[EOF]"
             opened.position += 1
-            self._api.set_var(name, value)
+            self._set_var(name, value)
         elif isinstance(opened, _VipFile) and len(args) > 2:
             index = _to_int(self._expand(args[2].text, scope), 0) - 1
             if 0 <= index < len(opened.values):
-                self._api.set_var(name, opened.values[index])
+                self._set_var(name, opened.values[index])
 
     def _write_file(self, args: list[_Tok], scope: _Scope) -> None:
         """``#Write handle value [record|NoReturn]``: append a line to a text file (with no
@@ -1717,7 +1769,7 @@ class VipMudPack:
             return
         assignment = _ASSIGN_RE.match(text)
         if assignment:  # "@name = value" sets a variable; it isn't sent to the MUD
-            self._api.set_var(_fold(assignment.group(1)), self._expand(assignment.group(2), scope))
+            self._set_var(_fold(assignment.group(1)), self._expand(assignment.group(2), scope))
             return
         # Bare text runs "as if typed": VIPMud expands aliases in script bodies (packs
         # call their own aliases by name, e.g. CR's `makebetter`), so route through the
@@ -1879,7 +1931,7 @@ class VipMudPack:
         alarm = _Alarm(body.text, abs(delay), delay < 0)
         self._alarms[self._alarm_count] = alarm
         if name:
-            self._api.set_var(name, str(self._alarm_count))
+            self._set_var(name, str(self._alarm_count))
         self._schedule_alarm(self._alarm_count, alarm)
 
     def _schedule_alarm(self, number: int, alarm: _Alarm) -> None:
@@ -1921,7 +1973,7 @@ class VipMudPack:
         result = self._evaluate(expression, scope)
         if result is None or _number(result) is None:
             return
-        self._api.set_var(_fold(self._expand(args[0].text, scope)), result)
+        self._set_var(_fold(self._expand(args[0].text, scope)), result)
 
     def _execute_pc(self, args: list[_Tok], scope: _Scope) -> None:
         handle = self._expand(args[0].text, scope).strip()
@@ -1944,7 +1996,7 @@ class VipMudPack:
                 channel in self._pending_cues or self._api.is_playing(channel)
             )
             if value.strip():
-                self._api.set_var(_fold(value.strip()), "1" if playing else "0")
+                self._set_var(_fold(value.strip()), "1" if playing else "0")
             return
         if channel is None:
             return
@@ -2346,7 +2398,7 @@ class VipMudPack:
         if not name:
             return ""
         first, _separator, rest = (self._api.get_var(name, "") or "").partition("|")
-        self._api.set_var(name, rest)
+        self._set_var(name, rest)
         return first
 
     def _function_pos(self, args: list[str], scope: _Scope) -> str:

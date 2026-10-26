@@ -306,3 +306,25 @@ def test_extract_pack_descends_nested_zips(tmp_path):
     extract_pack(outer, dest)
     assert list(dest.rglob("main.set")), "nested .set was not extracted"
     assert not list(dest.rglob("*.zip")), "nested zip left behind"
+
+
+def _linked_vipmud_pack(root):
+    """Shaped like Miriani's and the official Prometheus VIP Mud packs: a scripts folder and
+    a sounds folder, each with the batch file VIP Mud users run to link it."""
+    pack = root / "pack"
+    scripts = pack / "Miriani Soundpack for VIP Mud" / "Scripts"
+    scripts.mkdir(parents=True)
+    (scripts.parent / "Link the scripts for VIP Mud 2.0.bat").write_text("@echo off\n")
+    (scripts / "Main.set").write_text("#var linked {@ScriptPath}\n")
+    sounds = pack / "Miriani Soundpack Sounds Version 7"
+    (sounds / "Themes").mkdir(parents=True)
+    (sounds / "Link the sounds folder.bat").write_text("@echo off\n")
+    (sounds / "main.set").write_text("#Var SoundsVersion {7}\n")
+    (sounds / "Themes" / "Link the themes folder.bat").write_text("@echo off\n")
+    return pack
+
+
+def test_detect_entry_takes_a_linked_vipmud_packs_scripts_not_its_sounds_marker(tmp_path):
+    # The sounds folder's main.set only says which sounds version it is.
+    pack = _linked_vipmud_pack(tmp_path)
+    assert detect_entry(pack) == "Miriani Soundpack for VIP Mud/Scripts/Main.set"

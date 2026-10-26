@@ -183,3 +183,27 @@ def test_a_vipmud_packs_onconnect_and_ondisconnect_follow_the_connection(tmp_pat
     backend.spoken.clear()
     app.on_disconnected()  # the window's Disconnect, which sends no status
     assert "gone" in backend.spoken
+
+
+def test_a_vipmud_packs_variables_start_fresh_each_session(tmp_path):
+    # VIP Mud keeps no variables between sessions unless a player asks it to, and packs
+    # save what they want in their own files. Miriani warns at every login when variables
+    # were kept; genericMud kept them all.
+    store = PackStore(tmp_path / "store")
+    src = tmp_path / "pack.set"
+    src.write_text("#if {%defined(aaah)=1} {#say kept} {#var aaah 0}\n", encoding="latin-1")
+    store.install(src, world="miriani", trust=True)
+
+    def session():
+        backend = RecordingBackend()
+        voice = VoiceRouter(backend, clock=lambda: 0.0)
+        return EngineApp(voice, packs=store, name="miriani"), backend
+
+    first, _backend = session()
+    first.on_connect("miriani")
+    first.engine.set_var("UserSetting", "kept by genericMud")  # not the VIP Mud pack's
+    first.shutdown()
+    second, backend = session()
+    second.on_connect("miriani")
+    assert "kept" not in backend.spoken
+    assert second.engine.get_var("UserSetting") == "kept by genericMud"
