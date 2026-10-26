@@ -7,6 +7,54 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.16.0 — 2026-10-26
+
+**Speech**
+
+* Lines with em dashes, curly quotes, ellipses, or Korean, Chinese or Japanese
+  text are spoken again. Depending on where such a character fell in the line,
+  the whole line was silently skipped.
+
+**Each world's own settings**
+
+* A world's details (Ctrl+O, then Edit) set its command separator. It's a
+  semicolon unless you change it. Type it twice to send a real one, as in
+  `say hi;; bye`, or pick another character, or switch splitting off for a MUD
+  that uses semicolons in its commands. Your own aliases, hotkeys and triggers
+  split the same way; soundpacks aren't affected.
+* A world can start logging by itself when it connects, write a new file each
+  session, one per day or one for the world, and leave out what you type. Every
+  log adds to its file and starts with the date and time. A log you stop with
+  Alt+Shift+L stays stopped until you close the tab.
+* Changes to those apply straight away, even to a world that's open.
+
+**Sounds the MUD sends**
+
+* MUDs that send their sounds over GMCP Client.Media, as Mudlet supports, are
+  heard now, and so are MSP sounds a MUD offers to download. A sound you don't
+  have is fetched once into the world's own media folder and played from there.
+  Only real sound files are kept, up to 64 MB each and 2 GB for a world, and
+  nothing is fetched from your own network except the machine the MUD runs on.
+
+**Reconnecting**
+
+* Ctrl+D reconnects a tab that's disconnected, keeping its scrollback, and the
+  File menu's Disconnect says Reconnect when it would. Pressing Enter on a
+  command in a disconnected tab asks whether to reconnect instead of dropping
+  it, and leaves what you typed in the box. genericMud's own slash commands
+  still run without asking.
+* Disconnecting with Ctrl+D is announced the way a dropped connection is.
+
+**Also**
+
+* Ctrl+0 speaks the tenth line back, after Ctrl+1 to 9.
+* Saved rules and shared world files keep accented and non-Latin text readable.
+
+**Changed on purpose**
+
+* Two separators in a row send the separator itself, so `n;;s` is now the one
+  command `n;s` rather than two.
+
 ## 0.15.0 — 2026-10-26
 
 **Soundpack menus and questions**
