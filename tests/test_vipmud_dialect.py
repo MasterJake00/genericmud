@@ -819,3 +819,29 @@ def test_loading_prometheus_save_config_sends_nothing_to_the_mud():
     )
     assert sink.sent == []
     assert engine.process_input("spload") == []
+
+
+async def test_pack_sound_downloads_keep_off_the_loops_shared_threads(tmp_path, monkeypatch):
+    # asyncio looks up every connect's host name on the loop's default threads, so pack
+    # downloads stalled there kept sessions from connecting: the fix the MUD's own media got.
+    release = threading.Event()
+
+    def download(url, destination, **_kwargs):
+        release.wait(5)
+        destination.write_bytes(b"RIFF")
+
+    monkeypatch.setattr("genericmud.packs.vault.download", download)
+    loop = asyncio.get_running_loop()
+    used: list[object] = []
+    real_run_in_executor = loop.run_in_executor
+
+    def recording_run_in_executor(executor, *args):
+        used.append(executor)
+        return real_run_in_executor(executor, *args)
+
+    monkeypatch.setattr(loop, "run_in_executor", recording_run_in_executor)
+    sink, engine = _remote_pack(tmp_path)
+    engine.process_line(Line("$sphook play:general/misc/on:80:0:0:1"))
+    release.set()
+    await _until(lambda: sink.played)
+    assert used == []

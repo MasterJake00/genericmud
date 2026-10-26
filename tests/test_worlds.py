@@ -120,3 +120,15 @@ def test_a_separator_that_cant_work_falls_back_to_a_semicolon(tmp_path):
     )
     (world,) = load_worlds(path)
     assert world.command_separator == ";" and world.log_files == "session"
+
+
+def test_downloading_the_muds_sounds_is_on_unless_a_world_turns_it_off(tmp_path):
+    path = tmp_path / "worlds.toml"
+    worlds = [
+        World("Quiet", "q.example", 23, download_sounds=False),
+        World("Loud", "l.example", 23),
+    ]
+    save_worlds(worlds, path)
+    assert "download_sounds = false" in path.read_text(encoding="utf-8")
+    assert load_worlds(path) == worlds
+    assert World("New", "n.example", 23).download_sounds

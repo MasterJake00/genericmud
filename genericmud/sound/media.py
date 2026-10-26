@@ -51,6 +51,9 @@ _USER_AGENT = "genericMud-media"
 _WEB_PAGE_TYPES = frozenset({"text/html", "application/xhtml+xml"})
 
 Fetch = Callable[[str, Path, str], None]  # (url, destination, MUD's address): write it or raise
+# Soundpacks' own sound downloads (a VIPMud pack fetching its missing .wav files), across every
+# session, run this many at a time.
+_PACK_SOUND_SLOTS = threading.BoundedSemaphore(_AT_ONCE)
 Submit = Callable[[Callable[[], None], Callable[[BaseException | None], None]], None]
 
 
@@ -172,6 +175,42 @@ def _loop_submit(job: Callable[[], None], done: Callable[[BaseException | None],
             pass  # the loop has closed: genericMud is quitting and nothing is left to play it
 
     threading.Thread(target=run, name="genericmud-media", daemon=True).start()
+
+
+def run_in_own_thread[Result](job: Callable[[], Result]) -> asyncio.Future[Result]:
+    """Run a soundpack's download ``job`` on a daemon thread; the future resolves on the loop.
+
+    For the reasons :func:`_loop_submit` gives: not the loop's default executor, which asyncio
+    needs for every connect's host lookup, and a daemon thread, so a download still running
+    doesn't keep genericMud open after it's closed. Cancelling the future (the session
+    closing) leaves the thread to finish on its own, with nothing waiting on its result.
+    """
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[Result] = loop.create_future()
+
+    def settle(result: Result | None, error: BaseException | None) -> None:
+        if future.cancelled():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(result)  # type: ignore[arg-type]
+
+    def run() -> None:
+        result: Result | None = None
+        error: BaseException | None = None
+        try:
+            with _PACK_SOUND_SLOTS:
+                result = job()
+        except Exception as exc:  # noqa: BLE001 - handed to the future on the loop
+            error = exc
+        try:
+            loop.call_soon_threadsafe(settle, result, error)
+        except RuntimeError:
+            pass  # the loop has closed: genericMud is quitting
+
+    threading.Thread(target=run, name="genericmud-pack-sound", daemon=True).start()
+    return future
 
 
 class MediaLibrary:

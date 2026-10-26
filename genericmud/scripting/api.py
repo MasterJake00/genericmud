@@ -569,8 +569,12 @@ class ScriptApi:
         pack runs as script, can set; pointed at "/" it let any file play and a missing
         sound walk the whole disk."""
         sppath = self._engine.get_var("sppath")
+        if not sppath or is_unc(sppath):
+            # A UNC @sppath isn't even looked at: on Windows, resolving one is enough to send
+            # the player's NTLM hash to that host.
+            return self._engine.sounds_dir
         trusted = [root for root in (self._base_dir, self._engine.sounds_dir) if root]
-        if sppath and any(within(root, sppath) for root in trusted):
+        if any(within(root, sppath) for root in trusted):
             return sppath
         return self._engine.sounds_dir
 

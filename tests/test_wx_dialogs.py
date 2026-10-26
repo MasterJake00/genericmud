@@ -720,10 +720,12 @@ def test_world_dialog_round_trips_command_stacking_and_logging(frame):
 
     world = World(
         "Chat", "chatmud.com", 7777, command_stacking=False, command_separator="|",
-        log_automatically=True, log_files="world", log_commands=False,
+        log_automatically=True, log_files="world", log_commands=False, download_sounds=False,
     )
     dialog = WorldDialog(frame, world)
     try:
+        assert dialog._download_sounds.GetName() == "Download sounds the MUD offers"
+        assert not dialog._download_sounds.GetValue()
         assert dialog._separator.GetName() == "Command separator"
         assert dialog._log_files.GetName() == "Log files"
         assert dialog._log_files.GetStringSelection() == "One file for this world"
@@ -770,12 +772,13 @@ def test_editing_a_world_changes_its_open_tab_at_once(frame, monkeypatch):
         panel.app = EngineApp(VoiceRouter(RecordingBackend(), clock=lambda: 0.0), keymap={})
         edited = World(
             "W", "new.example", 4000, encoding="cp1251", sounds="C:/sounds",
-            command_separator="|", log_commands=False,
+            command_separator="|", log_commands=False, download_sounds=False,
         )
         panel.apply_world_settings(edited)
         loop.run_until_complete(asyncio.sleep(0.01))
         assert panel.app.command_separator == "|"
         assert panel.app.log_commands is False
+        assert panel.app.download_media is False
         # How the tab connects stays as it opened until the world is opened again, so a
         # reconnect (Ctrl+D) can't mix a new host with the old encoding and sounds.
         assert (panel.world.host, panel.world.port) == ("w.example", 23)

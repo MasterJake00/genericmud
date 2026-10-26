@@ -862,9 +862,10 @@ class SessionPanel(wx.Panel):
         self._loop.call_soon_threadsafe(self._apply_active, active)
 
     def apply_world_settings(self, world: World) -> None:  # UI thread
-        """Take a world's edited command stacking and logging now. How the tab connects (host,
-        port, TLS, encoding, sounds) stays as it opened, so a reconnect from this tab doesn't
-        reach a new host with the old encoding; those apply when the world is opened again."""
+        """Take a world's edited command stacking, logging and sound downloads now. How the
+        tab connects (host, port, TLS, encoding, sounds) stays as it opened, so a reconnect from
+        this tab doesn't reach a new host with the old encoding; those apply when the world is
+        opened again."""
         self.world = replace(
             self.world,
             command_stacking=world.command_stacking,
@@ -872,6 +873,7 @@ class SessionPanel(wx.Panel):
             log_automatically=world.log_automatically,
             log_files=world.log_files,
             log_commands=world.log_commands,
+            download_sounds=world.download_sounds,
         )
         if self.app is not None:
             self._loop.call_soon_threadsafe(self.app.apply_world_settings, self.world)
@@ -1235,6 +1237,11 @@ class WorldDialog(wx.Dialog):
         self._encoding.SetSelection(0)
         grid.Add(self._encoding, 1, wx.EXPAND)
         self._sounds = self._labeled_text(grid, "So&unds folder:", "Sounds folder")
+        grid.Add((0, 0))
+        self._download_sounds = wx.CheckBox(self, label="Do&wnload sounds the MUD offers")
+        self._download_sounds.SetName("Download sounds the MUD offers")
+        self._download_sounds.SetValue(True)
+        grid.Add(self._download_sounds, 1, wx.EXPAND)
 
         grid.Add((0, 0))
         self._tls = wx.CheckBox(self, label="Use &TLS")
@@ -1322,6 +1329,7 @@ class WorldDialog(wx.Dialog):
             self._log_automatically.SetValue(initial.log_automatically)
             self._log_files.SetSelection(LOG_FILES.index(initial.log_files))
             self._log_commands.SetValue(initial.log_commands)
+            self._download_sounds.SetValue(initial.download_sounds)
         if lock_name:
             self._name.Enable(False)
             self._host.SetFocus()
@@ -1371,6 +1379,7 @@ class WorldDialog(wx.Dialog):
             log_automatically=self._log_automatically.GetValue(),
             log_files=LOG_FILES[self._log_files.GetSelection()],
             log_commands=self._log_commands.GetValue(),
+            download_sounds=self._download_sounds.GetValue(),
         )
         self.EndModal(wx.ID_OK)
 

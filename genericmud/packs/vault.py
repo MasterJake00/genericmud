@@ -98,10 +98,11 @@ class _ValidatingRedirectHandler(HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102 - see class
         _validate_url(newurl, self.trusted)
+        # Down from https to plain http, the rest of the download could be read or swapped on
+        # the way. Mudlet refuses that hop for server media too.
+        if urlparse(req.full_url).scheme == "https" and urlparse(newurl).scheme != "https":
+            raise BlockedUrl(f"refusing a redirect from https down to http ({newurl})")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-_OPENER = build_opener(_ValidatingRedirectHandler)
 
 
 def _open(opener, request):
@@ -169,8 +170,15 @@ def trusting_opener(trusted: frozenset[IPAddress]) -> OpenerDirector:
     )
 
 
+# Every real pack download: each redirect hop re-checked, and the address each connection
+# actually reached checked too, so a server's DNS can't answer public to the check and then
+# 127.0.0.1 or the player's router to the connection.
+_OPENER = trusting_opener(frozenset())
+
+
 def _secure_urlopen(request, *args, **kwargs):
-    """``urlopen`` that re-validates every redirect hop (the default opener for real fetches)."""
+    """``urlopen`` that re-validates every redirect hop and every address it connects to (the
+    default opener for real fetches)."""
     return _OPENER.open(request, *args, **kwargs)
 
 # Clients genericMud can actually load (one of the three script dialects); others

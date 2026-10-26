@@ -65,14 +65,17 @@ class PygameSoundBackend:
         self._warned: set[str] = set()  # paths already reported, so a missing cue warns once
         self._music_channel: str | None = None  # logical channel the streaming music cue is on
 
-    def play(self, file: str, channel: str, gain: float, pan: float, loop: bool) -> None:
+    def play(
+        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1
+    ) -> None:
         sound = self._sound(file)
         if sound is None:  # missing/undecodable file: skip the cue, don't crash the line
             self._trace(file, "SKIP", gain=gain)
             return
         try:
             mixer_channel = self._channel(channel, loop)
-            mixer_channel.play(sound, loops=-1 if loop else 0)
+            # pygame's loops counts the repeats after the first play.
+            mixer_channel.play(sound, loops=-1 if loop else max(0, times - 1))
             self._levels[channel] = (gain, pan)  # adjust() merges live changes over these
             mixer_channel.set_volume(*stereo_volume(gain, pan))
         except Exception as exc:  # noqa: BLE001 - a mixer fault must not crash the line; record it
@@ -80,11 +83,12 @@ class PygameSoundBackend:
             return
         self._trace(file, "OK", gain=gain)
 
-    def music(self, file: str, channel: str, gain: float) -> None:
+    def music(self, file: str, channel: str, gain: float, times: int = -1) -> None:
         try:
             self._mixer.music.load(file)
             self._mixer.music.set_volume(_clamp(gain))
-            self._mixer.music.play(loops=-1)  # background music loops until stopped
+            # -1 loops until stopped (soundpacks' background music); a MUD may ask for a count.
+            self._mixer.music.play(loops=-1 if times < 0 else max(0, times - 1))
         except Exception:  # noqa: BLE001 - a missing/bad file OR a mixer fault must not crash the line
             self._warn(file)
             self._trace(file, "SKIP", kind="music")

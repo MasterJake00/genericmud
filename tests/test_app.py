@@ -299,7 +299,7 @@ def test_terminal_disconnect_flushes_looping_sound():
         def __init__(self):
             self.stopped: list[str] = []
 
-        def play(self, file, channel, gain, pan, loop):
+        def play(self, file, channel, gain, pan, loop, times=1):
             pass
 
         def stop(self, channel):

@@ -370,7 +370,14 @@ download one it doesn't find there, genericMud fetches it once into a per-world
 files with a sound's name (.wav, .ogg, .mp3 and the like) are downloaded, never
 a web page sent in place of one, each up to 64 MB and 2 GB in all for one world,
 and never from addresses on your own network, except the machine the MUD itself
-runs on (so a MUD on your own computer or LAN can serve its sounds).
+runs on (so a MUD on your own computer or LAN can serve its sounds). To stop a
+world downloading sounds, untick **Download sounds the MUD offers** in its
+details; sounds already in its folders still play.
+
+Sounds and music play as many times as the MUD asks, and loop only when it says
+to. When the MUD gives a sound a caption, a description for players who can't
+hear it, the caption appears in the output in brackets, like `[A wolf howls]`,
+where the review keys can find it. It isn't spoken.
 
 ## Sharing your setup
 

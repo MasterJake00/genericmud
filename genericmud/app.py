@@ -131,6 +131,14 @@ def _media_int(value: object, default, low: int, high: int):
     return max(low, min(high, number))
 
 
+def _media_is_zero(value: object) -> bool:
+    """Whether a Client.Media number is exactly 0, the volume that asks for a preload."""
+    try:
+        return float(value) == 0.0  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
 def _media_continues(value: object) -> bool:
     """Client.Media.Play's ``continue``: true unless the server sent false, either as a JSON
     boolean or as the text "false". The spec has clients take every value as a quoted string
@@ -154,10 +162,12 @@ class _PostSoundBackend(SoundBackend):
     def __init__(self, post) -> None:
         self._post = post
 
-    def play(self, file: str, channel: str, gain: float, pan: float, loop: bool) -> None:
-        self._post(protocol.sound(file, channel, gain, pan, loop))
+    def play(
+        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1
+    ) -> None:
+        self._post(protocol.sound(file, channel, gain, pan, loop))  # the renderer can't count
 
-    def music(self, file: str, channel: str, gain: float) -> None:
+    def music(self, file: str, channel: str, gain: float, times: int = -1) -> None:
         self._post(protocol.music(file, channel, gain))
 
     def stop(self, channel: str) -> None:
@@ -359,6 +369,7 @@ class EngineApp:
         self.log_automatically = False
         self.log_files = "session"
         self.log_commands = True
+        self.download_media = True  # fetch the sounds a MUD offers (the world's choice)
         self.credentials = credentials
         self._login: AutoLogin | None = None
         self._walk: SafeWalk | None = None
@@ -447,6 +458,7 @@ class EngineApp:
         self.log_automatically = world.log_automatically
         self.log_files = world.log_files
         self.log_commands = world.log_commands
+        self.download_media = world.download_sounds
 
     def on_connect(self, world: str) -> ActivationResult | None:
         """The on-connect sequence: register with the hub, activate packs, arm login."""
@@ -926,16 +938,19 @@ class EngineApp:
                 self._diag.event("msp.cue", kind=cue.kind, file=cue.file, volume=cue.volume)
             gain = cue.volume / 100.0
             url = cue.url or self._msp_url
+            times = max(1, cue.repeats)  # L= plays that many times; -1 loops until stopped
             if cue.kind == "music":
                 self._start_media(
                     cue.file, url, channel,
-                    lambda path, gain=gain: self.sound.music(path, MUSIC_CATEGORY, gain=gain),
+                    lambda path, gain=gain, times=-1 if cue.loops_forever else times: (
+                        self.sound.music(path, MUSIC_CATEGORY, gain=gain, times=times)
+                    ),
                 )
             else:
                 self._start_media(
                     cue.file, url, channel,
-                    lambda path, gain=gain, loop=cue.loops_forever: self.sound.play(
-                        path, DEFAULT_CATEGORY, gain=gain, loop=loop
+                    lambda path, gain=gain, loop=cue.loops_forever, times=times: self.sound.play(
+                        path, DEFAULT_CATEGORY, gain=gain, loop=loop, times=times
                     ),
                 )
         spans = parse_ansi(text)
@@ -1066,7 +1081,7 @@ class EngineApp:
         if path is not None:
             play(path)
             return
-        if url:
+        if url and self.download_media:
             address = media_url(url, name)
             flushes = self.sound.flushes
 
@@ -1121,10 +1136,7 @@ class EngineApp:
             name = str(body.get("name") or "")
             if not name or is_unsafe(name):
                 return
-            url = self._media_source(body)
-            if self._native_audio and url:
-                if self.media.locate(name, self._media_sounds_root()) is None:
-                    self.media.fetch(name, media_url(url, name))
+            self._media_preload(name, self._media_source(body))
         elif verb == "play":
             self._media_play(body)
         elif verb == "stop":
@@ -1139,8 +1151,14 @@ class EngineApp:
             if self._diag is not None:
                 self._diag.event("media.play", file=name, blocked=True)
             return
+        if _media_is_zero(body.get("volume")):
+            # Mudlet's preload: volume 0 asks for the file ahead of time, and plays nothing.
+            self._media_preload(name, self._media_source(body))
+            return
         gain = _media_int(body.get("volume"), _MEDIA_DEFAULT_VOLUME, 1, 100) / 100.0
-        loop = _media_int(body.get("loops"), 1, -1, 1_000_000) < 0  # counts > 1 play once, as MSP
+        loops = _media_int(body.get("loops"), 1, -1, 1_000_000)
+        loop = loops < 0  # -1 loops until stopped; otherwise it plays that many times
+        times = max(1, loops)
         key = str(body.get("key") or "")
         if kind == "music":
             channel = MUSIC_CATEGORY
@@ -1165,15 +1183,29 @@ class EngineApp:
         url = self._media_source(body)
         if self._diag is not None:
             self._diag.event("media.play", file=name, kind=kind, channel=channel)
+        caption = " ".join(str(body.get("caption") or "").split())
+        if caption:
+            # The spec's closed caption, for players who can't hear the sound. Shown in the
+            # output, in brackets as Mudlet prints them, where the review keys find it, but not
+            # spoken over the sound itself.
+            self.sink.echo(f"[{caption}]")
         if kind == "music":
             self._start_media(
-                name, url, channel, lambda path: self.sound.music(path, channel, gain)
+                name, url, channel,
+                lambda path: self.sound.music(path, channel, gain, times=-1 if loop else times),
             )
         else:
             self._start_media(
                 name, url, channel,
-                lambda path: self.sound.play(path, channel, gain=gain, loop=loop),
+                lambda path: self.sound.play(path, channel, gain=gain, loop=loop, times=times),
             )
+
+    def _media_preload(self, name: str, url: str) -> None:
+        """Client.Media's Load, and a Play at volume 0: fetch the file now, play nothing."""
+        if not name or is_unsafe(name) or not url or not self.download_media:
+            return
+        if self._native_audio and self.media.locate(name, self._media_sounds_root()) is None:
+            self.media.fetch(name, media_url(url, name))
 
     def _media_source(self, body: dict) -> str:
         """Where a Load or Play downloads from: its own url, which then stays the default for

@@ -31,12 +31,15 @@ class _Backend(SoundBackend):
         self.played: list[tuple[str, str, float, bool]] = []
         self.musics: list[tuple[str, float]] = []
         self.stopped: list[str] = []
+        self.times: list[int] = []  # how many times each play or music cue was to play
 
-    def play(self, file, channel, gain, pan, loop):
+    def play(self, file, channel, gain, pan, loop, times=1):
         self.played.append((file, channel, gain, loop))
+        self.times.append(times)
 
-    def music(self, file, channel, gain):
+    def music(self, file, channel, gain, times=-1):
         self.musics.append((file, gain))
+        self.times.append(times)
 
     def stop(self, channel):
         self.stopped.append(channel)
@@ -696,3 +699,94 @@ def test_client_media_refuses_unsafe_names_and_video(tmp_path):
     _gmcp(app, "Client.Media.Play", {"name": "intro.mp4", "type": "video", "url": "https://x/"})
     assert net.urls == []
     assert backend.played == [] and backend.musics == []
+
+
+# --- follow-ups: the download switch, loop counts, captions, preloads (0.17.0) ---
+
+
+def test_a_world_can_turn_off_downloading_the_muds_sounds(tmp_path):
+    from genericmud.config.worlds import World
+
+    net = _Net()
+    app, backend, _posted = _app(tmp_path, net)
+    app.apply_world_settings(World("W", "w.example", 23, download_sounds=False))
+    _gmcp(app, "Client.Media.Load", {"name": "a.wav", "url": "https://x.example/"})
+    _gmcp(app, "Client.Media.Play", {"name": "rain.wav", "url": "https://x.example/"})
+    app.on_telnet_event(DataReceived(b"!!SOUND(hit.wav U=https://x.example/)\r\n"))
+    assert net.urls == []
+    # Played by name as before downloads existed: from the Sounds folder if it's there.
+    assert [played[0] for played in backend.played] == ["rain.wav", "hit.wav"]
+
+
+def test_client_media_plays_as_many_times_as_the_mud_asks(tmp_path):
+    net = _Net()
+    app, backend, _posted = _app(tmp_path, net)
+    for loops in (3, None, -1):
+        body = {"name": "a.wav", "url": "https://x.example/"}
+        if loops is not None:
+            body["loops"] = loops
+        _gmcp(app, "Client.Media.Play", body)
+    assert backend.times == [3, 1, 1]  # forever is the loop flag, not a count
+    assert [played[3] for played in backend.played] == [False, False, True]
+
+
+def test_music_plays_once_unless_the_mud_says_to_loop(tmp_path):
+    # Server music looped forever whatever the MUD asked; both specs default to once.
+    net = _Net()
+    app, backend, _posted = _app(tmp_path, net)
+    url = "https://x.example/"
+    _gmcp(app, "Client.Media.Play", {"name": "town.ogg", "type": "music", "url": url})
+    _gmcp(app, "Client.Media.Play", {"name": "sea.ogg", "type": "music", "url": url, "loops": -1})
+    app.on_telnet_event(DataReceived(b"!!MUSIC(theme.mid U=https://x.example/)\r\n"))
+    app.on_telnet_event(DataReceived(b"!!MUSIC(storm.mid L=-1 U=https://x.example/)\r\n"))
+    assert backend.times == [1, -1, 1, -1]
+
+
+def test_msp_sounds_repeat_as_many_times_as_the_mud_asks(tmp_path):
+    net = _Net()
+    app, backend, _posted = _app(tmp_path, net)
+    app.on_telnet_event(DataReceived(b"!!SOUND(bell.wav L=3 U=https://x.example/)\r\n"))
+    assert backend.times == [3]
+
+
+def test_a_client_media_caption_is_shown_but_not_spoken(tmp_path):
+    net = _Net()
+    voice = RecordingBackend()
+    posted: list[dict] = []
+    app = EngineApp(
+        VoiceRouter(voice, clock=lambda: 0.0), post=posted.append, sound_backend=_Backend(),
+        media=_library(tmp_path, net),
+    )
+    _gmcp(app, "Client.Media.Play", {
+        "name": "howl.wav", "url": "https://x.example/", "caption": "A wolf howls",
+    })
+    assert app.buffer.lines()[-1].plain_text == "[A wolf howls]"
+    assert any(message.get("text") == "[A wolf howls]" for message in posted)
+    assert not any("wolf" in spoken for spoken in voice.spoken)
+
+
+def test_client_media_volume_zero_fetches_the_sound_without_playing_it(tmp_path):
+    # Mudlet's preload: volume 0 asks for the file ahead of time.
+    net = _Net()
+    app, backend, _posted = _app(tmp_path, net)
+    _gmcp(app, "Client.Media.Play", {"name": "later.wav", "url": "https://x.example/", "volume": 0})
+    assert net.urls == ["https://x.example/later.wav"]
+    assert backend.played == []
+
+
+def test_the_pack_downloader_checks_the_address_it_reached_too(tmp_path, local_server, monkeypatch):
+    # The DNS rebinding #12 closed for the MUD's media was still open for pack downloads.
+    from genericmud.packs import vault
+
+    port = int(local_server.rsplit(":", 1)[1])
+    real_getaddrinfo = socket.getaddrinfo
+    answers = iter(["93.184.216.34"])
+
+    def rebinding_dns(host, *args, **kwargs):
+        if host == "rebind.example":
+            host = next(answers, "127.0.0.1")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_dns)
+    with pytest.raises(BlockedUrl):
+        vault.download(f"http://rebind.example:{port}/hit.wav", tmp_path / "hit.wav")

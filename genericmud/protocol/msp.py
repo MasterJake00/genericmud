@@ -45,8 +45,8 @@ class SoundCue:
 
     @property
     def loops_forever(self) -> bool:
-        """``L=-1`` means loop until stopped — how servers start ambience. A finite count
-        above 1 has no bus equivalent (play once or loop), so it plays once."""
+        """``L=-1`` means loop until stopped — how servers start ambience. Any other count
+        plays the cue that many times."""
         return self.repeats < 0
 
 

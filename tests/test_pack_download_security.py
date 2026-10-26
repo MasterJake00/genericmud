@@ -118,3 +118,21 @@ def test_redirect_handler_allows_a_public_hop():
     req = Request("https://public.example/pack.zip")
     new = handler.redirect_request(req, None, 302, "Found", Message(), "https://93.184.216.34/x.zip")
     assert new is not None  # a public redirect target is followed as normal
+
+
+def test_a_redirect_from_https_down_to_http_is_refused():
+    # Mudlet refuses it too: the rest of the download could be read or changed on the way.
+    from email.message import Message
+    from urllib.request import Request
+
+    handler = _ValidatingRedirectHandler()
+    with pytest.raises(BlockedUrl):
+        handler.redirect_request(
+            Request("https://public.example/pack.zip"), None, 302, "Found", Message(),
+            "http://93.184.216.34/x.zip",
+        )
+    upgraded = handler.redirect_request(
+        Request("http://public.example/pack.zip"), None, 302, "Found", Message(),
+        "https://93.184.216.34/x.zip",
+    )
+    assert upgraded is not None

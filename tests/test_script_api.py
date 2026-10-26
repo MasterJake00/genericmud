@@ -152,3 +152,23 @@ def test_sounds_folder_fallback_reduces_an_absolute_request_to_its_relative_form
     api = _api(str(pack))
     _use_sounds_folder(api, sounds)
     assert _resolves_to(api._resolve(str(sounds) + "/Comm/Beep.wav")[0], real)
+
+
+def test_a_unc_sppath_is_never_resolved_while_looking_for_sounds(tmp_path, monkeypatch):
+    # On Windows, resolving \\host\share sends the player's NTLM hash to that host.
+    import genericmud.scripting.api as api_module
+
+    looked_at: list[str] = []
+    real_within = api_module.within
+
+    def recording_within(root, candidate):
+        looked_at.append(str(candidate))
+        return real_within(root, candidate)
+
+    monkeypatch.setattr(api_module, "within", recording_within)
+    engine = AutomationEngine(RecordingSink())
+    engine.sounds_dir = str(tmp_path)
+    engine.set_var("sppath", "\\\\evil.example\\share")
+    api = ScriptApi(engine, base_dir=str(tmp_path / "pack"))
+    assert api._sounds_root() == str(tmp_path)
+    assert not any("evil.example" in path for path in looked_at)

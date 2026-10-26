@@ -305,3 +305,20 @@ def test_all_loops_steal_releases_the_evicted_category():
     before = stolen.stopped
     backend.stop(evicted)  # stopping the evicted name must not kill the new cue
     assert stolen.stopped == before
+
+
+def test_a_cue_plays_the_number_of_times_asked():
+    # pygame's loops counts the repeats after the first play, so three plays is loops=2.
+    backend = PygameSoundBackend(_FakeMixer())
+    backend.play("/abs/bell.wav", "sound", 1.0, 0.0, loop=False, times=3)
+    backend.play("/abs/hit.wav", "other", 1.0, 0.0, loop=False)
+    assert [loops for _sound, loops in backend._channels["sound"].played] == [2]
+    assert [loops for _sound, loops in backend._channels["other"].played] == [0]
+
+
+def test_music_plays_once_when_a_mud_asks_and_loops_by_default():
+    mixer = _FakeMixer()
+    backend = PygameSoundBackend(mixer)
+    backend.music("/abs/town.ogg", "music", 0.5, times=1)
+    backend.music("/abs/theme.ogg", "music", 0.5)  # a soundpack's background music
+    assert mixer.music.played == [0, -1]

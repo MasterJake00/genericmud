@@ -43,6 +43,7 @@ from genericmud.automation.engine import _MATCH_KWARGS, MatchContext, _matcher, 
 from genericmud.model.buffer import Line
 from genericmud.safepath import confine, is_absolute, within
 from genericmud.scripting.api import ScriptApi
+from genericmud.sound.media import run_in_own_thread
 
 # VIPMud's commands, by full name. A pack may write any start of a name (#Tr, #Exec, #For,
 # #Va); where one start fits several, the first in this list wins.
@@ -2095,7 +2096,7 @@ class VipMudPack:
         if failed_at is not None and time.monotonic() - failed_at < _FETCH_RETRY_SECONDS:
             return False  # play() then reports the miss as handle 0, which packs handle
         try:
-            loop_ = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             # No event loop (a headless load): fetch in place, as before, and play straight away.
             if not self._fetch_remote_sound(file):
@@ -2104,7 +2105,9 @@ class VipMudPack:
         self._pending_cues[channel] = _PendingCue(file, gain=volume / 100, loop=loop)
         self._waiting.setdefault(url, []).append(channel)
         if url not in self._fetching:
-            future = loop_.run_in_executor(None, self._fetch_remote_sound, file)
+            # Its own thread, not the loop's default executor: asyncio looks up every connect's
+            # host name there, so downloads stalled on a slow server held up connecting.
+            future = run_in_own_thread(lambda file=file: self._fetch_remote_sound(file))
             self._fetching[url] = future
             self._api.track_pending(future)  # closing the session cancels the late play
             future.add_done_callback(lambda done, url=url: self._fetched(url, done))

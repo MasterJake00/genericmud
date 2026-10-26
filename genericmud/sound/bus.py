@@ -30,9 +30,11 @@ class SoundBackend:
     """Playback surface the bus drives; real wiring (renderer/native) overrides."""
 
     def play(
-        self, file: str, channel: str, gain: float, pan: float, loop: bool
-    ) -> None: ...
-    def music(self, file: str, channel: str, gain: float) -> None: ...
+        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1
+    ) -> None:
+        """Play ``file``; ``loop`` repeats it until stopped, else it plays ``times`` times."""
+    def music(self, file: str, channel: str, gain: float, times: int = -1) -> None:
+        """Play ``file`` as the music; ``times`` -1 loops it until stopped."""
     def stop(self, channel: str) -> None: ...
 
     def is_playing(self, channel: str) -> bool:
@@ -93,13 +95,22 @@ class SoundBus:
         gain: float = 1.0,
         pan: float = 0.0,
         loop: bool = False,
+        times: int = 1,
     ) -> None:
+        """Play a cue; ``loop`` repeats it until stopped, otherwise it plays ``times`` times
+        (a MUD's MSP L= or Client.Media loops)."""
         self._playing.add(channel)
-        self._backend.play(file, channel, self.effective_gain(channel, gain), pan, loop)
+        self._backend.play(
+            file, channel, self.effective_gain(channel, gain), pan, loop, times=max(1, times)
+        )
 
-    def music(self, file: str, channel: str = MUSIC_CATEGORY, gain: float = 1.0) -> None:
+    def music(
+        self, file: str, channel: str = MUSIC_CATEGORY, gain: float = 1.0, times: int = -1
+    ) -> None:
+        """Play music: until stopped (-1, what soundpacks' background music wants), or the
+        number of times a MUD asked for."""
         self._playing.add(channel)
-        self._backend.music(file, channel, self.effective_gain(channel, gain))
+        self._backend.music(file, channel, self.effective_gain(channel, gain), times=times)
 
     def stop(self, channel: str) -> None:
         self._playing.discard(channel)

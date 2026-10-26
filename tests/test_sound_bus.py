@@ -18,10 +18,10 @@ class _RecordingSound(SoundBackend):
     musics: list = field(default_factory=list)
     stopped: list = field(default_factory=list)
 
-    def play(self, file, channel, gain, pan, loop):
+    def play(self, file, channel, gain, pan, loop, times=1):
         self.played.append({"file": file, "channel": channel, "gain": gain, "loop": loop})
 
-    def music(self, file, channel, gain):
+    def music(self, file, channel, gain, times=-1):
         self.musics.append({"file": file, "channel": channel, "gain": gain})
 
     def stop(self, channel):
