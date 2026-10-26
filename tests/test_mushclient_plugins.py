@@ -236,3 +236,72 @@ def test_mushclient_aliases_stop_only_their_own_plugin_and_swallow_the_command()
     assert engine.process_input("c fireball") == []
     assert sink.sent == ["cast fireball"]
     assert sorted(_notes(sink)) == ["other plugin", "same plugin, later"]
+
+
+def _described(plugin_id: str, name: str, script: str = "", rules: str = "") -> str:
+    return (
+        f"<muclient><plugin name='{name}' id='{plugin_id}' author='Ruthgul' purpose='less spam'"
+        " language='Lua' date_written='2012-04-27 18:46:16' date_modified='2014-01-20'"
+        " requires='4.71' version='1.5' sequence='-50' save_state='y'>"
+        "<description trim='y'>\n\n  Gags most melee attacks.\n\n</description></plugin>"
+        f"<script><![CDATA[{script}]]></script>{rules}</muclient>"
+    )
+
+
+def test_get_plugin_info_answers_every_type_mushclient_does():
+    import datetime
+
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_described(
+        A, "sbrief", "function report(...) for _, n in ipairs({...}) do"
+        " Note(n .. '=' .. tostring(GetPluginInfo(GetPluginID(), n))) end end",
+        "<triggers><trigger match='x' enabled='y' send_to='12'><send>Note('x')</send>"
+        "</trigger></triggers><aliases><alias match='y' enabled='y'/></aliases>",
+    ))
+    pack.load_source(_plugin(B, "other"))
+    pack._in_plugin(A, pack._lua.execute, "report(1, 2, 3, 5, 7, 8, 9, 10, 11, 15, 16, 17, "
+                    "18, 19, 21, 23, 25)")
+    written = int(datetime.datetime(2012, 4, 27, 18, 46, 16).timestamp())
+    modified = int(datetime.datetime(2014, 1, 20).timestamp())
+    assert _notes(sink) == [
+        "1=sbrief", "2=Ruthgul", "3=Gags most melee attacks.", "5=Lua", f"7={A}",
+        "8=less spam", "9=1", "10=1", "11=0", "15=true", "16=true", "17=true", "18=4.71",
+        "19=1.5", "21=1", "23=", "25=-50",
+    ]
+    assert pack._lua.eval(f"GetPluginInfo('{A}', 13)") == written
+    assert pack._lua.eval(f"GetPluginInfo('{A}', 14)") == modified
+    assert pack._lua.eval(f"GetPluginInfo('{B}', 13)") is None  # no date given
+    assert pack._lua.eval(f"GetPluginInfo('{B}', 21)") == 2
+    assert pack._lua.eval(f"GetPluginInfo('{A}', 4)").startswith("function report")
+    assert pack._lua.eval(f"GetPluginInfo('{A}', 99)") is None
+    assert pack._lua.eval("GetPluginInfo('nobody', 1)") is None
+
+
+def test_a_called_plugin_knows_who_called_it():
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(_plugin(
+        A, "callee", "function who() Note('called by ' .. GetPluginInfo(GetPluginID(), 23)) end",
+    ))
+    pack.load_source(_plugin(B, "caller", f"CallPlugin('{A}', 'who')"))
+    pack._lua.execute(f"CallPlugin('{A}', 'who')")  # the world isn't a plugin
+    assert _notes(sink) == [f"called by {B}", "called by "]
+
+
+def test_materia_magica_help_prints_the_plugins_description():
+    # Each of the V.I. bundle's plugins answers "<name> help" with its description and the
+    # date it was last changed; both came out blank, and os.date choked on the date.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"), full_stdlib=True)  # trusted, as it is
+    pack.load_source(_described(
+        A, "sbrief",
+        "function OnHelp()\n"
+        "  ColourNote('silver', 'black', world.GetPluginInfo(world.GetPluginID(), 3))\n"
+        "  ColourNote('silver', 'black', '(this version: ' .."
+        " os.date('%Y', GetPluginInfo(GetPluginID(), 14)) .. ')')\n"
+        "end",
+        "<aliases><alias match='sbrief help' enabled='y' script='OnHelp'/></aliases>",
+    ))
+    assert engine.process_input("sbrief help") == []
+    assert _notes(sink) == ["Gags most melee attacks.", "(this version: 2014)"]

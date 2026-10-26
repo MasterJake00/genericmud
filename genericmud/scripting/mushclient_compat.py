@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import datetime
 import hashlib
 import json
 import random
@@ -403,6 +404,51 @@ _GMCP_HANDLER_ID = "3e7dedbe37e44942dd46d264"  # GMCP_handler_NJG broadcast iden
 
 
 _XML_TRUE = frozenset({"y", "yes", "1", "-1", "true", "t"})
+_PLUGIN_SEQUENCE = 5000  # MUSHclient's default plugin sequence
+_PLUGIN_DATE = re.compile(r"^(\d+)-(\d+)-(\d+)(?:\s+(\d+)(?::(\d+))?(?::(\d+))?)?$")
+
+
+def _plugin_date(text: str | None) -> int | None:
+    """A plugin's date_written/date_modified as Lua gets it from MUSHclient: Unix seconds
+    for "YYYY-MM-DD [HH:MM:SS]" in local time, or nil (MUSHclient refuses a malformed one;
+    genericMud just leaves it out)."""
+    found = _PLUGIN_DATE.match((text or "").strip())
+    if found is None:
+        return None
+    try:
+        parts = [int(part) for part in found.groups(default="0")]
+        return int(datetime.datetime(*parts).timestamp())
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _plugin_number(text: str | None, default: float) -> float:
+    try:
+        return float(text) if text is not None else default
+    except ValueError:
+        return default
+
+
+def _plugin_details(plugin: ET.Element) -> dict:
+    """What GetPluginInfo answers about a plugin, read the way MUSHclient reads it."""
+    description = plugin.find("description")
+    text = ""
+    if description is not None:
+        text = description.text or ""
+        if _xml_flag(description.attrib, "trim"):
+            text = text.strip("\n\r\t ")
+    return {
+        "author": plugin.get("author", ""),
+        "purpose": plugin.get("purpose", ""),
+        "language": plugin.get("language", ""),
+        "description": text,
+        "date_written": _plugin_date(plugin.get("date_written")),
+        "date_modified": _plugin_date(plugin.get("date_modified")),
+        "requires": _plugin_number(plugin.get("requires"), 0.0),
+        "version": _plugin_number(plugin.get("version"), 0.0),
+        "sequence": int(_plugin_number(plugin.get("sequence"), _PLUGIN_SEQUENCE)),
+        "installed": int(time.time()),
+    }
 
 
 def _xml_flag(attrs: dict[str, str], name: str, default: bool = False) -> bool:
@@ -1006,11 +1052,15 @@ class MushclientPack:
     def _as_plugin(self, plugin_id: str, function):
         def call(*args: object):
             previous = self._current_plugin
+            info = self._plugin_info.get(plugin_id, {})
+            previous_caller = info.get("calling", "")
+            info["calling"] = previous if previous in self._plugin_info else ""
             self._current_plugin = plugin_id
             try:
                 return function(*args)
             finally:
                 self._current_plugin = previous
+                info["calling"] = previous_caller
 
         return call
 
@@ -1061,16 +1111,56 @@ class MushclientPack:
         return str(plugin_id or "") in self._plugin_info
 
     def _get_plugin_info(self, plugin_id: object = "", info_type: object = 0, *_args: object):
-        info = self._plugin_info.get(str(plugin_id or ""))
-        if info is None:
+        """MUSHclient ``GetPluginInfo``, every type its methods_plugins.cpp answers. Materia
+        Magica's plugins print their help from 3 (the description) and 14 (a date)."""
+        found = self._find_plugin(plugin_id)
+        if found is None:
             return None
+        info = self._plugin_info[found]
+        path = info.get("path")
         code = int(_to_float(info_type) or 0)
-        if code == 17:  # enabled
-            return bool(info["enabled"])
-        if code == 20:  # plugin directory, including trailing separator
-            path = info.get("path")
-            return path.parent.as_posix() + "/" if isinstance(path, Path) else ""
-        return info.get("name", "") if code == 1 else ""
+        if code in (9, 10):
+            kind = TRIGGER if code == 9 else ALIAS
+            return sum(1 for plugin, _label in self._rules[kind] if plugin == found)
+        if code == 11:
+            return sum(1 for plugin, _label in self._timers if plugin == found)
+        if code == 16:  # MUSHclient starts a script engine for script, or send-to-script rules
+            return bool(info.get("script")) or any(
+                rule.send_to in _SEND_TO_SCRIPT_CODES
+                for rules in self._rules.values()
+                for (plugin, _label), rule in rules.items() if plugin == found
+            )
+        if code == 21:  # place in the plugin list, which MUSHclient keeps in sequence order
+            order = sorted(
+                enumerate(self._plugin_info.items()),
+                key=lambda item: (int(item[1][1].get("sequence", _PLUGIN_SEQUENCE)), item[0]),
+            )
+            return next(place for place, (_index, (key, _info)) in enumerate(order, 1)
+                        if key == found)
+        values = {
+            1: info.get("name", ""),
+            2: info.get("author", ""),
+            3: info.get("description", ""),
+            4: info.get("script", ""),
+            5: info.get("language", ""),
+            6: str(path) if isinstance(path, Path) else "",
+            7: found,
+            8: info.get("purpose", ""),
+            12: len(self._api.variables()),
+            13: info.get("date_written"),  # nil when the plugin gives none
+            14: info.get("date_modified"),
+            15: bool(info.get("save_state")),
+            17: bool(info["enabled"]),
+            18: float(info.get("requires", 0.0)),
+            19: float(info.get("version", 0.0)),
+            # The plugin's directory, including the trailing separator.
+            20: path.parent.as_posix() + "/" if isinstance(path, Path) else "",
+            22: info.get("installed"),
+            23: info.get("calling", ""),  # the plugin calling it through CallPlugin, if any
+            24: 0.0,  # time spent in its scripts, which genericMud doesn't keep
+            25: int(info.get("sequence", _PLUGIN_SEQUENCE)),
+        }
+        return values.get(code)
 
     def _enable_plugin(self, plugin_id: object = "", enabled: object = True, *_args: object) -> int:
         found = self._find_plugin(plugin_id)
@@ -3506,6 +3596,8 @@ class MushclientPack:
         if fn is None:
             return E_NO_SUCH_ROUTINE, f"No function '{routine}' in plugin '{name}' ({target})"
         previous = self._current_plugin
+        previous_caller = info.get("calling", "")
+        info["calling"] = previous if previous in self._plugin_info else ""
         self._current_plugin = target
         try:
             results = self._guard.run_strict(fn, *args)
@@ -3514,6 +3606,7 @@ class MushclientPack:
             return E_ERROR_CALLING_PLUGIN_ROUTINE, f"{type(error).__name__}: {error}"
         finally:
             self._current_plugin = previous
+            info["calling"] = previous_caller
         if isinstance(results, tuple):
             return (E_OK, *results)
         return E_OK, results
@@ -3812,6 +3905,7 @@ class MushclientPack:
                 # MUSHclient saves only these plugins' state when the world closes, and
                 # calls their OnPluginSaveState to do it.
                 "save_state": _xml_flag(plugin.attrib, "save_state"),
+                **_plugin_details(plugin),
             }
         try:
             # Non-plugin includes are Lua/constants fragments and must exist before the
@@ -3862,6 +3956,8 @@ class MushclientPack:
             if script_filename:
                 self._load_world_script(script_filename)
             script = "\n".join((el.text or "") for el in root.iter("script"))
+            if plugin is not None and plugin_id in self._plugin_info:
+                self._plugin_info[plugin_id]["script"] = script.strip()  # GetPluginInfo 4
             if script.strip():
                 self._guard.run_strict(self._execute_lua, script)
             if self._loading_plugins[plugin_id] == 1:  # its plain includes are loaded too
