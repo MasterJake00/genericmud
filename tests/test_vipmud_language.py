@@ -663,3 +663,123 @@ def test_isplaying_tells_the_pack_whether_its_sound_is_still_going(tmp_path):
     bus.busy.add("vip-1")
     engine.process_input("check")
     assert engine.get_var("playing") == "1"
+
+
+# --- control flow (manual 5.2.1, 5.2.3, 5.2.55, 5.2.64, 5.2.68, 5.2.69, 5.2.72) ---
+
+POTIONS = (
+    "#var hitPoints 10\n"
+    "#alias drink {#10 {\n"
+    "    #Say {Try %i};\n"
+    "    #if {@hitPoints > 30} {\n"
+    "        #abort%LEVEL%} {\n"
+    "        get potion from bag;quaff potion;#math hitPoints {@hitPoints + 5}};\n"
+    "    #say {Success %i}\n"
+    "};#say {done}}\n"
+)
+
+
+def test_abort_without_a_value_ends_only_the_current_level():
+    # The manual's potion example: the #If runs all ten times, "Success" only follows a
+    # quaff, and "done" is said whatever happens.
+    sink, engine, _pack = _load(POTIONS.replace("%LEVEL%", ""))
+    engine.process_input("drink")
+    said = _said(sink)
+    assert said[:2] == ["Try 1", "Success 1"]
+    assert said.count("Success 5") == 1 and "Success 6" not in said
+    assert said[-2:] == ["Try 10", "done"]
+    assert sink.sent.count("quaff potion") == 5
+
+
+def test_abort_with_a_value_ends_the_whole_script():
+    sink, engine, _pack = _load(POTIONS.replace("%LEVEL%", " 1"))
+    engine.process_input("drink")
+    said = _said(sink)
+    assert said[-1] == "Try 6"
+    assert "done" not in said
+
+
+def test_repeat_counts_with_repeatnum_and_i():
+    sink, engine, _pack = _load(
+        "#key f1 {#5 {#math countdown {6-%repeatnum};#say @countdown};#say BlastOff}\n"
+        "#key f2 {#26 {#var abc {@abc%chr(%i+64)}}}\n"
+    )
+    engine.press_key("f1")
+    engine.press_key("f2")
+    assert _said(sink) == ["5", "4", "3", "2", "1", "BlastOff"]
+    assert engine.get_var("abc") == "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def test_while_and_until_count_down():
+    sink, engine, _pack = _load(
+        "#VAR countdown 4\n"
+        "#While {@countdown > 1} {#say @countdown; #math countdown {@countdown-1}};#say lift\n"
+        "#VAR countdown 3\n"
+        "#until {@countdown < 1} {#say @countdown;#math countdown {@countdown-1}};#say blastoff\n"
+    )
+    assert _said(sink) == ["4", "3", "2", "lift", "3", "2", "1", "blastoff"]
+
+
+def test_a_loop_that_never_ends_stops_instead_of_freezing_the_client():
+    _sink, engine, _pack = _load("#var n 0\n#while {1} {#math n {@n + 1}}\n#var after yes")
+    assert 0 < int(engine.get_var("n")) <= 100_000
+    assert engine.get_var("after") == "yes"
+
+
+def test_wait_holds_the_rest_of_the_commands():
+    sink, engine, _pack = _load(
+        "#alias RDi {#say {Rolling};#wait 0.3;#say {You rolled}}"
+    )
+    engine.process_input("RDi")
+    assert _said(sink) == ["Rolling"]
+    assert [delay for delay, _callback in sink.scheduled] == [0.3]
+    sink.run_pending()
+    assert _said(sink) == ["Rolling", "You rolled"]
+
+
+def test_a_named_repeating_alarm_runs_until_unalarm():
+    sink, engine, _pack = _load(
+        "#alias go {#alarm tick -5 {#say tick}}\n"
+        "#alias halt {#unalarm @tick}\n"
+    )
+    engine.process_input("go")
+    assert [delay for delay, _callback in sink.scheduled] == [5]
+    sink.run_pending()
+    sink.run_pending()
+    engine.process_input("halt")
+    sink.run_pending()
+    assert _said(sink) == ["tick", "tick"]
+    assert sink.scheduled == []
+
+
+def test_unalarm_takes_the_variables_name_too_and_minus_one_stops_every_alarm():
+    sink, engine, _pack = _load(
+        "#alarm LagTest -1 {#say lag}\n#alarm Other 3 {#say other}\n"
+        "#alias stoplag {#unalarm LagTest}\n#alias stopall {#unalarm -1}\n"
+    )
+    engine.process_input("stoplag")
+    sink.run_pending()
+    assert _said(sink) == ["other"]
+    sink.scheduled.clear()
+    engine.process_input("stopall")
+    assert _said(sink) == ["other"]
+
+
+def test_an_alarm_given_only_a_time_changes_how_often_it_runs():
+    sink, engine, _pack = _load("#alarm check -120 {save}\n#alarm check -300\n")
+    assert [delay for delay, _callback in sink.scheduled] == [120, 300]
+    sink.run_pending()  # the old schedule is dropped; the new one sends once
+    assert sink.sent == ["save"]
+
+
+def test_alarm_times_take_a_decimal_comma():
+    # Cosmic Rage and the unofficial Prometheus pack ask which decimal separator the
+    # system uses and build their alarm times with it: "0,50" is half a second.
+    sink, _engine, _pack = _load("#var decchar {,}\n#alarm 0@{decchar}50 {#say half}")
+    assert [delay for delay, _callback in sink.scheduled] == [0.5]
+
+
+def test_a_wildcard_number_can_come_from_a_variable():
+    sink, engine, _pack = _load("#trigger {* and *} {#var which 2; #say {%{@which}}}")
+    engine.process_line(Line("salt and pepper"))
+    assert _said(sink) == ["pepper"]

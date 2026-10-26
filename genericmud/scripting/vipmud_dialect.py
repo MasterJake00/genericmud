@@ -77,6 +77,12 @@ _EXPRESSION_MAX_DEPTH = 64
 # through a captured variable, and 9^9^9 would take the client down.
 _POWER_MAX_BITS = 256
 _DEFAULT_VOLUME = 100
+# A runaway script stops instead of freezing every tab: no loop runs more than this many
+# times, and one script (with everything it calls) runs at most this many commands.
+_LOOP_LIMIT = 10_000
+_STEP_LIMIT = 50_000
+_REPEAT_LIMIT = 32_767  # #N {commands}: the manual's range is 1 to 32767
+_MIN_REPEATING_ALARM = 0.1  # seconds; "#alarm -0 {...}" must not spin
 _MASTER_HANDLE = "0"  # VIPMud handle 0 == all cues / master volume
 _MAX_EXEC_DEPTH = 20  # bare-text alias expansion recursion cap (self-invoking alias)
 _VIPMUD_VERSION = "200000"  # %Version: VIPMud 2.0.0 as xyyzzz
@@ -372,13 +378,6 @@ def _to_int(value: str, default: int) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
-
-
-def _as_number(text: str) -> float | None:
-    try:
-        return float(text)
-    except (TypeError, ValueError):
-        return None
 
 
 _INTEGER_RE = re.compile(r"^[+-]?\d{1,30}$")
@@ -840,8 +839,24 @@ def _split_trigger_name(pattern: str) -> tuple[str, str]:
     return "", pattern
 
 
-class _Abort(Exception):  # noqa: N818 - a control-flow signal (#Abort), not an error condition
-    """Raised by ``#Abort`` to stop the current script body (a trigger fire or a load)."""
+class _AbortLevel(Exception):  # noqa: N818 - a control-flow signal (#Abort), not an error
+    """``#Abort`` with no value: ends the current level, a loop's pass or the whole script
+    when it isn't in a loop (manual 5.2.1)."""
+
+
+class _AbortScript(Exception):  # noqa: N818 - a control-flow signal (#Abort 1), not an error
+    """``#Abort`` with a value: ends the whole script, loops and all."""
+
+
+_ABORTS = (_AbortLevel, _AbortScript)
+
+
+@dataclass
+class _Alarm:
+    body: str
+    seconds: float
+    repeating: bool
+    generation: int = 0  # bumped on every reschedule, so a superseded timer does nothing
 
 
 class VipMudPack:
@@ -867,6 +882,10 @@ class VipMudPack:
         self._aliases: dict[tuple[str, tuple[str, ...]], _VipRule] = {}
         self._keys: dict[str, dict[tuple[str, ...], _VipRule]] = {}
         self._rule_count = 0
+        self._alarms: dict[int, _Alarm] = {}  # by the number #Alarm hands its variable
+        self._alarm_count = 0
+        self._run_depth = 0  # scripts running inside one another (an alias calling an alias)
+        self._steps = 0  # commands the outermost running script has used of _STEP_LIMIT
         # Classes start switched off; a rule in a class works only while it's enabled.
         self._enabled_classes: set[str] = set()
         self._current_classes: tuple[str, ...] = ()  # set by #Class with just a name
@@ -979,12 +998,7 @@ class VipMudPack:
                 temporary.unlink(missing_ok=True)
 
     def load_source(self, source: str) -> None:
-        scope = _Scope([])
-        for command, args in tokenize_statements(source):
-            try:
-                self._execute_statement(command, args, scope)
-            except _Abort:
-                return  # a top-level #Abort stops loading the rest of this script
+        self._run_rule(source, _Scope([]))  # an #Abort stops loading the rest of the file
 
     def _engine_name(self) -> str:
         self._rule_count += 1
@@ -1124,11 +1138,17 @@ class VipMudPack:
             self._run_rule(candidates[-1].body, _Scope([""]))
 
     def _run_rule(self, body: str, scope: _Scope) -> None:
-        """Run a rule's commands as one script: an #Abort ends it here."""
+        """Run commands as one script (a rule firing, an alarm, a file loading): an #Abort
+        of either kind ends it here."""
+        if self._run_depth == 0:
+            self._steps = 0  # the budget covers this script and everything it calls
+        self._run_depth += 1
         try:
             self._execute_body(body, scope)
-        except _Abort:
+        except _ABORTS:
             pass
+        finally:
+            self._run_depth -= 1
 
     def _define_alias(self, args: list[_Tok], scope: _Scope) -> None:
         name = args[0].text.strip()
@@ -1178,8 +1198,51 @@ class VipMudPack:
         return run
 
     def _execute_body(self, body: str, scope: _Scope) -> None:
-        for command, args in tokenize_statements(body):
+        self._run_statements(tokenize_statements(body), 0, scope)
+
+    def _run_statements(
+        self, statements: list[tuple[str | None, list[_Tok]]], start: int, scope: _Scope
+    ) -> None:
+        for index in range(start, len(statements)):
+            command, args = statements[index]
+            self._steps += 1
+            if self._steps > _STEP_LIMIT:
+                if self._steps == _STEP_LIMIT + 1 and self._api.diag is not None:
+                    self._api.diag.event("vipmud.script_stopped", source=self._api.source,
+                                         reason="ran too many commands")
+                raise _AbortScript
+            if command == "WAIT":
+                # #Wait holds the rest of these commands for a while. Only this list waits:
+                # whatever called it carries on, which is all the packs' #Waits need.
+                delay = self._delay(args, scope)
+                if delay is not None:
+                    self._api.add_timer(
+                        delay, lambda index=index: self._resume(statements, index + 1, scope)
+                    )
+                    return
+                continue
             self._execute_statement(command, args, scope)
+
+    def _resume(
+        self, statements: list[tuple[str | None, list[_Tok]]], start: int, scope: _Scope
+    ) -> None:
+        self._steps = 0
+        try:
+            self._run_statements(statements, start, scope)
+        except _ABORTS:
+            pass
+
+    def _delay(self, args: list[_Tok], scope: _Scope) -> float | None:
+        """Seconds for #Wait and #Alarm. Packs build them with the decimal separator their
+        system uses ("0,50"), so a comma is a decimal point here; "(0.1)" works too."""
+        if not args:
+            return None
+        text = self._expand(args[0].text, scope).strip().replace(",", ".")
+        number = _number(text)
+        if number is None:
+            value = self._evaluate(text, scope)
+            number = _number(value) if value is not None else None
+        return float(number) if number is not None else None
 
     def _execute_statement(self, command: str | None, args: list[_Tok], scope: _Scope) -> None:
         if command is None or command == "SEND":
@@ -1232,7 +1295,7 @@ class VipMudPack:
             self._execute_body(self._expand(args[0].text, scope), scope)
         elif command == "FORALL" and len(args) > 1:
             self._execute_forall(args, scope)
-        elif command == "ALARM" and len(args) > 1:
+        elif command in ("ALARM", "GALARM") and len(args) > 1:
             self._execute_alarm(args, scope)
         elif command == "GAGLINE" and scope.line is not None:
             # "#gagline [count] voice" gags self-voice but keeps the line reviewable; without a
@@ -1241,7 +1304,13 @@ class VipMudPack:
             scope.line.gagged = True
             scope.line.display_when_gagged = any(a.text.lower() == "voice" for a in args)
         elif command == "ABORT":
-            raise _Abort
+            raise _AbortScript if args else _AbortLevel
+        elif command.isdigit():
+            self._execute_repeat(int(command), args, scope)
+        elif command in ("WHILE", "UNTIL") and len(args) > 1:
+            self._execute_loop(command == "UNTIL", args, scope)
+        elif command in ("UNALARM", "GUNALARM") and args:
+            self._execute_unalarm(args, scope)
         elif command == "PC" and len(args) > 1:
             self._execute_pc(args, scope)
         elif command == "LOAD" and args:
@@ -1465,31 +1534,104 @@ class VipMudPack:
         item in ``%i``. VIPMud loaders use it to pull in every script, e.g.
         ``#ForAll {combat|ground|...} {#load {Scripts\\%I.set}}``."""
         body = args[1].text
-        for number, item in enumerate(self._expand(args[0].text, scope).split("|"), 1):
-            item = item.strip()
-            if item:
+        items = [item.strip() for item in self._expand(args[0].text, scope).split("|")]
+        for number, item in enumerate([item for item in items if item][:_LOOP_LIMIT], 1):
+            try:
                 self._execute_body(body, scope.looping(item, number))
+            except _AbortLevel:
+                continue  # a plain #Abort ends this pass; the loop goes on
+
+    def _execute_repeat(self, count: int, args: list[_Tok], scope: _Scope) -> None:
+        """``#10 {commands}``: run them that many times, with the pass number in %repeatnum
+        (and %i)."""
+        if not args:
+            return
+        for number in range(1, min(count, _REPEAT_LIMIT) + 1):
+            try:
+                self._execute_body(args[0].text, scope.looping(str(number), number))
+            except _AbortLevel:
+                continue
+
+    def _execute_loop(self, until: bool, args: list[_Tok], scope: _Scope) -> None:
+        """``#While {condition} {commands}`` runs while the condition holds; ``#Until``
+        runs the commands first and stops once it holds."""
+        for _ in range(_LOOP_LIMIT):
+            if not until and not self._condition(args[0].text, scope):
+                return
+            try:
+                self._execute_body(args[1].text, scope)
+            except _AbortLevel:
+                pass
+            if until and self._condition(args[0].text, scope):
+                return
+        if self._api.diag is not None:
+            self._api.diag.event("vipmud.loop_stopped", source=self._api.source,
+                                 limit=_LOOP_LIMIT)
 
     def _execute_alarm(self, args: list[_Tok], scope: _Scope) -> None:
-        """``#alarm <delay> {body}`` — run ``body`` after ``delay`` seconds (a VIPMud timer).
+        """``#Alarm [variable] [-]seconds [commands]`` (manual 5.2.3): run the commands after
+        that many seconds, or every that many seconds when negative. The variable gets the
+        alarm's number for #UnAlarm; given a variable and a time but no commands, it sets a
+        new time for that alarm.
 
-        Packs defer loading the rest of the pack until the login line arrives, via
-        ``#alarm 0 {#load ...}`` fired from a login trigger. Cancel/named forms (``#alarm -1``,
-        ``#unalarm``) aren't modelled. Fires only when an event loop drives the engine's
-        scheduler (the live app); under a no-op scheduler the timer simply never runs.
+        Packs defer loading the rest of the pack until the login line arrives with
+        ``#alarm 0 {#load ...}``. Alarms fire only when an event loop drives the engine's
+        scheduler (the live app); under a no-op scheduler they never run.
         """
-        delay = _as_number(self._expand(args[0].text, scope))
-        if delay is None or delay < 0:
+        name = ""
+        delay = self._delay(args[:1], scope)
+        body: _Tok | None = args[1] if len(args) > 1 else None
+        if delay is None:  # the first parameter names the variable
+            name = _fold(self._expand(args[0].text, scope).strip())
+            delay = self._delay(args[1:2], scope)
+            body = args[2] if len(args) > 2 else None
+        if delay is None:
             return
-        body = args[1].text
-        self._api.add_timer(delay, lambda: self._run_alarm(body))
+        existing = _to_int(self._api.get_var(name, "") or "", 0) if name else 0
+        if body is None:
+            alarm = self._alarms.get(existing)
+            if alarm is not None:
+                alarm.seconds, alarm.repeating = abs(delay), delay < 0
+                self._schedule_alarm(existing, alarm)
+            return
+        self._alarms.pop(existing, None)  # setting a named alarm again replaces it
+        self._alarm_count += 1
+        alarm = _Alarm(body.text, abs(delay), delay < 0)
+        self._alarms[self._alarm_count] = alarm
+        if name:
+            self._api.set_var(name, str(self._alarm_count))
+        self._schedule_alarm(self._alarm_count, alarm)
 
-    def _run_alarm(self, body: str) -> None:
-        # An alarm body runs later, on its own: the wildcards of whatever set it are gone.
-        try:
-            self._execute_body(body, _Scope([]))
-        except _Abort:
-            pass
+    def _schedule_alarm(self, number: int, alarm: _Alarm) -> None:
+        alarm.generation += 1
+        generation = alarm.generation
+        seconds = max(alarm.seconds, _MIN_REPEATING_ALARM) if alarm.repeating else alarm.seconds
+        self._api.add_timer(seconds, lambda: self._fire_alarm(number, generation))
+
+    def _fire_alarm(self, number: int, generation: int) -> None:
+        alarm = self._alarms.get(number)
+        if alarm is None or alarm.generation != generation:
+            return  # cancelled, or set to a new time since
+        if alarm.repeating:
+            self._schedule_alarm(number, alarm)
+        else:
+            del self._alarms[number]
+        # It runs on its own: the wildcards of whatever set it are gone.
+        self._run_rule(alarm.body, _Scope([]))
+
+    def _execute_unalarm(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#UnAlarm @variable`` (or its name, or a number) stops that alarm; a negative
+        number stops them all."""
+        text = self._expand(args[0].text, scope).strip()
+        number = _number(text)
+        if number is None:
+            number = _number(self._api.get_var(_fold(text), "") or "")
+        if number is None:
+            return
+        if number < 0:
+            self._alarms.clear()
+        else:
+            self._alarms.pop(int(number), None)
 
     def _execute_math(self, args: list[_Tok], scope: _Scope) -> None:
         """``#math <var> {expr}`` — arithmetic into a variable. Cosmic Rage computes its
@@ -1607,7 +1749,7 @@ class VipMudPack:
         c = text[j]
         if c == "{":
             inner, end = _scan_block(text, j)
-            key = inner.strip()
+            key = self._expand(inner, scope).strip()  # %{@n}: the number from a variable
             if key.isdigit():
                 return self._wildcard(scope, int(key)), end
             value = self._system_variable(key.lower(), scope)
