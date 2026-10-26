@@ -23,6 +23,7 @@ import concurrent.futures
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import webbrowser
 import zipfile
@@ -170,11 +171,13 @@ _FLUSH_INTERVAL_MS = 50  # batch output appends during floods
 # How long the variables window waits for the session's loop thread to hand over a
 # snapshot. A healthy loop answers in microseconds; this only bounds a wedged one.
 _VARIABLE_SNAPSHOT_TIMEOUT_S = 2.0
-# How long a soundpack's dialog waits for an answer before it's closed as cancelled. Every
-# tab waits with it (they share the loop thread), so a dialog nobody can see mustn't hold
-# them forever, but Cosmic Rage's menu items are paragraphs and reading eight of them with
-# a screen reader takes a few minutes.
-_PACK_QUESTION_TIMEOUT_S = 300.0
+# How long a soundpack's question waits. Every tab waits with it (they share the loop
+# thread), so one the window never manages to show is given up on soon. One on screen is
+# modal, so nothing else in genericMud can be used until it's answered anyway, and Cosmic
+# Rage's menu items are paragraphs: it gets a long while before it closes as cancelled.
+_PACK_QUESTION_SHOW_TIMEOUT_S = 60.0
+_PACK_QUESTION_ANSWER_TIMEOUT_S = 900.0
+_PACK_QUESTION_POLL_S = 0.05  # how often the asking pack's own timers get a turn meanwhile
 _PACK_SOUND_SUFFIXES = frozenset({".wav", ".ogg", ".mp3", ".flac"})  # bundled-audio detection
 
 # Numpad compass (VIPMud/MUDBall convention): digits walk, 5/0 look, . scans,
@@ -410,12 +413,16 @@ class SessionPanel(wx.Panel):
         except Exception:  # noqa: BLE001 - timeout, closed loop, or a failed read: say so
             return None
 
-    def _ask_from_pack(self, request: dict) -> object | None:  # loop thread
+    def _ask_from_pack(
+        self, request: dict, while_waiting: Callable[[], None] | None = None
+    ) -> object | None:  # loop thread
         """Show a pack's question and wait for the answer; None when cancelled.
 
         The pack's script stops here until the player answers, as it does in VIPMud and
-        MUSHclient, and every tab waits with it because they share this thread. A dialog
-        left for _PACK_QUESTION_TIMEOUT_S is closed and counts as cancelled.
+        MUSHclient, and every tab waits with it because they share this thread.
+        ``while_waiting`` runs every _PACK_QUESTION_POLL_S meanwhile (the pack's own alarms).
+        A question that isn't on screen within _PACK_QUESTION_SHOW_TIMEOUT_S, or isn't
+        answered within _PACK_QUESTION_ANSWER_TIMEOUT_S of appearing, counts as cancelled.
         """
         if not self._alive:
             return None
@@ -423,12 +430,27 @@ class SessionPanel(wx.Panel):
         self._questions.append(question)
         try:
             wx.CallAfter(self._show_question, question)
-            if not question.done.wait(_PACK_QUESTION_TIMEOUT_S):
-                wx.CallAfter(self._withdraw_question, question)
-                return None
+            give_up = time.monotonic() + _PACK_QUESTION_SHOW_TIMEOUT_S
+            while not question.done.wait(_PACK_QUESTION_POLL_S):
+                if question.shown_at is not None:
+                    give_up = question.shown_at + _PACK_QUESTION_ANSWER_TIMEOUT_S
+                if time.monotonic() > give_up:
+                    wx.CallAfter(self._withdraw_question, question)
+                    return None
+                if while_waiting is not None:
+                    self._run_while_waiting(while_waiting)
             return question.answer
         finally:
             self._questions.remove(question)
+
+    def _run_while_waiting(self, while_waiting: Callable[[], None]) -> None:  # loop thread
+        try:
+            while_waiting()
+        except Exception as error:  # noqa: BLE001 - a pack's timer mustn't end the wait
+            if self._diag is not None:
+                self._diag.event(
+                    "pack.ask.while_waiting_failed", error=f"{type(error).__name__}: {error}"
+                )
 
     def _show_question(self, question: _PackQuestion) -> None:  # UI thread
         if question.done.is_set() or not self._alive:
@@ -443,15 +465,13 @@ class SessionPanel(wx.Panel):
         request = question.request
         title = self._question_title(request)
         if request["kind"] == "message":
-            dialog = build_pack_message(self, request, title)
+            dialog = PackMessageDialog(self, request, title)
         else:
             dialog = PackQuestionDialog(self, request, title)
         question.dialog = dialog
+        question.shown_at = time.monotonic()
         try:
-            result = dialog.ShowModal()
-            if request["kind"] == "message":
-                return pack_message_answer(request["buttons"], result)
-            return dialog.answer() if result == wx.ID_OK else None
+            return dialog.answer(dialog.ShowModal())
         finally:
             question.dialog = None
             dialog.Destroy()
@@ -459,8 +479,9 @@ class SessionPanel(wx.Panel):
     def _withdraw_question(self, question: _PackQuestion) -> None:  # UI thread
         """Cancel a question nobody answered in time, or one the closing tab leaves behind."""
         question.finish(None)
-        if question.dialog is not None:
-            question.dialog.EndModal(wx.ID_CANCEL)
+        dialog = question.dialog
+        if dialog is not None and dialog.IsModal():
+            dialog.EndModal(wx.ID_CANCEL)
 
     def _question_title(self, request: dict) -> str:
         """The pack's title, or the world's name when it gave none. With several worlds open
@@ -819,8 +840,14 @@ class SessionPanel(wx.Panel):
     def close(self) -> None:
         """Tear down the session; safe to call from the wx thread on tab close."""
         self._alive = False
-        for question in list(self._questions):  # free the loop thread to tear down
-            self._withdraw_question(question)
+        try:
+            for question in list(self._questions):  # free the loop thread to tear down
+                self._withdraw_question(question)
+        except Exception as error:  # noqa: BLE001 - the session must be torn down regardless
+            if self._diag is not None:
+                self._diag.event(
+                    "pack.ask.withdraw_failed", error=f"{type(error).__name__}: {error}"
+                )
         self._loop.call_soon_threadsafe(self._teardown)
 
     def _teardown(self) -> None:  # loop thread
@@ -893,8 +920,12 @@ class PackQuestionDialog(wx.Dialog):
             self._control = wx.ListBox(
                 self, choices=request["items"], style=wx.LB_SINGLE, size=(560, 300)
             )
+            # Nothing is selected unless the pack names an item, as in MUSHclient, where OK
+            # alone then answers nothing: a mapper's "Choose exit to delete" deletes whatever
+            # comes back. A VIPMud pick list always names one.
             selected = request.get("selected")
-            self._control.SetSelection(selected if selected is not None else 0)
+            if selected is not None:
+                self._control.SetSelection(selected)
             self._control.Bind(wx.EVT_LISTBOX_DCLICK, lambda _event: self.EndModal(wx.ID_OK))
         self._control.SetName(prompt or title)
         outer.Add(self._control, 1, wx.ALL | wx.EXPAND, 10)
@@ -902,7 +933,10 @@ class PackQuestionDialog(wx.Dialog):
         self.SetSizerAndFit(outer)
         self._control.SetFocus()
 
-    def answer(self) -> object | None:
+    def answer(self, result: int = wx.ID_OK) -> object | None:
+        """What the player chose, given how the dialog closed (ShowModal's result)."""
+        if result != wx.ID_OK:
+            return None
         if self._kind == "text":
             return self._control.GetValue()
         if self._kind == "choices":
@@ -911,41 +945,68 @@ class PackQuestionDialog(wx.Dialog):
         return index if index != wx.NOT_FOUND else None
 
 
-# How each of MUSHclient's button sets shows as a wx message dialog: its style, and the
-# button ids in the order of MESSAGE_BUTTONS. Retry/Cancel and Abort/Retry/Ignore are the
-# standard buttons relabelled.
-_MESSAGE_STYLES = {
-    "ok": (wx.OK, (wx.ID_OK,)),
-    "okcancel": (wx.OK | wx.CANCEL, (wx.ID_OK, wx.ID_CANCEL)),
-    "yesno": (wx.YES_NO, (wx.ID_YES, wx.ID_NO)),
-    "yesnocancel": (wx.YES_NO | wx.CANCEL, (wx.ID_YES, wx.ID_NO, wx.ID_CANCEL)),
-    "retrycancel": (wx.OK | wx.CANCEL, (wx.ID_OK, wx.ID_CANCEL)),
-    "abortretryignore": (wx.YES_NO | wx.CANCEL, (wx.ID_YES, wx.ID_NO, wx.ID_CANCEL)),
+# A msgbox button's id and label, by the name MESSAGE_BUTTONS gives it.
+_MESSAGE_BUTTON_IDS = {
+    "ok": (wx.ID_OK, "OK"),
+    "cancel": (wx.ID_CANCEL, "Cancel"),
+    "yes": (wx.ID_YES, "&Yes"),
+    "no": (wx.ID_NO, "&No"),
+    "retry": (wx.ID_RETRY, "&Retry"),
+    "abort": (wx.ID_ABORT, "&Abort"),
+    "ignore": (wx.ID_IGNORE, "&Ignore"),
 }
-_MESSAGE_ICON_STYLES = {
-    "!": wx.ICON_WARNING, "?": wx.ICON_QUESTION, "i": wx.ICON_INFORMATION, ".": wx.ICON_ERROR,
+_MESSAGE_ICONS = {
+    "!": wx.ART_WARNING, "?": wx.ART_QUESTION, "i": wx.ART_INFORMATION, ".": wx.ART_ERROR,
 }
-_DEFAULT_BUTTON_STYLES = {wx.ID_NO: wx.NO_DEFAULT, wx.ID_CANCEL: wx.CANCEL_DEFAULT}
 
 
-def build_pack_message(parent: wx.Window | None, request: dict, title: str) -> wx.MessageDialog:
-    """The native message box for a pack's msgbox, with its buttons, icon and default."""
-    buttons = request["buttons"]
-    style, ids = _MESSAGE_STYLES[buttons]
-    style |= _MESSAGE_ICON_STYLES.get(request.get("icon"), wx.ICON_WARNING)
-    style |= _DEFAULT_BUTTON_STYLES.get(ids[request.get("default", 1) - 1], 0)
-    dialog = wx.MessageDialog(parent, request.get("prompt") or "", title, style)
-    if buttons == "retrycancel":
-        dialog.SetOKCancelLabels("&Retry", "Cancel")
-    elif buttons == "abortretryignore":
-        dialog.SetYesNoCancelLabels("&Abort", "&Retry", "&Ignore")
-    return dialog
+class PackMessageDialog(wx.Dialog):
+    """A soundpack's message box (MUSHclient's utils.msgbox): its text and its buttons.
 
+    genericMud's own dialog, not the system's, so a closing tab or a question that ran out
+    of time can take it down (EndModal fails on a native one). The text is a StaticText the
+    screen reader reads with the dialog, and the default button has the focus. Escape is
+    Cancel where there is one and OK on a lone OK, and does nothing on Yes/No or
+    Abort/Retry/Ignore, as on Windows' own message boxes. :meth:`answer` names the button.
+    """
 
-def pack_message_answer(buttons: str, result: int) -> str | None:
-    """The name of the button a message dialog's ShowModal result stands for."""
-    _style, ids = _MESSAGE_STYLES[buttons]
-    return MESSAGE_BUTTONS[buttons][ids.index(result)] if result in ids else None
+    def __init__(self, parent: wx.Window, request: dict, title: str) -> None:
+        super().__init__(parent, title=title)
+        names = MESSAGE_BUTTONS[request["buttons"]]
+        self._names = {_MESSAGE_BUTTON_IDS[name][0]: name for name in names}
+        outer = wx.BoxSizer(wx.VERTICAL)
+        row = wx.BoxSizer(wx.HORIZONTAL)
+        art = _MESSAGE_ICONS.get(request.get("icon"), wx.ART_WARNING)
+        icon = wx.StaticBitmap(self, bitmap=wx.ArtProvider.GetBitmap(art, wx.ART_MESSAGE_BOX))
+        row.Add(icon, 0, wx.ALL, 10)
+        message = wx.StaticText(self, label=(request.get("prompt") or "").replace("&", "&&"))
+        message.Wrap(480)
+        row.Add(message, 1, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 10)
+        outer.Add(row, 1, wx.EXPAND)
+        buttons = wx.BoxSizer(wx.HORIZONTAL)
+        self._buttons: list[wx.Button] = []
+        for name in names:
+            button_id, label = _MESSAGE_BUTTON_IDS[name]
+            button = wx.Button(self, button_id, label=label)
+            button.Bind(wx.EVT_BUTTON, lambda _event, ident=button_id: self.EndModal(ident))
+            buttons.Add(button, 0, wx.ALL, 5)
+            self._buttons.append(button)
+        outer.Add(buttons, 0, wx.ALIGN_CENTER | wx.BOTTOM, 5)
+        self.SetSizerAndFit(outer)
+        if "cancel" in names:
+            self.SetEscapeId(wx.ID_CANCEL)
+        elif names == ("ok",):
+            self.SetEscapeId(wx.ID_OK)
+        else:
+            self.SetEscapeId(wx.ID_NONE)
+        default = self._buttons[min(max(request.get("default", 1), 1), len(names)) - 1]
+        default.SetDefault()
+        default.SetFocus()
+
+    def answer(self, result: int) -> str | None:
+        """The name of the button pressed, given ShowModal's result; None when the dialog
+        was closed some other way."""
+        return self._names.get(result)
 
 
 @dataclass
@@ -957,6 +1018,7 @@ class _PackQuestion:
     answer: object = None
     done: threading.Event = field(default_factory=threading.Event)
     dialog: wx.Dialog | None = None  # while it's on screen
+    shown_at: float | None = None  # time.monotonic() when it came up
 
     def finish(self, answer: object) -> None:
         if not self.done.is_set():

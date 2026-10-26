@@ -162,7 +162,7 @@ def test_a_slow_answer_doesnt_use_up_the_scripts_time(monkeypatch):
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
 
     class SlowPlayer(RecordingSink):
-        def ask(self, request):
+        def ask(self, request, while_waiting=None):
             clock[0] += 60.0  # a minute arrowing through Cosmic Rage's paragraphs
             return super().ask(request)
 
@@ -325,7 +325,7 @@ def test_a_slow_answer_doesnt_use_up_the_lua_time_limit(monkeypatch):
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
 
     class SlowPlayer(RecordingSink):
-        def ask(self, request):
+        def ask(self, request, while_waiting=None):
             clock[0] += 60.0
             return super().ask(request)
 
@@ -364,7 +364,7 @@ def test_the_app_hands_a_packs_question_to_whoever_shows_dialogs():
     api = ScriptApi(app.engine)
     assert api.ask_text("Name", "Who are you?") is None  # no window: cancelled
     asked = []
-    app.asker = lambda request: asked.append(request) or "Bob"
+    app.asker = lambda request, while_waiting: asked.append(request) or "Bob"
     assert api.ask_text("Name", "Who are you?") == "Bob"
     assert asked[0]["kind"] == "text"
 
@@ -388,3 +388,125 @@ def test_a_key_bound_only_to_vipmuds_own_menus_stays_genericmuds():
         assert not engine.has_key(vip_key_to_combo(vip_key)), vip_key
     assert engine.has_key("f5")
     assert engine.has_key("f6")  # it does something of its own too
+
+
+# --- what an independent review of the first version reproduced ---
+
+
+def test_a_caption_from_a_variable_keeps_its_colons():
+    # Cosmic Rage's gag creator shows the line being gagged in a caption. A gag like
+    # "Bob says: *" split that item and sent "*:setgagline" to the MUD.
+    script = (
+        "#var newgag {Bob says: *}\n"
+        "#alias setgagline {#say setting}\n"
+        "#alias agl {#pick {*Gag menu:agl|What line are we gagging today? @newgag:setgagline}}"
+    )
+    sink, engine = _vip(script, answers=[1])
+    engine.process_input("agl")
+    assert sink.asked[0]["items"] == ["Gag menu", "What line are we gagging today? Bob says: *"]
+    assert _said(sink) == ["setting"]
+    assert sink.sent == []
+
+
+def test_an_escaped_pipe_written_in_the_list_stays_in_its_item():
+    sink, engine = _vip(
+        "#alias go {#pick {Earth:#say {cgc 1} Entry~|NoReturn|Mars:#say m}}", answers=[0]
+    )
+    engine.process_input("go")
+    assert sink.asked[0]["items"] == ["Earth", "Mars"]
+    assert _said(sink) == ["cgc 1"]
+
+
+def test_a_list_variable_after_a_title_adds_its_items():
+    # Star Conquest: %pick(p:Which buffer do you want to delete?|@CurrentBufferList).
+    sink, engine = _vip(
+        "#var bufs {Mining|Chat}\n#alias del {#var item {%pick(p:Which buffer?|@bufs)}}",
+        answers=[1],
+    )
+    engine.process_input("del")
+    assert sink.asked[0]["title"] == "Which buffer?"
+    assert sink.asked[0]["items"] == ["Mining", "Chat"]
+    assert engine.get_var("item") == "Chat"
+
+
+def test_a_pick_list_without_a_star_starts_on_its_first_item():
+    sink, engine = _vip("#alias h {#pick {one:#say 1|two:#say 2}}")
+    engine.process_input("h")
+    assert sink.asked[0]["selected"] == 0
+
+
+def test_inputbox_judges_validate_the_way_lua_does():
+    # tonumber("0") is 0, which Lua counts as true, and "false, reason" is false.
+    sink, _engine, pack = _mush(
+        'local function number(s) return tonumber(s) end\n'
+        'local function explained(s)\n'
+        '  if tonumber(s) then return true end\n'
+        '  return false, "not a number"\n'
+        'end\n'
+        'SetVariable("a", utils.inputbox("N?", "N", "", nil, nil, {validate = number}) or "-")\n'
+        'local b = utils.inputbox("N?", "N", "", nil, nil, {validate = explained})\n'
+        'SetVariable("b", b or "-")\n',
+        answers=["0", "x", "5"],
+    )
+    assert pack._api.get_var("a") == "0"
+    assert pack._api.get_var("b") == "5"
+    assert len(sink.asked) == 3
+
+
+def test_multilistbox_ticks_defaults_the_way_lua_reads_them():
+    sink, _engine, pack = _mush(
+        'utils.multilistbox("Pick", "Food", {a = "apple", b = "bean", c = "corn"},'
+        ' {a = 0, b = false, c = ""})\n'
+    )
+    assert sink.asked[0]["selected"] == [0, 2]
+
+
+def test_a_slow_answer_in_another_pack_doesnt_use_up_the_callers_time(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    class SlowPlayer(RecordingSink):
+        def ask(self, request, while_waiting=None):
+            clock[0] += 60.0
+            return super().ask(request)
+
+    sink = SlowPlayer(answers=[0, "yes"])
+    engine = AutomationEngine(sink)
+    VipMudPack(ScriptApi(engine, source="b")).load_source("#alias pickit {#pick {a:#say picked}}")
+    MushclientPack(ScriptApi(engine, source="m")).load_source(
+        "<muclient><aliases>"
+        '<alias match="^askit$" enabled="y" regexp="y" send_to="12">'
+        '<send>SetVariable("r", utils.msgbox("Sure?", "Q", "yesno"))</send></alias>'
+        "</aliases></muclient>"
+    )
+    VipMudPack(ScriptApi(engine, source="a")).load_source("#alias go {pickit;askit;#say after}")
+    engine.process_input("go")
+    assert _said(sink) == ["picked", "after"]
+    assert engine.get_var("r") == "yes"
+
+
+def test_a_packs_alarms_run_while_its_dialog_waits(monkeypatch):
+    # Cosmic Rage speaks a menu's instructions from an alarm it sets just before the menu,
+    # as VIPMud runs timers while a dialog is open.
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    class ReadingPlayer(RecordingSink):
+        def ask(self, request, while_waiting=None):
+            for _second in range(3):
+                clock[0] += 0.5
+                if while_waiting is not None:
+                    while_waiting()
+            return super().ask(request)
+
+    sink = ReadingPlayer(answers=[0])
+    engine = AutomationEngine(sink)
+    VipMudPack(ScriptApi(engine, source="vip")).load_source(
+        "#alias go {#alarm 0.05 {#say {Choose wisely} VoiceOnly};"
+        "#pick {P:Sure?|yes:#say yes};#say after}"
+    )
+    engine.process_input("go")
+    assert _said(sink) == ["Choose wisely", "yes", "after"]
+    for _delay, callback in list(sink.scheduled):  # the alarm's own timer, later on
+        callback()
+    assert _said(sink) == ["Choose wisely", "yes", "after"]

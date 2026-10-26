@@ -137,6 +137,14 @@ _MSGBOX_BACKED_OUT = {
 }
 
 
+def _lua_true(value: object) -> bool:
+    """Whether Lua counts a value as true: everything but nil and false, 0 and "" included.
+    A function's first result decides (``return false, "why"`` is false)."""
+    if isinstance(value, tuple):
+        value = value[0] if value else None
+    return value is not None and value is not False
+
+
 def _dialog_text(value: object, default: str = "") -> str:
     """A dialog argument as text: nil is the default, 5.0 is "5", and CR LF a line break."""
     if value is None:
@@ -348,7 +356,8 @@ class MushclientPack:
         # Untrusted packs fail closed if the runaway-loop guard can't be installed; a trusted
         # pack is user-vouched arbitrary code, so a missing hook is acceptable there.
         self._guard = ScriptGuard(
-            install_hook, require_hook=not full_stdlib, report=self._report_error
+            install_hook, require_hook=not full_stdlib, report=self._report_error,
+            clock=lambda: time.monotonic() - api.player_time,  # a dialog's wait isn't the script's
         )
         self._install_api()
         # MushReader and the channel_history plugin are often installed globally in
@@ -1233,7 +1242,7 @@ class MushclientPack:
     def _install_dialogs(self, utils) -> None:
         """MUSHclient's utils dialogs, shown by the window and waited on like MUSHclient does.
 
-        Each pauses the script's time limit while the player reads and answers. Without a
+        The time the player takes doesn't count against the script's time limit. Without a
         window to show them, they answer as if the player backed out.
         """
         api = self._api
@@ -1242,11 +1251,10 @@ class MushclientPack:
             kind = _dialog_text(buttons, "ok").lower()
             if kind not in MESSAGE_BUTTONS:
                 kind = "ok"
-            with self._guard.paused():
-                answer = api.ask_message(
-                    _dialog_text(title, "MUSHclient"), _dialog_text(message), kind,
-                    _dialog_text(icon, "!"), int(_to_float(default) or 1),
-                )
+            answer = api.ask_message(
+                _dialog_text(title, "MUSHclient"), _dialog_text(message), kind,
+                _dialog_text(icon, "!"), int(_to_float(default) or 1),
+            )
             # MUSHclient's msgbox always names a button, and packs compare the answer or
             # call string methods on it.
             return answer if answer is not None else _MSGBOX_BACKED_OUT[kind]
@@ -1256,11 +1264,10 @@ class MushclientPack:
             limit = int(_to_float(extras["max_length"]) or 0) if hasattr(extras, "items") else 0
             text = _dialog_text(default)
             while True:
-                with self._guard.paused():
-                    answer = api.ask_text(
-                        _dialog_text(title, "MUSHclient"), _dialog_text(message), text,
-                        multiline=multiline,
-                    )
+                answer = api.ask_text(
+                    _dialog_text(title, "MUSHclient"), _dialog_text(message), text,
+                    multiline=multiline,
+                )
                 if answer is None:
                     return None
                 if limit > 0:
@@ -1269,7 +1276,7 @@ class MushclientPack:
                     answer = answer.replace("\r\n", "\n").replace("\n", "\r\n")
                 # MUSHclient keeps the box open until the pack's validate function accepts
                 # the text; it usually explains what's wrong in a msgbox of its own first.
-                if not callable(validate) or validate(answer):
+                if not callable(validate) or _lua_true(validate(answer)):
                     return answer
                 text = answer
 
@@ -1285,11 +1292,12 @@ class MushclientPack:
             keys, captions = _sorted_choices(choices)
             if not keys:
                 return None
+            # Nothing is selected unless the pack names an item, and OK alone is then nil:
+            # the mapper's "Choose exit to delete" deletes whatever comes back.
             start = next((index for index, key in enumerate(keys) if key == default), None)
-            with self._guard.paused():
-                index = api.ask_choice(
-                    _dialog_text(title, "MUSHclient"), _dialog_text(message), captions, start
-                )
+            index = api.ask_choice(
+                _dialog_text(title, "MUSHclient"), _dialog_text(message), captions, start
+            )
             return keys[index] if index is not None else None
 
         def multilistbox(message=None, title=None, choices=None, defaults=None, *_args):
@@ -1298,12 +1306,11 @@ class MushclientPack:
                 return None
             ticked = [
                 index for index, key in enumerate(keys)
-                if hasattr(defaults, "items") and defaults[key]
+                if hasattr(defaults, "items") and _lua_true(defaults[key])
             ]
-            with self._guard.paused():
-                indexes = api.ask_choices(
-                    _dialog_text(title, "MUSHclient"), _dialog_text(message), captions, ticked
-                )
+            indexes = api.ask_choices(
+                _dialog_text(title, "MUSHclient"), _dialog_text(message), captions, ticked
+            )
             if indexes is None:
                 return None
             chosen = self._lua.table()

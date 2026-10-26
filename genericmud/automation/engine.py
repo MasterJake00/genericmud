@@ -66,11 +66,14 @@ class EngineSink:
     def recent_lines(self, count: int) -> list[str]:
         """The last ``count`` lines of the output, oldest first."""
         return []
-    def ask(self, request: dict) -> object | None:
+    def ask(
+        self, request: dict, while_waiting: Callable[[], None] | None = None
+    ) -> object | None:
         """Show the player a pack's question and wait for the answer; None means cancelled.
 
         ``request["kind"]`` is "choice", "choices", "text" or "message"; ScriptApi's ask_*
-        methods build each one and check the answer. A front end with no dialogs answers None.
+        methods build each one and check the answer. ``while_waiting`` is called now and
+        then until the answer comes. A front end with no dialogs answers None.
         """
         return None
 
@@ -168,6 +171,9 @@ class AutomationEngine:
         # The player's own sounds folder for this world (set by the window before packs
         # load). Unlike @sppath, which any pack can set, it is trusted for sound paths.
         self.sounds_dir: str | None = None
+        # Seconds scripts have spent waiting on the player's answers to dialogs. Every
+        # dialect's time limit leaves them out, whichever pack asked.
+        self.player_time = 0.0
         # The server line the triggers are working on, so a pack's script can act on it
         # (MUSHclient packs file it under a channel with history_add).
         self.current_line: Line | None = None

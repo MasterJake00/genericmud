@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -219,30 +220,47 @@ class ScriptApi:
         return self._engine.connected
 
     # --- asking the player (each returns None when they cancel or there's no window) ---
+    # A script waits for the answer. ``while_waiting`` is called now and then meanwhile, and
+    # the time spent waiting doesn't count against any script's time limit.
+
+    @property
+    def player_time(self) -> float:
+        """Seconds scripts have spent waiting on the player's answers, all packs together."""
+        return self._engine.player_time
+
+    def _ask(self, request: dict, while_waiting: Callable[[], None] | None) -> object | None:
+        started = time.monotonic()
+        try:
+            return self._engine.sink.ask(request, while_waiting)
+        finally:
+            self._engine.player_time += time.monotonic() - started
 
     def ask_choice(
-        self, title: str, prompt: str, items: list[str], selected: int | None = None
+        self, title: str, prompt: str, items: list[str], selected: int | None = None,
+        *, while_waiting: Callable[[], None] | None = None,
     ) -> int | None:
-        """Show a list and return the index of the item the player picked."""
+        """Show a list and return the index of the item the player picked. With
+        ``selected`` None nothing is selected at first, and OK alone is a cancel."""
         items = [str(item) for item in items]
         if not _is_index(selected, len(items)):
             selected = None
-        answer = self._engine.sink.ask({
+        answer = self._ask({
             "kind": "choice", "title": str(title), "prompt": str(prompt), "items": items,
             "selected": selected,
-        })
+        }, while_waiting)
         return answer if _is_index(answer, len(items)) else None
 
     def ask_choices(
-        self, title: str, prompt: str, items: list[str], selected: list[int] | None = None
+        self, title: str, prompt: str, items: list[str], selected: list[int] | None = None,
+        *, while_waiting: Callable[[], None] | None = None,
     ) -> list[int] | None:
         """Show a list the player can tick several items in; returns the ticked indexes."""
         items = [str(item) for item in items]
         ticked = sorted({index for index in selected or [] if _is_index(index, len(items))})
-        answer = self._engine.sink.ask({
+        answer = self._ask({
             "kind": "choices", "title": str(title), "prompt": str(prompt), "items": items,
             "selected": ticked,
-        })
+        }, while_waiting)
         if not isinstance(answer, list):
             return None
         if not all(_is_index(index, len(items)) for index in answer):
@@ -250,17 +268,19 @@ class ScriptApi:
         return sorted(set(answer))
 
     def ask_text(
-        self, title: str, prompt: str, default: str = "", *, multiline: bool = False
+        self, title: str, prompt: str, default: str = "", *, multiline: bool = False,
+        while_waiting: Callable[[], None] | None = None,
     ) -> str | None:
         """Ask the player to type something; ``default`` is already filled in."""
-        answer = self._engine.sink.ask({
+        answer = self._ask({
             "kind": "text", "title": str(title), "prompt": str(prompt), "default": str(default),
             "multiline": bool(multiline),
-        })
+        }, while_waiting)
         return answer if isinstance(answer, str) else None
 
     def ask_message(
-        self, title: str, prompt: str, buttons: str = "ok", icon: str = "!", default: int = 1
+        self, title: str, prompt: str, buttons: str = "ok", icon: str = "!", default: int = 1,
+        *, while_waiting: Callable[[], None] | None = None,
     ) -> str | None:
         """Show a message with MUSHclient's button sets; returns the pressed button's name.
 
@@ -273,10 +293,10 @@ class ScriptApi:
             icon = "!"
         if not (isinstance(default, int) and 1 <= default <= len(MESSAGE_BUTTONS[buttons])):
             default = 1
-        answer = self._engine.sink.ask({
+        answer = self._ask({
             "kind": "message", "title": str(title), "prompt": str(prompt), "buttons": buttons,
             "icon": icon, "default": default,
-        })
+        }, while_waiting)
         return answer if answer in MESSAGE_BUTTONS[buttons] else None
 
     def play(

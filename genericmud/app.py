@@ -218,10 +218,12 @@ class AppSink(EngineSink):
     def schedule(self, delay: float, callback: Callable[[], None]) -> object | None:
         return self._schedule(delay, callback)
 
-    def ask(self, request: dict) -> object | None:
+    def ask(
+        self, request: dict, while_waiting: Callable[[], None] | None = None
+    ) -> object | None:
         if self._ask is None:
             return None
-        return self._ask(request)
+        return self._ask(request, while_waiting)
 
 
 class EngineApp:
@@ -272,9 +274,10 @@ class EngineApp:
             diag=diag,
             ask=self._ask_player,
         )
-        # Set by a front end that can show dialogs (the wx window); a pack's question to a
-        # window-less session is cancelled.
-        self.asker: Callable[[dict], object] | None = None
+        # Set by a front end that can show dialogs (the wx window): called with the question
+        # and a function to call while it waits. A window-less session's questions are
+        # cancelled.
+        self.asker: Callable[[dict, Callable[[], None] | None], object] | None = None
         self.engine = AutomationEngine(self.sink, sound=self.sound)
         self.engine.diag = diag  # sound-path trace, reached by ScriptApi/loader via the engine
         if diag is not None:
@@ -350,13 +353,15 @@ class EngineApp:
         """
         return list_variables(self.engine.all_mud_vars(), self.engine.all_vars())
 
-    def _ask_player(self, request: dict) -> object | None:
+    def _ask_player(
+        self, request: dict, while_waiting: Callable[[], None] | None = None
+    ) -> object | None:
         """Hand a pack's question to the window; with no window, or if it fails, it's Cancel."""
         asker = self.asker
         if asker is None:
             return None
         try:
-            return asker(request)
+            return asker(request, while_waiting)
         except Exception as exc:  # noqa: BLE001 - a failed dialog must not kill the pack's script
             if self._diag is not None:
                 self._diag.event(

@@ -66,7 +66,7 @@ class RecordingSink(EngineSink):
     def schedule(self, delay: float, callback: Callable[[], None]) -> None:
         self.scheduled.append((delay, callback))
 
-    def ask(self, request: dict) -> Any:
+    def ask(self, request: dict, while_waiting: Callable[[], None] | None = None) -> Any:
         self.asked.append(request)
         return self.answers.pop(0) if self.answers else None
 

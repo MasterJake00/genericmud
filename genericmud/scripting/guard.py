@@ -10,8 +10,7 @@ A separate worker process would isolate further; this just prevents hangs.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 
 MAX_SCRIPT_SECONDS = 1.0
 HOOK_INSTRUCTION_INTERVAL = 50_000
@@ -33,8 +32,13 @@ class ScriptGuard:
         *,
         require_hook: bool = False,
         report: Callable[[Exception], None] | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._deadline = 0.0
+        # What the budget is measured on. A pack's guard leaves out the time scripts spend
+        # waiting on the player (ScriptApi.player_time), so answering a dialog slowly
+        # doesn't stop the script that asked.
+        self._clock = clock
         self._max_seconds = max_seconds
         self.last_error: Exception | None = None
         self._report = report  # called with a contained fault; else the cue vanishes silently
@@ -45,13 +49,16 @@ class ScriptGuard:
         if install_hook is not None:
             install_hook(self._check, HOOK_INSTRUCTION_INTERVAL)
 
+    def _now(self) -> float:
+        return self._clock() if self._clock is not None else time.monotonic()
+
     def _check(self) -> None:
-        if time.monotonic() > self._deadline:
+        if self._now() > self._deadline:
             raise ScriptTimeout("script exceeded its time budget")
 
     def run(self, fn: Callable, *args: object):
         """Run a fire-time Lua callback under the budget; contain errors/timeouts."""
-        self._deadline = time.monotonic() + self._max_seconds
+        self._deadline = self._now() + self._max_seconds
         try:
             return fn(*args)
         except Exception as error:  # timeout or script error — keep the engine alive
@@ -62,14 +69,5 @@ class ScriptGuard:
 
     def run_strict(self, fn: Callable, *args: object):
         """Time-bound a call but let errors propagate (for pack loading/import reports)."""
-        self._deadline = time.monotonic() + self._max_seconds
+        self._deadline = self._now() + self._max_seconds
         return fn(*args)
-
-    @contextmanager
-    def paused(self) -> Iterator[None]:
-        """Stop the clock while the script waits for the player to answer a dialog."""
-        started = time.monotonic()
-        try:
-            yield
-        finally:
-            self._deadline += time.monotonic() - started

@@ -16,6 +16,7 @@ where ``wildcards[1]`` is the first capture.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -266,7 +267,10 @@ class LuaPackRuntime:
         self._match_context: MatchContext | None = None
         self._lua, install_hook = make_sandboxed_runtime()
         # native packs are sandboxed; report contained faults so a broken trigger isn't silent
-        self._guard = ScriptGuard(install_hook, require_hook=True, report=self._report_error)
+        self._guard = ScriptGuard(
+            install_hook, require_hook=True, report=self._report_error,
+            clock=lambda: time.monotonic() - api.player_time,  # a dialog's wait isn't the script's
+        )
         self._install_mud()
         install_pack_require(self._lua, api.base_dir)
 

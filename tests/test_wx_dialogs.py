@@ -406,14 +406,18 @@ def test_a_pick_list_starts_on_the_packs_item_and_answers_its_index(frame):
         dialog.Destroy()
 
 
-def test_a_pick_list_without_a_starred_item_starts_on_the_first(frame):
+def test_a_list_with_no_item_named_starts_with_nothing_selected(frame):
+    # MUSHclient's listbox selects nothing without a default, and OK alone answers nil:
+    # the mapper's "Choose exit to delete" deletes whatever comes back.
     from genericmud.ui.wx_app import PackQuestionDialog
 
     request = {"kind": "choice", "title": "", "prompt": "", "items": ["a", "b"], "selected": None}
     dialog = PackQuestionDialog(frame, request, "Miriani")
     try:
-        assert dialog.answer() == 0
+        assert dialog.answer() is None
         assert dialog._control.GetName() == "Miriani"  # no prompt: named after the title
+        dialog._control.SetSelection(1)
+        assert dialog.answer(wx.ID_CANCEL) is None
     finally:
         dialog.Destroy()
 
@@ -457,38 +461,36 @@ def test_a_text_question_fills_in_the_default_and_answers_what_was_typed(frame):
 
 
 @pytest.mark.parametrize(
-    ("buttons", "default", "flag", "results"),
+    ("buttons", "default", "labels", "escape"),
     [
-        ("yesno", 2, "NO_DEFAULT", {"ID_YES": "yes", "ID_NO": "no"}),
-        ("okcancel", 2, "CANCEL_DEFAULT", {"ID_OK": "ok", "ID_CANCEL": "cancel"}),
-        ("retrycancel", 1, None, {"ID_OK": "retry", "ID_CANCEL": "cancel"}),
-        ("abortretryignore", 3, "CANCEL_DEFAULT",
-         {"ID_YES": "abort", "ID_NO": "retry", "ID_CANCEL": "ignore"}),
+        ("ok", 1, ["OK"], "ID_OK"),
+        ("yesno", 2, ["Yes", "No"], "ID_NONE"),
+        ("okcancel", 2, ["OK", "Cancel"], "ID_CANCEL"),
+        ("yesnocancel", 1, ["Yes", "No", "Cancel"], "ID_CANCEL"),
+        ("retrycancel", 1, ["Retry", "Cancel"], "ID_CANCEL"),
+        ("abortretryignore", 3, ["Abort", "Retry", "Ignore"], "ID_NONE"),
     ],
 )
-def test_a_msgbox_has_mushclients_buttons_and_answers_their_names(
-    frame, buttons, default, flag, results
+def test_a_msgbox_has_mushclients_buttons_default_and_escape(
+    frame, buttons, default, labels, escape
 ):
-    from genericmud.ui.wx_app import build_pack_message, pack_message_answer
+    # Escape is Cancel where there is one and OK on a lone OK; on Yes/No and
+    # Abort/Retry/Ignore it does nothing, as on Windows' own message boxes.
+    from genericmud.scripting.api import MESSAGE_BUTTONS
+    from genericmud.ui.wx_app import PackMessageDialog
 
-    request = {"kind": "message", "title": "Q", "prompt": "Sure?", "buttons": buttons,
+    request = {"kind": "message", "title": "Q", "prompt": "Sure & certain?", "buttons": buttons,
                "icon": "?", "default": default}
-    dialog = build_pack_message(frame, request, "Q")
+    dialog = PackMessageDialog(frame, request, "Q")
     try:
-        style = dialog.GetMessageDialogStyle()
-        assert style & wx.ICON_QUESTION
-        if flag is not None:
-            assert style & getattr(wx, flag)
-        if buttons == "abortretryignore":
-            labels = (dialog.GetYesLabel(), dialog.GetNoLabel(), dialog.GetCancelLabel())
-            assert [label.replace("&", "").replace("_", "") for label in labels] == [
-                "Abort", "Retry", "Ignore",
-            ]
+        assert [button.GetLabel().replace("&", "") for button in dialog._buttons] == labels
+        assert dialog.GetDefaultItem() is dialog._buttons[default - 1]
+        assert dialog.GetEscapeId() == getattr(wx, escape)
+        for button, name in zip(dialog._buttons, MESSAGE_BUTTONS[buttons], strict=True):
+            assert dialog.answer(button.GetId()) == name
+        assert dialog.answer(wx.ID_HELP) is None  # closed some other way
     finally:
         dialog.Destroy()
-    for result, name in results.items():
-        assert pack_message_answer(buttons, getattr(wx, result)) == name
-    assert pack_message_answer("yesno", wx.ID_CANCEL) is None  # closed some other way
 
 
 def _question_panel(frame, monkeypatch, parent=None):
@@ -513,15 +515,27 @@ def _close_question_panel(panel, loop) -> None:
     loop.close()
 
 
-def _ask_on_another_thread(panel, request):
+def _ask_on_another_thread(panel, request, while_waiting=None):
     import threading
 
     outcome: dict = {}
     worker = threading.Thread(
-        target=lambda: outcome.setdefault("answer", panel._ask_from_pack(request)), daemon=True
+        target=lambda: outcome.setdefault(
+            "answer", panel._ask_from_pack(request, while_waiting)
+        ),
+        daemon=True,
     )
     worker.start()
     return worker, outcome
+
+
+def _pump_until_done(worker, seconds=10.0) -> None:
+    import time
+
+    deadline = time.monotonic() + seconds
+    while worker.is_alive() and time.monotonic() < deadline:
+        wx.GetApp().ProcessPendingEvents()
+        worker.join(0.01)
 
 
 def test_a_packs_question_is_shown_on_the_ui_thread_and_answered_to_the_loop_thread(
@@ -558,7 +572,7 @@ def test_a_packs_question_is_shown_on_the_ui_thread_and_answered_to_the_loop_thr
 def test_an_unanswered_question_gives_up_as_cancelled(frame, monkeypatch):
     from genericmud.ui import wx_app
 
-    monkeypatch.setattr(wx_app, "_PACK_QUESTION_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(wx_app, "_PACK_QUESTION_SHOW_TIMEOUT_S", 0.05)
     panel, loop = _question_panel(frame, monkeypatch)
     try:
         request = {"kind": "text", "title": "Name", "prompt": "Name?", "default": "",
@@ -605,3 +619,97 @@ def test_the_world_is_named_on_a_question_when_several_are_open(frame, monkeypat
         book.RemovePage(0)
         _close_question_panel(panel, loop)
         book.Destroy()
+
+
+def test_the_asking_packs_timers_get_their_turns_while_it_waits(frame, monkeypatch):
+    from genericmud.ui import wx_app
+
+    monkeypatch.setattr(wx_app, "_PACK_QUESTION_SHOW_TIMEOUT_S", 0.3)
+    panel, loop = _question_panel(frame, monkeypatch)
+    try:
+        turns: list[int] = []
+        request = {"kind": "text", "title": "Name", "prompt": "Name?", "default": "",
+                   "multiline": False}
+        worker, outcome = _ask_on_another_thread(panel, request, lambda: turns.append(1))
+        worker.join(5)
+        assert outcome == {"answer": None}
+        assert len(turns) >= 2
+    finally:
+        _close_question_panel(panel, loop)
+
+
+def test_a_question_on_screen_isnt_given_up_on_like_one_that_never_appeared(
+    frame, monkeypatch
+):
+    import time
+
+    from genericmud.ui import wx_app
+
+    monkeypatch.setattr(wx_app, "_PACK_QUESTION_SHOW_TIMEOUT_S", 0.2)
+
+    def slow_reader(dialog):
+        time.sleep(0.6)  # reading Cosmic Rage's paragraphs
+        dialog._control.SetSelection(0)
+        return wx.ID_OK
+
+    monkeypatch.setattr(wx_app.PackQuestionDialog, "ShowModal", slow_reader)
+    panel, loop = _question_panel(frame, monkeypatch)
+    try:
+        request = {"kind": "choice", "title": "Gags", "prompt": "Gags",
+                   "items": ["Create a new gag"], "selected": 0}
+        worker, outcome = _ask_on_another_thread(panel, request)
+        _pump_until_done(worker)
+        assert outcome == {"answer": 0}
+    finally:
+        _close_question_panel(panel, loop)
+
+
+def test_closing_the_tab_takes_down_a_message_box_on_screen(frame, monkeypatch):
+    import asyncio
+
+    panel, loop = _question_panel(frame, monkeypatch)
+    torn_down: list[bool] = []
+    monkeypatch.setattr(panel, "_teardown", lambda: torn_down.append(True))
+
+    def end_any_dialog_left() -> None:  # so a failure can't hang the suite
+        for window in wx.GetTopLevelWindows():
+            if isinstance(window, wx.Dialog) and window.IsModal():
+                window.EndModal(wx.ID_CANCEL)
+
+    try:
+        request = {"kind": "message", "title": "Q", "prompt": "Sure?", "buttons": "yesno",
+                   "icon": "?", "default": 1}
+        worker, outcome = _ask_on_another_thread(panel, request)
+        wx.CallLater(300, panel.close)  # fires inside the dialog's own modal loop
+        wx.CallLater(5000, end_any_dialog_left)
+        _pump_until_done(worker)
+        assert outcome == {"answer": None}
+        loop.run_until_complete(asyncio.sleep(0.01))
+        assert torn_down == [True]
+    finally:
+        _close_question_panel(panel, loop)
+
+
+def test_closing_the_tab_tears_the_session_down_even_if_a_question_wont_close(
+    frame, monkeypatch
+):
+    import asyncio
+
+    from genericmud.ui import wx_app
+
+    panel, loop = _question_panel(frame, monkeypatch)
+    torn_down: list[bool] = []
+    monkeypatch.setattr(panel, "_teardown", lambda: torn_down.append(True))
+
+    def broken(_question):
+        raise RuntimeError("the dialog wouldn't close")
+
+    monkeypatch.setattr(panel, "_withdraw_question", broken)
+    try:
+        panel._questions.append(wx_app._PackQuestion({"kind": "text"}))
+        panel.close()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        assert torn_down == [True]
+    finally:
+        panel._questions.clear()
+        _close_question_panel(panel, loop)
