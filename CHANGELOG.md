@@ -7,6 +7,39 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.14.0 — 2026-10-26
+
+**VIP Mud soundpacks**
+
+genericMud now runs VIP Mud soundpack scripts the way VIP Mud's manual describes,
+so several packs that played nothing now work.
+
+* The official Prometheus soundpack plays its sounds and registers with the game.
+  It played nothing before.
+* The unofficial Prometheus soundpack plays its sounds and remembers your
+  settings, and its sounds off, room sounds off and similar keys work. It played
+  nothing before.
+* Miriani's VIP Mud soundpack loads and plays. It loaded nothing before.
+* Sounds are panned the way the packs mean them. A sound slightly to one side
+  used to play entirely in one ear.
+* Packs save their settings and lists, Star Conquest's buffer list among them.
+  They were never written before.
+* Triggers match whole lines, as in VIP Mud, so they no longer go off on lines
+  that only mention their text.
+* When a pack shortens a line, such as Star Conquest's tracking reports, you hear
+  the short version. Messages a pack speaks also appear in the output, where the
+  review keys can find them.
+* Packs' speech mute, find, "read the last few lines" and reload-the-soundpack
+  commands work.
+* A soundpack can't be made to play or write files outside its own folder and
+  your sounds folder, and no pack script can keep genericMud busy for more than
+  a couple of seconds.
+
+**Changed on purpose**
+
+* In a VIP Mud trigger, # matches a digit and % a letter, as in VIP Mud. COGG's
+  game announcement sound no longer plays, the same as in VIP Mud.
+
 ## 0.13.1 — 2026-10-25
 
 **Soundpacks stop typing at the MUD**
