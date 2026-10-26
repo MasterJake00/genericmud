@@ -258,19 +258,6 @@ def test_chat_while_a_password_prompt_is_open_does_not_unhide_it():
     assert sent == ["old;pass", "new;pass"]
 
 
-def test_a_server_that_hides_typing_for_good_lets_go_after_a_few_commands():
-    # A server that holds WILL ECHO for the whole session would otherwise turn every
-    # command into a password: no aliases, speedwalks, separator or /commands, ever.
-    from genericmud.bridge import protocol
-
-    app, sent, posted = _app_at_a_password_prompt()
-    for answer in range(8):  # name, password, and a few commands that went out as typed
-        app.on_ws_message({"type": "input", "text": f"answer{answer}"})
-    app.on_ws_message({"type": "input", "text": "look;look"})
-    assert sent[-2:] == ["look", "look"]
-    assert posted[-1] == protocol.input_masked(False)  # Up-arrow history works again too
-
-
 def test_a_retyped_password_stays_hidden_through_a_few_prompts():
     # ROM-style new character: one WILL ECHO, then the password, the retype, and a retry
     # loop if they don't match. A few prompt lines in between must not let go.
@@ -279,3 +266,122 @@ def test_a_retyped_password_stays_hidden_through_a_few_prompts():
     _server_lines(app, 2)  # "Passwords don't match." "Retype password:"
     app.on_ws_message({"type": "input", "text": "abc;deg"})
     assert sent == ["abc;def", "abc;deg"]
+
+
+class _Clock:
+    """Time that only moves when the test says so, firing the callbacks due by then."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.pending: list[tuple[float, object]] = []
+
+    def schedule(self, delay, callback) -> None:
+        self.pending.append((self.now + delay, callback))
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        due = sorted((entry for entry in self.pending if entry[0] <= self.now), key=lambda e: e[0])
+        for entry in due:
+            self.pending.remove(entry)
+            entry[1]()
+
+
+def _timed_app(**kwargs):
+    from genericmud.config.keymap import load_keymap
+
+    clock = _Clock()
+    sent: list[str] = []
+    withdrawn: list[int] = []
+    backend = RecordingBackend()
+    voice = VoiceRouter(backend, clock=lambda: 0.0)
+    app = EngineApp(
+        voice, send=sent.append, post=[].append, keymap=load_keymap("vipmud"),
+        schedule=clock.schedule, clock=lambda: clock.now, withdraw_option=withdrawn.append,
+        **kwargs,
+    )
+    return app, clock, sent, backend, withdrawn
+
+
+def _hide(app) -> None:
+    from genericmud.protocol import telnet as T
+
+    app.on_telnet_event(T.Negotiation(T.WILL, T.OPT_ECHO))
+
+
+def test_escape_while_the_mud_hides_typing_makes_it_ordinary_again():
+    # Mudlet's hidden-input box: Escape on it goes back to the ordinary command line until
+    # the MUD hides input again. The way out when a MUD never sends WONT ECHO.
+    app, _clock, sent, backend, _withdrawn = _timed_app()
+    _hide(app)
+    app.on_ws_message({"type": "key", "key": "escape"})
+    app.on_ws_message({"type": "input", "text": "look;look"})
+    assert sent == ["look", "look"]
+    assert "Typing is no longer hidden." in backend.spoken
+
+
+def test_escape_no_longer_stops_speech_and_does_nothing_while_typing_shows():
+    # Screen readers stop speech with Ctrl, and genericMud speaks through them; F11 stays.
+    from genericmud.config.keymap import load_keymap
+
+    keymap = load_keymap("vipmud")
+    assert keymap["escape"] == "input:unhide"
+    assert keymap["f11"] == "voice:flush"
+    app, _clock, sent, backend, _withdrawn = _timed_app()
+    app.on_ws_message({"type": "key", "key": "escape"})
+    assert backend.spoken == [] and sent == []
+
+
+def test_a_login_password_prompt_the_mud_never_ends_stops_hiding_after_a_minute():
+    from genericmud.protocol import telnet as T
+
+    app, clock, sent, backend, withdrawn = _timed_app()
+    _hide(app)
+    clock.advance(5)
+    app.on_ws_message({"type": "input", "text": "hunter2"})
+    clock.advance(59)
+    app.on_ws_message({"type": "input", "text": "still;hidden"})  # restarts the minute
+    clock.advance(59)
+    assert sent == ["hunter2", "still;hidden"]
+    clock.advance(2)
+    app.on_ws_message({"type": "input", "text": "look;look"})
+    assert sent[-2:] == ["look", "look"]
+    assert withdrawn == [T.OPT_ECHO]  # told to the MUD, so its next WILL ECHO is fresh
+    assert any("stopped hiding" in spoken for spoken in backend.spoken)
+
+
+def test_a_password_prompt_later_in_the_session_never_times_out():
+    # Changing a password in-game: only the MUD's WONT ECHO or Escape ends the hiding.
+    app, clock, sent, _backend, withdrawn = _timed_app()
+    clock.advance(400)
+    _hide(app)
+    app.on_ws_message({"type": "input", "text": "old;pass"})
+    clock.advance(3600)
+    app.on_ws_message({"type": "input", "text": "new;pass"})
+    assert sent == ["old;pass", "new;pass"]
+    assert withdrawn == []
+
+
+def test_an_auto_login_password_sent_before_the_prompt_hides_still_gets_the_minute(tmp_path):
+    # On a slow link auto-login answers the password prompt before the WILL ECHO arrives.
+    from genericmud.protocol import telnet as T
+
+    store = PlaintextCredentialStore(tmp_path / "c.json")
+    store.set("gw", "hero", "secret")
+    app, clock, sent, _backend, withdrawn = _timed_app(credentials=store, name="gw")
+    app.begin_login("gw")
+    app.on_telnet_event(DataReceived(b"What is your name?\r\n"))
+    app.on_telnet_event(DataReceived(b"Password:\r\n"))
+    assert sent == ["hero", "secret"]
+    _hide(app)
+    clock.advance(61)
+    assert withdrawn == [T.OPT_ECHO]
+
+
+def test_the_second_line_typed_while_hidden_mentions_escape_once():
+    app, _clock, _sent, backend, _withdrawn = _timed_app()
+    _hide(app)
+    for answer in ("one", "two", "three"):
+        app.on_ws_message({"type": "input", "text": answer})
+    hints = [spoken for spoken in backend.spoken if "Escape" in spoken]
+    assert len(hints) == 1
+

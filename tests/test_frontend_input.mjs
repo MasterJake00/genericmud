@@ -46,7 +46,7 @@ function keyEvent(key, modifiers = {}) {
   };
 }
 
-test("Escape reaches the engine so the speech-flush binding works", () => {
+test("Escape reaches the engine so it can stop hiding typed input", () => {
   const { input, sent } = makeInput();
   const event = keyEvent("Escape");
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import traceback
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -59,10 +60,12 @@ MAX_ALIAS_DEPTH = 20  # guard against an alias/trigger that re-fires itself fore
 _MAP_SAVE_INTERVAL = 25
 _PLUGIN_TICK_SECONDS = 0.25  # OnPluginTick cadence (MUSHclient ticks faster; see _arm_plugin_ticks)
 _PROMPT_IDLE_FLUSH_SECONDS = 0.25  # emit a newline-less prompt if the server sends no more data
-# No password exchange asks for more than a handful of secrets under one WILL ECHO: old,
-# new and confirm, plus a retry or two. A server still hiding input after this many answers
-# is holding echo for the session, so input goes back to normal.
-_HIDDEN_ANSWER_LIMIT = 8
+# A MUD that never sends WONT ECHO after the login password would leave every command going
+# out as a password. Mudlet's answer, copied here: during the first five minutes of a
+# connection, a minute after the last line typed while hidden, stop hiding and say so. Later
+# in a session (changing a password in-game) only WONT ECHO or Escape ends the hiding.
+_LOGIN_PHASE_SECONDS = 300.0
+_HIDDEN_INPUT_TIMEOUT_SECONDS = 60.0
 # Transport statuses that mean the socket went away or was replaced (transport/connection.py).
 _SOCKET_CHANGES = (
     "disconnected",
@@ -228,6 +231,8 @@ class EngineApp:
         suppress_reconnect: Callable[[], None] | None = None,
         encoding: str = AUTO,
         other_worlds: Callable[[], Iterable[str]] | None = None,
+        clock: Callable[[], float] | None = None,
+        withdraw_option: Callable[[int], None] | None = None,
     ) -> None:
         self.buffer = Buffer()
         self.voice = voice
@@ -299,7 +304,12 @@ class EngineApp:
         self._user_script_generation = 0
         self._msdp_offered = False  # server sent WILL MSDP (replayed to late-loading packs)
         self._input_masked = False  # server WILL ECHO (password entry): don't log/store input
-        self._answers_while_hidden = 0  # lines typed since input was hidden (see the limit)
+        self._clock = clock or time.monotonic
+        # Wired by the UI to the transport: tell the server to turn an option off (DONT).
+        self._withdraw_option = withdraw_option or (lambda _option: None)
+        self._login_phase_started = self._clock()  # restarted with every connection
+        self._hidden_answers = 0  # lines typed since the MUD hid input; the second gets a hint
+        self._hidden_timeout_token = 0  # bumped to cancel a pending hidden-input timeout
         self._ticks_armed = False  # the OnPluginTick chain is scheduled at most once
         self._closed = False  # ends the tick chain at shutdown
         # The world's text encoding, both directions: the UI hands this same codec to the
@@ -646,6 +656,7 @@ class EngineApp:
 
     def begin_login(self, world: str) -> None:
         """Arm auto-login for ``world`` if credentials are stored for it."""
+        self._login_phase_started = self._clock()  # a fresh connection means fresh prompts
         self._login = None
         if self.credentials is None:
             return
@@ -653,7 +664,13 @@ class EngineApp:
         if creds is None:
             return
         username, password = creds
-        self._login = AutoLogin(username, password, self._send)
+        self._login = AutoLogin(username, password, self._send_for_login)
+
+    def _send_for_login(self, text: str) -> None:
+        """Auto-login's typing. On a slow link its password goes out before the WILL ECHO
+        that hides the prompt arrives, so it starts the hidden-input timeout regardless."""
+        self._send(text)
+        self._arm_hidden_timeout()
 
     def _announce_activation(self, result: ActivationResult) -> None:
         triggers = sum(
@@ -1050,21 +1067,55 @@ class EngineApp:
                 self._login.disarm()  # the user is answering the prompt themselves
             self._log("> ***")
         self._send(text)
-        self._answers_while_hidden += 1
-        if self._answers_while_hidden >= _HIDDEN_ANSWER_LIMIT:
-            # A server that holds WILL ECHO for the whole session never sends the WONT, and
-            # every command would go out as a password for good. Counting what the user
-            # typed, not what the server sent: chatter while a prompt waits proves nothing.
-            if self._diag is not None:
-                self._diag.event("input.unhidden", answers=self._answers_while_hidden)
-            self.forget_hidden_input()
+        self._hidden_answers += 1
+        if self._hidden_answers == 2:
+            # Once per hidden stretch, like Mudlet's box saying "still hidden" when it comes
+            # back: a MUD that never ends the hiding leaves this the only clue to the way out.
+            self._speak_system(
+                "The MUD is still hiding what you type. If it shouldn't be, press Escape.",
+                interrupt=False,
+            )
+        self._arm_hidden_timeout()
+
+    def _arm_hidden_timeout(self) -> None:
+        """(Re)start the minute after which a login password prompt that never ended lets go.
+
+        Measured from the last line sent, never from the prompt, so it can't fire while
+        someone is still typing. A line past the login phase still cancels any earlier
+        deadline, so that one can't fire mid-session either.
+        """
+        self._hidden_timeout_token += 1
+        if self._clock() - self._login_phase_started >= _LOGIN_PHASE_SECONDS:
+            return
+        token = self._hidden_timeout_token
+        self._schedule(_HIDDEN_INPUT_TIMEOUT_SECONDS, lambda: self._hidden_input_timed_out(token))
+
+    def _hidden_input_timed_out(self, token: int) -> None:
+        if token != self._hidden_timeout_token or not self._input_masked:
+            return
+        if self._diag is not None:
+            self._diag.event("input.unhidden", reason="timeout")
+        self._withdraw_option(T.OPT_ECHO)  # so the MUD's next WILL ECHO is a fresh request
+        self.forget_hidden_input()
+        self._speak_system(
+            "The MUD didn't say it had stopped hiding what you type, so genericMud stopped "
+            "hiding it.",
+            interrupt=False,
+        )
+
+    def _unhide_on_request(self) -> None:
+        """Escape: treat typing as ordinary until the MUD hides it again (its next WILL ECHO)."""
+        if not self._input_masked:
+            return  # nothing hidden: Escape does nothing
+        self.forget_hidden_input()
+        self._speak_system("Typing is no longer hidden.")
 
     def forget_hidden_input(self) -> None:
         """Treat typing as ordinary again, for when no WONT ECHO is coming.
 
         The socket went away; the window's Disconnect closed it, quietly, so it never
-        reaches on_connection_status; or the server hides input for the whole session
-        (the answer limit in _dispatch_secret).
+        reaches on_connection_status; a login prompt timed out; or the user pressed
+        Escape.
         """
         self._set_input_masked(False)
 
@@ -1077,7 +1128,11 @@ class EngineApp:
         if masked == self._input_masked:
             return
         self._input_masked = masked
-        self._answers_while_hidden = 0
+        self._hidden_answers = 0
+        if not masked:
+            # Hiding a prompt keeps a pending timeout: auto-login's password may have gone
+            # out before the WILL ECHO for it arrived.
+            self._hidden_timeout_token += 1
         self._post(protocol.input_masked(masked))
 
     def _dispatch_remote(self, text: str) -> None:
@@ -1312,6 +1367,8 @@ class EngineApp:
             self._toggle(argument)
         elif namespace == "input" and argument == "autoretype":
             self._toggle("autoretype")
+        elif namespace == "input" and argument == "unhide":
+            self._unhide_on_request()
         elif namespace == "chan":
             self._handle_channel_review(argument)
         elif namespace == "sound" and argument == "flush":
@@ -1392,8 +1449,8 @@ class EngineApp:
         self.voice.speak(text, channel=REVIEW_CHANNEL, interrupt=True)
         self._post(protocol.review(text))
 
-    def _speak_system(self, text: str) -> None:
-        self.voice.speak(text, channel=SYSTEM_CHANNEL, interrupt=True)
+    def _speak_system(self, text: str, *, interrupt: bool = True) -> None:
+        self.voice.speak(text, channel=SYSTEM_CHANNEL, interrupt=interrupt)
         self._post(protocol.echo(f"* {text}"))
 
     def on_connection_status(self, message: str) -> None:

@@ -24,8 +24,10 @@
 "alt+end" = "review:bottom"
 
 "f11" = "voice:flush"
-"escape" = "voice:flush"
 "shift+f11" = "sound:flush"
+# Escape doesn't stop speech: genericMud speaks through the screen reader, and Ctrl already
+# silences that. While the MUD hides what you type (a password prompt), Escape stops hiding it.
+"escape" = "input:unhide"
 
 # Speech ergonomics (announced toggles, persisted across restarts).
 # Follow mode: speech interrupts when YOU move rooms, not on every line.

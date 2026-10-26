@@ -147,3 +147,18 @@ def test_acknowledges_the_end_of_the_servers_echo_once():
 
 def test_does_not_answer_a_wont_for_an_option_that_was_never_on():
     assert _negotiate(Negotiation(T.WONT, T.OPT_ECHO)) == b""
+
+
+def test_withdrawing_the_servers_echo_says_dont_once_and_accepts_it_again_later():
+    # When a password prompt times out, the server hears DONT ECHO, so its next WILL ECHO
+    # is a fresh request the client answers again.
+    conn = MudConnection()
+    writer = _FakeWriter()
+    conn._writer = writer
+    conn._dispatch(Negotiation(T.WILL, T.OPT_ECHO))
+    conn.withdraw_remote(T.OPT_ECHO)
+    conn.withdraw_remote(T.OPT_ECHO)  # already off: nothing more on the wire
+    conn._dispatch(Negotiation(T.WILL, T.OPT_ECHO))
+    do_echo = bytes([T.IAC, T.DO, T.OPT_ECHO])
+    assert bytes(writer.sent) == do_echo + bytes([T.IAC, T.DONT, T.OPT_ECHO]) + do_echo
+

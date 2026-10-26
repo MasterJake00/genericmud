@@ -69,6 +69,7 @@ def run(args) -> None:
                 keymap=load_keymap("vipmud"),
                 diag=make_diagnostic_log(),
                 suppress_reconnect=connection.suppress_reconnect,
+                withdraw_option=connection.withdraw_remote,
                 encoding=getattr(args, "encoding", AUTO),
             )
             connection.text_codec = app.codec  # commands go out in the world's encoding too

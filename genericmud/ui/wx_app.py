@@ -330,6 +330,7 @@ class SessionPanel(wx.Panel):
             hub=self._hub,
             diag=self._diag,
             suppress_reconnect=self._connection.suppress_reconnect,
+            withdraw_option=self._connection.withdraw_remote,
             encoding=self.world.encoding,
             other_worlds=lambda: [world.name for world in load_worlds()],
         )
@@ -627,7 +628,7 @@ class SessionPanel(wx.Panel):
         Only a combo that's actually bound is consumed -- everything else falls through to
         wx (swallowing unbound combos is what killed Alt+F menu access keys and the Ctrl
         accelerators for keyboard-only users). Shared by the command box and the output box
-        so the panic keys (Escape/F11 stop speech, Shift+F11 stop sound) and every other
+        so the panic keys (F11 stops speech, Shift+F11 stops sound) and every other
         bound action work even while the reader is focused in the output.
         """
         if (

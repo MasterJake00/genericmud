@@ -35,7 +35,8 @@ Making it talk your way:
 Ctrl+Shift+F is follow mode: when you move rooms, speech skips straight to the
 new room. Ctrl+I makes every line interrupt (fast fights). View menu,
 Background silence keeps genericMud quiet while you're in another window.
-Esc silences the voice; Shift+F11 stops every sound.
+Ctrl silences the voice, as it does for your screen reader (F11 works too);
+Shift+F11 stops every sound.
 
 Walking:
 The numpad is a compass: 8 north, 2 south, 4 west, 6 east, corners are the
@@ -223,8 +224,9 @@ Speech:
 Ctrl+M            Self-voice on or off
 Ctrl+Shift+F      Follow mode: speech interrupts when you change rooms
 Ctrl+I            Interrupt mode: every line barges in
-Esc or F11        Stop speech now
+Ctrl or F11       Stop speech now
 Shift+F11         Stop all sounds (panic)
+Esc               While the MUD hides what you type (a password), stop hiding it
 
 Reviewing output:
 Ctrl+1 to 9       Recall the last nine lines, newest first

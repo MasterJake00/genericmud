@@ -289,6 +289,20 @@ class MudConnection:
     def _send_command(self, command: int, option: int) -> None:
         self._raw_write(bytes([T.IAC, command, option]))
 
+    def withdraw_remote(self, option: int) -> None:
+        """Tell the server to turn off an option it has on (DONT), and forget it was on.
+
+        Forgetting matters as much as saying it: the server's next WILL is then answered
+        as a fresh request instead of ignored as a repeat.
+        """
+        if option not in self._remote_enabled:
+            return
+        self._remote_enabled.discard(option)
+        try:
+            self._send_command(T.DONT, option)
+        except ConnectionError:
+            pass  # the link is gone, and the option with it
+
     def send_subnegotiation(self, option: int, payload: bytes) -> None:
         """Send ``IAC SB <option> <payload> IAC SE`` with payload IAC-escaped."""
         self._raw_write(T.subnegotiation(option, payload))
