@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 import threading
 import warnings
 from pathlib import Path
@@ -735,4 +736,55 @@ async def test_a_sound_that_failed_to_download_is_tried_again_later(tmp_path, mo
     await asyncio.sleep(0.05)
     engine.process_line(Line("$sphook play:flaky:80:0:0:1"))
     await _until(lambda: len(calls) == 2)
+
+
+def _installer_pack(tmp_path):
+    (tmp_path / "SoundSync.exe").write_bytes(b"windows helper")
+    (tmp_path / "installer.bat").write_text(
+        'set "REPO_URL=https://gitea.example/Cosmic/Sounds"\nset "REPO_SUBFOLDER=wav"\n',
+        encoding="latin-1",
+    )
+    pack = VipMudPack(
+        ScriptApi(AutomationEngine(RecordingSink()), source="vip", base_dir=str(tmp_path))
+    )
+    pack.load_source(SPHOOK)
+    return pack
+
+
+def test_whether_a_sound_can_be_fetched_is_decided_without_asking_the_disk(
+    tmp_path, monkeypatch
+):
+    # On Windows, resolve() turned down a second missing sound while the first one's
+    # download was creating the sounds folder, so the second was played as a miss and
+    # never fetched. The decision is made on the path alone now.
+    pack = _installer_pack(tmp_path)
+    sounds = tmp_path / "sounds" / "wav"
+
+    def unreliable(_path, strict=False):
+        raise OSError("the folder is being created")
+
+    monkeypatch.setattr(Path, "resolve", unreliable)
+    assert pack.can_fetch_sound(str(sounds / "combat" / "hit.wav"))
+    assert not pack.can_fetch_sound(str(sounds / ".." / ".." / "escape.wav"))
+    assert not pack.can_fetch_sound(str(sounds / "notes.txt"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="making a link needs admin rights there")
+def test_a_download_is_never_written_through_a_link_out_of_the_sounds_folder(
+    tmp_path, monkeypatch
+):
+    pack = _installer_pack(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sounds = tmp_path / "sounds" / "wav"
+    sounds.mkdir(parents=True)
+    (sounds / "evil").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(
+        "genericmud.packs.vault.download",
+        lambda _url, destination, **_kwargs: destination.write_bytes(b"RIFF"),
+    )
+    assert pack._fetch_remote_sound(str(sounds / "evil" / "hit.wav")) is False
+    assert pack._fetch_remote_sound(str(sounds / "evil" / "deeper" / "hit.wav")) is False
+    assert list(outside.iterdir()) == []  # no file, and no folder made for one either
+    assert pack._fetch_remote_sound(str(sounds / "combat" / "hit.wav")) is True
 

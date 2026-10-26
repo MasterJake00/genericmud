@@ -30,6 +30,7 @@ ignored, so a pack loads partially but its sound core works.
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import re
 import tempfile
@@ -465,6 +466,31 @@ def _serialize_vip_settings(values: list[str]) -> bytes:
     return bytes(out)
 
 
+def _lexical(path: Path) -> Path:
+    """``path`` made absolute and normalised as text, without asking the disk."""
+    return Path(os.path.normpath(os.path.abspath(path)))
+
+
+def _stays_inside(path: Path, root: Path) -> bool:
+    """Whether ``path`` is inside ``root`` once links are followed.
+
+    Only folders that already exist are resolved, strictly: a folder that appears while
+    resolve() runs (another sound's download making it) can change what resolve() returns
+    on Windows, and an existing path's answer can't change underneath it.
+    """
+    def existing(candidate: Path) -> Path:
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        return candidate
+
+    try:
+        real = existing(_lexical(path)).resolve(strict=True)
+        real_root = existing(_lexical(root)).resolve(strict=True)
+    except OSError:
+        return False
+    return real.is_relative_to(real_root)
+
+
 @dataclass
 class _PendingCue:
     """A cue waiting for its sound to download; #pc volume and pan land here until it plays."""
@@ -548,11 +574,12 @@ class VipMudPack:
             return None
         requested = Path(file.replace("\\", "/"))
         candidate = requested if requested.is_absolute() else root / requested
-        try:
-            destination = candidate.resolve()
-            root = root.resolve()
-        except OSError:
-            return None
+        # Decided on the path alone. resolve() here turned down every missing sound asked
+        # for while another one's download was creating the sounds folder on Windows, so
+        # they were played as misses instead of fetched. _fetch_remote_sound follows links
+        # before it writes anything.
+        destination = _lexical(candidate)
+        root = _lexical(root)
         if not destination.is_relative_to(root) or destination.suffix.casefold() != ".wav":
             return None
         relative = destination.relative_to(root).as_posix()
@@ -570,10 +597,14 @@ class VipMudPack:
         destination, url = request
         root = self._remote_sound_root
         assert root is not None
-        relative = destination.relative_to(root.resolve()).as_posix()
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        relative = destination.relative_to(_lexical(root)).as_posix()
         temporary: Path | None = None
         try:
+            # A link inside the pack must not send the download, or the folders made for
+            # it, anywhere outside the pack's sounds folder.
+            if not _stays_inside(destination.parent, root):
+                raise PermissionError("the sound's folder leads outside the pack's sounds folder")
+            destination.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
                 dir=destination.parent, prefix=".genericmud-sound-", delete=False
             ) as handle:
