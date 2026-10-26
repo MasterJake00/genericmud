@@ -7,6 +7,40 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.17.0 — 2026-10-26
+
+**Sounds the MUD sends**
+
+* Sounds and music play as many times as the MUD asks, and loop only when it
+  says to. Music used to loop forever, and a sound asked for three times played
+  once.
+* A world's details have a Download sounds the MUD offers box. Untick it and
+  nothing is downloaded; sounds already in the world's folders still play.
+* When a MUD gives a sound a caption, a description for players who can't hear
+  it, the caption appears in the output in brackets, like [A wolf howls]. It
+  isn't spoken.
+* A MUD can fetch a sound ahead of time, by asking for it at volume 0, without
+  it playing.
+
+**Safety**
+
+* Soundpack downloads check the address they actually reach, so a server's
+  answers can't send one to a machine on your own network, and no download
+  follows a redirect from https down to plain http.
+* A soundpack whose sounds folder is set to a network share no longer has it
+  looked at. On Windows, looking would have sent your login hash to that
+  machine.
+
+**Also**
+
+* A VIP Mud soundpack downloading its sounds no longer holds up connecting to
+  your worlds.
+
+**Changed on purpose**
+
+* Music from a MUD that doesn't say how many times to play it plays once, as
+  the sound protocols define, instead of looping.
+
 ## 0.16.0 — 2026-10-26
 
 **Speech**
