@@ -117,6 +117,51 @@ def test_a_plugin_loaded_while_playing_hears_its_install_hook(tmp_path):
     assert _notes(sink) == ["late installed"]
 
 
+def test_a_plugin_loaded_while_connected_hears_install_then_connect(tmp_path):
+    _write(tmp_path / "worlds" / "plugins" / "late.xml", _plugin(
+        B, "late",
+        "function OnPluginInstall() Note('late installed') end\n"
+        "function OnPluginConnect() Note('late connected') end",
+    ))
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
+    pack.load_source(_plugin(A, "first"))
+    pack.dispatch_install()
+    pack.dispatch_connect()
+    pack._lua.execute("LoadPlugin('worlds/plugins/late.xml')")
+    assert _notes(sink) == ["late installed", "late connected"]
+
+
+def test_a_plain_include_that_fails_leaves_its_plugin_working(tmp_path):
+    # The include's error is recorded; the plugin's own script still runs, its rules find
+    # their functions, and a rule it adds later in play is bound at once.
+    from genericmud.scripting.mushclient_rules import ALIAS
+
+    _write(tmp_path / "worlds" / "plugins" / "broken.xml", (
+        "<muclient><script><![CDATA[this is not lua]]></script></muclient>"
+    ))
+    _write(tmp_path / "worlds" / "plugins" / "plug.xml", _plugin(
+        B, "plug", "function handler() Note('handler') end",
+        "<include name='broken.xml'/>"
+        "<aliases><alias match='xtest' enabled='y' script='handler'/></aliases>",
+    ))
+    _write(tmp_path / "worlds" / "world.xml", (
+        "<muclient><include name='plugins/plug.xml' plugin='y'/></muclient>"
+    ))
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
+    pack.load_file(str(tmp_path / "worlds" / "world.xml"))
+    assert any(name == "broken.xml" for name, _error in pack._include_errors)
+    assert pack._loading_plugins == {}
+    pack._in_plugin(
+        B, pack._lua.execute, "AddAlias('later', 'later', '', alias_flag.Enabled, 'handler')"
+    )
+    assert pack._rules[ALIAS][(B, "later")].handler is not None
+    engine.process_input("xtest")
+    engine.process_input("later")
+    assert _notes(sink) == ["handler", "handler"]
+
+
 def test_a_disabled_plugins_alias_lets_the_command_through():
     sink, engine = _engine()
     pack = MushclientPack(ScriptApi(engine, source="m"))

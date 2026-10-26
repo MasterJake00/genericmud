@@ -453,9 +453,17 @@ class ScriptApi:
             return
         self._active_timers += 1
         handle_box: list = []
+        released: list[bool] = []
+
+        def release() -> None:
+            # Once per timer, whether it fires or a disconnect or reload cancels it, so
+            # cancelled timers don't keep counting against the limit.
+            if not released:
+                released.append(True)
+                self._active_timers -= 1
 
         def wrapped() -> None:
-            self._active_timers -= 1
+            release()
             if handle_box:
                 self._engine.discard_timer(handle_box[0])
             callback()
@@ -464,7 +472,7 @@ class ScriptApi:
         # (a fired one is discarded above), rather than letting it run after the tab closes.
         handle_box.append(
             self._engine.schedule_timer(
-                max(delay, _MIN_TIMER_DELAY), wrapped, source=self._source
+                max(delay, _MIN_TIMER_DELAY), wrapped, source=self._source, on_cancel=release
             )
         )
 

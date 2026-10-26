@@ -56,6 +56,44 @@ def test_add_timer_frees_its_slot_when_it_fires():
     assert api._active_timers == 0  # a self-rearming heartbeat stays at steady state
 
 
+class _Handle:
+    def __init__(self, callback) -> None:
+        self.callback = callback
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class _CancellableSink(EngineSink):
+    def __init__(self) -> None:
+        self.handles: list[_Handle] = []
+
+    def schedule(self, delay, callback) -> _Handle:
+        self.handles.append(_Handle(callback))
+        return self.handles[-1]
+
+
+def test_a_cancelled_timer_frees_its_slot_once():
+    # A dropped connection cancels a pack's pending timers. Their slots must come back, or a
+    # pack that re-arms its timers on every reconnect is refused for good after a few drops.
+    sink = _CancellableSink()
+    engine = AutomationEngine(sink)
+    api = ScriptApi(engine, source="pack")
+    other = ScriptApi(engine, source="other")
+    api.add_timer(1.0, lambda: None)
+    api.add_timer(1.0, lambda: None)
+    other.add_timer(1.0, lambda: None)
+    engine.cancel_source_timers("pack")
+    assert (api._active_timers, other._active_timers) == (0, 1)
+    engine.cancel_timers()
+    engine.cancel_timers()  # nothing is left to cancel a second time
+    assert other._active_timers == 0
+    assert all(handle.cancelled for handle in sink.handles)
+    sink.handles[0].callback()  # a cancelled timer that runs anyway doesn't free it twice
+    assert api._active_timers == 0
+
+
 def test_set_var_rejects_oversized_value():
     engine = AutomationEngine()
     api = ScriptApi(engine)

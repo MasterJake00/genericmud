@@ -196,6 +196,15 @@ def _named(match: re.Match[str]) -> dict[str, str]:
     return {name: value if value is not None else "" for name, value in match.groupdict().items()}
 
 
+
+def _cancel_pending(entry: tuple[object, str, Callable[[], None] | None]) -> None:
+    handle, _source, on_cancel = entry
+    cancel = getattr(handle, "cancel", None)
+    if cancel is not None:
+        cancel()
+    if on_cancel is not None:
+        on_cancel()
+
 class AutomationEngine:
     def __init__(self, sink: EngineSink | None = None, *, sound: SoundBus | None = None) -> None:
         self.sink = sink or EngineSink()
@@ -229,7 +238,9 @@ class AutomationEngine:
         # False while a pack wants incoming lines kept quiet (Miriani-Next's Do Not Disturb).
         self.line_speech = True
         # (handle, source) pairs let a live script reload cancel only the retiring script set.
-        self._timer_handles: list[tuple[object, str]] = []
+        # Each pending timer or other cancellable job: its handle, the source that made it,
+        # and what to run if it's cancelled instead of firing (see ScriptApi.add_timer).
+        self._timer_handles: list[tuple[object, str, Callable[[], None] | None]] = []
 
     # --- registration ---
 
@@ -440,47 +451,48 @@ class AutomationEngine:
     # --- timers ---
 
     def schedule_timer(
-        self, delay: float, callback: Callable[[], None], *, source: str = ""
+        self,
+        delay: float,
+        callback: Callable[[], None],
+        *,
+        source: str = "",
+        on_cancel: Callable[[], None] | None = None,
     ) -> object | None:
         """Schedule a pack timer through the sink and track its handle.
 
         Tracked so :meth:`cancel_timers` can drop everything still pending at session close;
         a one-shot cue timer that outlives its tab would otherwise fire and start audio with no
-        session left to stop it.
+        session left to stop it. ``on_cancel`` runs if it's cancelled instead of firing.
         """
         handle = self.sink.schedule(delay, callback)
         if handle is not None:
-            self._timer_handles.append((handle, source))
+            self._timer_handles.append((handle, source, on_cancel))
         return handle
 
     def track_pending(self, handle: object, *, source: str = "") -> None:
         """Hold other cancellable pending work (a sound still downloading) with the timers,
         so session teardown and a source's reload cancel it the same way."""
-        self._timer_handles.append((handle, source))
+        self._timer_handles.append((handle, source, None))
 
     def discard_timer(self, handle: object) -> None:
         """Forget a handle once it has fired, so the tracking list can't grow unbounded."""
-        self._timer_handles = [pair for pair in self._timer_handles if pair[0] is not handle]
+        self._timer_handles = [entry for entry in self._timer_handles if entry[0] is not handle]
 
     def cancel_source_timers(self, source: str) -> None:
         """Cancel pending timers registered by one retiring script/pack source."""
-        keep: list[tuple[object, str]] = []
-        for handle, handle_source in self._timer_handles:
-            if handle_source != source:
-                keep.append((handle, handle_source))
-                continue
-            cancel = getattr(handle, "cancel", None)
-            if cancel is not None:
-                cancel()
+        keep: list[tuple[object, str, Callable[[], None] | None]] = []
+        cancelled: list[tuple[object, str, Callable[[], None] | None]] = []
+        for entry in self._timer_handles:
+            (cancelled if entry[1] == source else keep).append(entry)
         self._timer_handles = keep
+        for entry in cancelled:
+            _cancel_pending(entry)
 
     def cancel_timers(self) -> None:
-        """Cancel every still-pending pack timer (session teardown)."""
-        for handle, _source in self._timer_handles:
-            cancel = getattr(handle, "cancel", None)
-            if cancel is not None:
-                cancel()
-        self._timer_handles.clear()
+        """Cancel every still-pending pack timer (session teardown, or a dropped connection)."""
+        cancelled, self._timer_handles = self._timer_handles, []
+        for entry in cancelled:
+            _cancel_pending(entry)
 
     # --- evaluation ---
 

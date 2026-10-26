@@ -419,6 +419,7 @@ class EngineApp:
         self._vip_packs: list[VipMudPack] = []  # loaded VIPMud packs (OnConnect/OnDisconnect)
         self._vip_connected = False  # which of the two the VIPMud packs last heard
         self._mush_connected = False  # the same for the MUSHclient packs' hooks
+        self._pack_timers_cancelled = False  # a dropped connection cancelled the packs' timers
         self._simulate_depth = 0  # Simulate inside a line that was itself simulated
         self._save_scheduled = False  # a pack's SaveState is waiting to be written
         self._user_script_runtimes: list[user_scripts.LoadedUserScript] = []
@@ -495,6 +496,7 @@ class EngineApp:
         self._vip_packs = [pack for pack in result.packs.values() if isinstance(pack, VipMudPack)]
         self._vip_connected = False
         self._mush_connected = False
+        self._pack_timers_cancelled = False
         self._announce_activation(result)
         return result
 
@@ -579,9 +581,13 @@ class EngineApp:
         if connected == self._mush_connected:
             return
         self._mush_connected = connected
+        resume = connected and self._pack_timers_cancelled
+        if resume:
+            self._pack_timers_cancelled = False
         for pack in self._mush_packs:
             if connected:
-                pack.resume_timers()  # a terminal drop cancelled them
+                if resume:
+                    pack.resume_timers()  # only after a drop that cancelled them
                 pack.dispatch_connect()
             else:
                 pack.dispatch_disconnect()
@@ -1956,6 +1962,7 @@ class EngineApp:
             # OnPluginTick chain pauses so a tick can't restart music after quit.
             self.engine.connected = False
             self.engine.cancel_timers()  # a pending #alarm must not fire into a dead session
+            self._pack_timers_cancelled = True
             self.sound.flush()
             if message.startswith("protocol error"):
                 # The raw exception is developer-speak; speak plain language and leave the

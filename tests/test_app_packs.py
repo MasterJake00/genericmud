@@ -340,8 +340,20 @@ def test_the_session_lists_its_packs_notepads(tmp_path):
     assert app.pack_notepads() == {"comlog": "Bob: hi\r\n"}
 
 
-def test_a_packs_timers_run_again_after_a_reconnect(tmp_path):
-    # A disconnect cancels every pending pack timer; Toastush's heartbeat must come back.
+class _TimerHandle:
+    """What the event loop hands back for a scheduled callback: it can be cancelled."""
+
+    def __init__(self, delay: float, callback) -> None:
+        self.delay = delay
+        self.callback = callback
+        self.cancelled = False
+        self.fired = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+def _heartbeat_session(tmp_path):
     store = PackStore(tmp_path / "store")
     _install_mush(
         store, tmp_path,
@@ -350,17 +362,48 @@ def test_a_packs_timers_run_again_after_a_reconnect(tmp_path):
         "function beat() Note('beat') end\n"
         "]]></script></muclient>",
     )
-    scheduled: list[tuple[float, object]] = []
+    handles: list[_TimerHandle] = []
+
+    def schedule(delay, callback):
+        handles.append(_TimerHandle(delay, callback))
+        return handles[-1]
+
     backend = RecordingBackend()
     app = EngineApp(
-        VoiceRouter(backend, clock=lambda: 0.0), packs=store, name="mud",
-        schedule=lambda delay, callback: scheduled.append((delay, callback)),
+        VoiceRouter(backend, clock=lambda: 0.0), packs=store, name="mud", schedule=schedule,
     )
     app.on_connect("mud")
-    app.on_connection_status("disconnected")
-    scheduled.clear()  # what the disconnect cancelled never runs
+    return app, backend, handles
+
+
+def _heartbeats(handles: list[_TimerHandle]) -> list[_TimerHandle]:
+    return [
+        handle for handle in handles
+        if handle.delay == 1 and not handle.cancelled and not handle.fired
+    ]
+
+
+def test_a_packs_timers_run_again_after_a_reconnect(tmp_path, monkeypatch):
+    # A disconnect cancels every pending pack timer, and Toastush's heartbeat must come back
+    # each time. Cancelled timers give their places under the pack's timer limit back, or
+    # a few drops would use the limit up and the heartbeat would be refused for good.
+    monkeypatch.setattr("genericmud.scripting.api._MAX_ACTIVE_TIMERS", 1)
+    app, backend, handles = _heartbeat_session(tmp_path)
+    for _drop in range(3):
+        app.on_connection_status("disconnected")
+        app.on_connection_status("reconnected")
+        backend.spoken.clear()
+        due = _heartbeats(handles)
+        assert len(due) == 1
+        due[0].fired = True
+        due[0].callback()
+        assert "beat" in backend.spoken
+
+
+def test_a_drop_that_reconnects_by_itself_leaves_the_timers_running(tmp_path):
+    # Losing the connection and getting it back doesn't cancel the pack's timers, so they
+    # aren't scheduled again: that would restart every countdown.
+    app, _backend, handles = _heartbeat_session(tmp_path)
+    app.on_connection_status("connection lost; reconnecting in 5s (attempt 1)")
     app.on_connection_status("reconnected")
-    backend.spoken.clear()
-    for _delay, callback in [entry for entry in scheduled if entry[0] == 1]:
-        callback()
-    assert "beat" in backend.spoken
+    assert len(_heartbeats(handles)) == 1
