@@ -7,6 +7,20 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.13.1 — 2026-10-25
+
+**Soundpacks stop typing at the MUD**
+
+* MUSHclient soundpacks written for MushReader speak their messages instead of
+  sending them to the MUD. Stellarmush and Mystavaria sent "tts_interrupt" lines
+  and the message was never read out.
+* Chat lines a soundpack keeps in its channel history no longer go to the MUD as
+  "history_add" commands. Empire and Mystavaria sent one for every chat line.
+  Those lines are now under their channel for the Ctrl+Alt arrow keys.
+* Miriani-Next's Do Not Disturb works.
+* The official Prometheus VIP Mud soundpack no longer sends stray "}" lines to
+  the MUD after you log in.
+
 ## 0.13.0 — 2026-10-25
 
 **Escape no longer stops speech**
