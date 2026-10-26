@@ -24,6 +24,8 @@ class RecordingSink(EngineSink):
     scheduled: list[tuple[float, Callable[[], None]]] = field(default_factory=list)
     speech_stops: int = 0
     lines: list[str] = field(default_factory=list)  # the output window, oldest first
+    answers: list[Any] = field(default_factory=list)  # the player's replies to pack dialogs
+    asked: list[dict] = field(default_factory=list)  # the dialogs packs asked for
 
     def send(self, text: str) -> None:
         self.sent.append(text)
@@ -63,6 +65,10 @@ class RecordingSink(EngineSink):
 
     def schedule(self, delay: float, callback: Callable[[], None]) -> None:
         self.scheduled.append((delay, callback))
+
+    def ask(self, request: dict) -> Any:
+        self.asked.append(request)
+        return self.answers.pop(0) if self.answers else None
 
     def recent_lines(self, count: int) -> list[str]:
         return self.lines[-count:] if count > 0 else []

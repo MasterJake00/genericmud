@@ -10,7 +10,8 @@ A separate worker process would isolate further; this just prevents hangs.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 MAX_SCRIPT_SECONDS = 1.0
 HOOK_INSTRUCTION_INTERVAL = 50_000
@@ -63,3 +64,12 @@ class ScriptGuard:
         """Time-bound a call but let errors propagate (for pack loading/import reports)."""
         self._deadline = time.monotonic() + self._max_seconds
         return fn(*args)
+
+    @contextmanager
+    def paused(self) -> Iterator[None]:
+        """Stop the clock while the script waits for the player to answer a dialog."""
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._deadline += time.monotonic() - started

@@ -34,6 +34,8 @@ import random
 import re
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -72,6 +74,12 @@ _SEQUENTIAL_HANDLES = frozenset("12345")  # #File handles 1-5 are text files; 6-
 _SEND_LIMIT = 1000  # lines #Send sends from one file
 _PROTECTED_SUFFIXES = (".exe", ".dll", ".ini", ".cfg", ".hlp")  # #DelFile won't (manual)
 _WRITES_FILES_RE = re.compile(r"#write\b", re.IGNORECASE)
+# Commands that work VIPMud's own menus, windows and keys. genericMud has its own of each and
+# ignores these, so a key bound to nothing else stays genericMud's: Cosmic Rage re-binds
+# Alt+F, Ctrl+O, Escape and Ctrl+Q to them.
+_VIPMUD_INTERFACE_COMMANDS = frozenset(
+    {"AUTOMENU", "SYSKEY", "WINDOW", "EDIT", "QUIT", "TAB", "UNTAB", "CONFIGURE"}
+)
 
 
 @lru_cache(maxsize=512)
@@ -943,9 +951,20 @@ class _VipRule:
     origin: str | None = None  # the file whose loading defined it, for #UnLoad
 
 
+@lru_cache(maxsize=256)
+def _only_works_vipmud(body: str) -> bool:
+    """Whether a script does nothing but work VIPMud's own menus, windows and keys."""
+    statements = tokenize_statements(body)
+    return bool(statements) and all(
+        command is not None and _command_name(command) in _VIPMUD_INTERFACE_COMMANDS
+        for command, _args in statements
+    )
+
+
 class _KeyBinding:
     """A pack key as the engine sees it. It is active while one of its definitions is, so a
-    key whose class is off falls through to genericMud instead of doing nothing."""
+    key whose class is off falls through to genericMud instead of doing nothing, and so does
+    one that only opens VIPMud's own menus and windows."""
 
     def __init__(self, pack: VipMudPack, combo: str) -> None:
         self._pack = pack
@@ -954,9 +973,10 @@ class _KeyBinding:
     def active(self) -> bool:
         # The window asks from its own thread while the pack may be changing its keys.
         try:
-            return self._pack._key_rule(self._combo) is not None
+            rule = self._pack._key_rule(self._combo)
         except RuntimeError:
             return True
+        return rule is not None and not _only_works_vipmud(rule.body)
 
     def __call__(self, ctx: MatchContext) -> None:
         rule = self._pack._key_rule(self._combo)
@@ -1037,6 +1057,7 @@ class VipMudPack:
         self._gag_voice_only = False
         self._gag_from: Line | None = None  # the line that asked, which isn't one of them
         self._steps = 0  # commands the outermost running script has used of _STEP_LIMIT
+        self._player_time = 0.0  # seconds spent waiting on the player's answers to dialogs
         # Classes start switched off; a rule in a class works only while it's enabled.
         self._enabled_classes: set[str] = set()
         self._current_classes: tuple[str, ...] = ()  # set by #Class with just a name
@@ -1398,14 +1419,27 @@ class VipMudPack:
 
     def _start_budget(self, seconds: float) -> None:
         self._steps = 0
-        self._deadline = time.monotonic() + seconds
+        self._deadline = self._script_time() + seconds
         self._budget_noted = False
+
+    def _script_time(self) -> float:
+        """The clock budgets run on: it stands still while a dialog waits for the player, so
+        every script waiting on the answer, and any file loading it, keeps its time."""
+        return time.monotonic() - self._player_time
+
+    @contextmanager
+    def _waiting_for_player(self) -> Iterator[None]:
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._player_time += time.monotonic() - started
 
     def _tick(self) -> None:
         """Count a command or a loop's pass against the running script's budget. Text a pack
         runs with #Exec can come from the MUD, so no script gets to keep the client busy."""
         self._steps += 1
-        if self._steps <= _STEP_LIMIT and time.monotonic() <= self._deadline:
+        if self._steps <= _STEP_LIMIT and self._script_time() <= self._deadline:
             return
         if not self._budget_noted and self._api.diag is not None:
             self._budget_noted = True
@@ -1593,9 +1627,13 @@ class VipMudPack:
             back = self._expand(args[1].text, scope).strip()
             if way and back:
                 self._directions[way] = back
+        elif command == "PICK" and args:
+            self._execute_pick(args, scope)
+        elif command in ("PROMPT", "GPROMPT") and args:
+            self._execute_prompt(command == "GPROMPT", args, scope)
         # Other #commands are ignored rather than sent to the MUD: the ones for VIPMud's own
         # windows and menus (#Edit, #Window, #AutoMenu, #SysKey, #Tab) have genericMud
-        # equivalents, and #Pick and #Prompt need a menu to show.
+        # equivalents.
 
     def _options(self, args: list[_Tok], scope: _Scope) -> set[str]:
         """Option words like "NoDisplay|Current", lowercased, from every parameter given."""
@@ -1678,6 +1716,46 @@ class VipMudPack:
             if needle and needle in lines[index].casefold():
                 self._found_line, self._find_index = lines[index], index
                 return
+
+    def _execute_pick(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#Pick list`` (manual 5.2.36): show the list and run what the player picks as if
+        they had typed it, inside this script, so a picked ``#Abort`` ends it. Cancelling
+        runs nothing and the script goes on.
+
+        The list is expanded once, when it's shown, like any parameter: the unofficial
+        Prometheus options menu words each toggle's message by the value it had then.
+        """
+        value = self._ask_pick(self._expand(args[0].text, scope))
+        if value is not None:
+            self._execute_body(value, scope)
+
+    def _ask_pick(self, text: str) -> str | None:
+        """Show a #Pick list and return the value of the item picked; None when cancelled."""
+        listing = _pick_list(text)
+        if not listing.captions:
+            return None
+        with self._waiting_for_player():
+            index = self._api.ask_choice(
+                listing.title, listing.title or "Choose an item", listing.captions,
+                listing.selected,
+            )
+        return listing.values[index] if index is not None else None
+
+    def _execute_prompt(self, is_global: bool, args: list[_Tok], scope: _Scope) -> None:
+        """``#Prompt variable text`` (manual 5.2.39): ask the player to type the variable's
+        value. Cancelling leaves the variable as it was. #GPrompt sets a global one."""
+        name = _fold(self._expand(args[0].text, scope).strip())
+        if not name:
+            return
+        text = self._expand(args[1].text, scope).strip() if len(args) > 1 else ""
+        with self._waiting_for_player():
+            answer = self._api.ask_text(text, text or name)
+        if answer is None:
+            return
+        if is_global:
+            self._api.set_gvar(name, answer)
+        else:
+            self._set_var(name, answer)
 
     def _resolve_in_pack(self, reference: str, *, must_exist: bool) -> Path | None:
         """Resolve a pack-relative path: an exact file under the pack dir, else the first match
@@ -2573,7 +2651,11 @@ class VipMudPack:
         return str(len(_words(text, delimiter)))
 
     def _function_pick(self, args: list[str], scope: _Scope) -> str:
-        return ""  # no list to pick from yet: as if the player cancelled
+        """``%Pick(list)`` (manual 5.3.23): the value of the item the player picks, or
+        nothing when they cancel. Commas split a function's arguments, not a list, so the
+        list is all of them."""
+        value = self._ask_pick(_unquote(self._expand(",".join(args), scope)))
+        return _unescape(value).strip() if value is not None else ""
 
     def _function_pop(self, args: list[str], scope: _Scope) -> str:
         name = _fold(self._text_argument(args, 0, scope).strip())
@@ -2650,6 +2732,87 @@ class VipMudPack:
 
 def _list_items(text: str) -> list[str]:
     return text.split("|") if text else []
+
+
+def _unescape(text: str) -> str:
+    """``text`` with its ``~`` escapes taken off, as shown to the player."""
+    if _ESCAPE not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == _ESCAPE and i + 1 < len(text):
+            i += 1
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def _top_level(text: str, separator: str) -> list[int]:
+    """Where ``separator`` occurs in ``text`` outside braces and not after a ``~``."""
+    positions: list[int] = []
+    depth = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == _ESCAPE:
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}" and depth:
+            depth -= 1
+        elif c == separator and not depth:
+            positions.append(i)
+        i += 1
+    return positions
+
+
+@dataclass
+class _PickList:
+    """A #Pick list: the captions shown, what each one stands for, the title and the item
+    the cursor starts on."""
+
+    title: str = ""
+    captions: list[str] = field(default_factory=list)
+    values: list[str] = field(default_factory=list)
+    selected: int | None = None
+
+
+def _pick_list(text: str) -> _PickList:
+    """Read a #Pick list (manual 5.2.36): items between ``|``, each ``caption:value`` or just
+    one text that is both. A ``P`` caption makes its value the list's title, and a ``*``
+    before a caption starts the cursor there.
+
+    Packs write values that are whole scripts (the unofficial Prometheus options menu), so
+    a ``|`` or ``:`` inside braces belongs to its item, and ``~|`` is a pipe in an item
+    (Miriani builds ``Entry~|NoReturn`` into its destination list). The first ``:`` splits:
+    Cosmic Rage's titles end in one.
+    """
+    listing = _PickList()
+    start = 0
+    for end in [*_top_level(text, "|"), len(text)]:
+        item = text[start:end]
+        start = end + 1
+        colons = _top_level(item, ":")
+        if colons:
+            caption, value = item[:colons[0]].strip(), item[colons[0] + 1:]
+        else:
+            caption = value = item.strip()
+        if colons and caption.lower() == "p":
+            listing.title = _unescape(value).strip()
+            continue
+        if caption.startswith("*"):
+            caption = caption[1:].strip()
+            if not colons:
+                value = caption
+            if listing.selected is None:
+                listing.selected = len(listing.captions)
+        if not caption and not value.strip():
+            continue
+        listing.captions.append(" ".join(_unescape(caption).split()))
+        listing.values.append(value)
+    return listing
 
 
 def _words(text: str, delimiter: str) -> list[str]:

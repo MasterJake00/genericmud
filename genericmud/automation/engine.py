@@ -66,6 +66,13 @@ class EngineSink:
     def recent_lines(self, count: int) -> list[str]:
         """The last ``count`` lines of the output, oldest first."""
         return []
+    def ask(self, request: dict) -> object | None:
+        """Show the player a pack's question and wait for the answer; None means cancelled.
+
+        ``request["kind"]`` is "choice", "choices", "text" or "message"; ScriptApi's ask_*
+        methods build each one and check the answer. A front end with no dialogs answers None.
+        """
+        return None
 
 
 def wildcard_regex(pattern: str) -> str:

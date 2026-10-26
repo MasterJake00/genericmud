@@ -32,7 +32,7 @@ from uuid import uuid4
 
 from genericmud.automation.engine import MatchContext
 from genericmud.navigation import expand_speedwalk
-from genericmud.scripting.api import ScriptApi
+from genericmud.scripting.api import MESSAGE_BUTTONS, ScriptApi
 from genericmud.scripting.guard import ScriptGuard
 from genericmud.scripting.lua_runtime import install_pack_require, make_sandboxed_runtime
 from genericmud.scripting.sqlite_compat import make_sqlite_bridge
@@ -124,6 +124,38 @@ def _to_float(value: object) -> float | None:
         return float(value)  # lupa hands Lua numbers over as int/float; nil arrives as None
     except (TypeError, ValueError):
         return None
+
+
+# What a msgbox answers when the player backs out of it, or there's no window to show it.
+_MSGBOX_BACKED_OUT = {
+    "ok": "ok",
+    "okcancel": "cancel",
+    "yesno": "no",
+    "yesnocancel": "cancel",
+    "retrycancel": "cancel",
+    "abortretryignore": "abort",
+}
+
+
+def _dialog_text(value: object, default: str = "") -> str:
+    """A dialog argument as text: nil is the default, 5.0 is "5", and CR LF a line break."""
+    if value is None:
+        return default
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).replace("\r\n", "\n")
+
+
+def _sorted_choices(choices: object) -> tuple[list[object], list[str]]:
+    """A listbox table's keys and captions, sorted by caption ignoring case, the way a
+    Windows list box sorts them."""
+    if not hasattr(choices, "items"):
+        return [], []
+    pairs = sorted(
+        ((key, _dialog_text(value)) for key, value in choices.items()),
+        key=lambda pair: pair[1].casefold(),
+    )
+    return [key for key, _caption in pairs], [caption for _key, caption in pairs]
 _MUSHCLIENT_VERSION = "5.06"
 
 # MUSHclient's AddTrigger/AddTriggerEx flag bits (exposed to packs as `trigger_flag`).
@@ -1195,7 +1227,97 @@ class MushclientPack:
         )
         utils.split = split
         utils.readdir = readdir
+        self._install_dialogs(utils)
         self._lua.globals().utils = utils
+
+    def _install_dialogs(self, utils) -> None:
+        """MUSHclient's utils dialogs, shown by the window and waited on like MUSHclient does.
+
+        Each pauses the script's time limit while the player reads and answers. Without a
+        window to show them, they answer as if the player backed out.
+        """
+        api = self._api
+
+        def msgbox(message=None, title=None, buttons=None, icon=None, default=None, *_args):
+            kind = _dialog_text(buttons, "ok").lower()
+            if kind not in MESSAGE_BUTTONS:
+                kind = "ok"
+            with self._guard.paused():
+                answer = api.ask_message(
+                    _dialog_text(title, "MUSHclient"), _dialog_text(message), kind,
+                    _dialog_text(icon, "!"), int(_to_float(default) or 1),
+                )
+            # MUSHclient's msgbox always names a button, and packs compare the answer or
+            # call string methods on it.
+            return answer if answer is not None else _MSGBOX_BACKED_OUT[kind]
+
+        def ask_text(message, title, default, extras, *, multiline: bool):
+            validate = extras["validate"] if hasattr(extras, "items") else None
+            limit = int(_to_float(extras["max_length"]) or 0) if hasattr(extras, "items") else 0
+            text = _dialog_text(default)
+            while True:
+                with self._guard.paused():
+                    answer = api.ask_text(
+                        _dialog_text(title, "MUSHclient"), _dialog_text(message), text,
+                        multiline=multiline,
+                    )
+                if answer is None:
+                    return None
+                if limit > 0:
+                    answer = answer[:limit]
+                if multiline:  # a Windows edit box's lines end in CR LF, and packs split on it
+                    answer = answer.replace("\r\n", "\n").replace("\n", "\r\n")
+                # MUSHclient keeps the box open until the pack's validate function accepts
+                # the text; it usually explains what's wrong in a msgbox of its own first.
+                if not callable(validate) or validate(answer):
+                    return answer
+                text = answer
+
+        def inputbox(message=None, title=None, default=None, _font=None, _size=None,
+                     extras=None, *_args):
+            return ask_text(message, title, default, extras, multiline=False)
+
+        def editbox(message=None, title=None, default=None, _font=None, _size=None,
+                    extras=None, *_args):
+            return ask_text(message, title, default, extras, multiline=True)
+
+        def listbox(message=None, title=None, choices=None, default=None, *_args):
+            keys, captions = _sorted_choices(choices)
+            if not keys:
+                return None
+            start = next((index for index, key in enumerate(keys) if key == default), None)
+            with self._guard.paused():
+                index = api.ask_choice(
+                    _dialog_text(title, "MUSHclient"), _dialog_text(message), captions, start
+                )
+            return keys[index] if index is not None else None
+
+        def multilistbox(message=None, title=None, choices=None, defaults=None, *_args):
+            keys, captions = _sorted_choices(choices)
+            if not keys:
+                return None
+            ticked = [
+                index for index, key in enumerate(keys)
+                if hasattr(defaults, "items") and defaults[key]
+            ]
+            with self._guard.paused():
+                indexes = api.ask_choices(
+                    _dialog_text(title, "MUSHclient"), _dialog_text(message), captions, ticked
+                )
+            if indexes is None:
+                return None
+            chosen = self._lua.table()
+            for index in indexes:
+                chosen[keys[index]] = True
+            return chosen
+
+        utils.msgbox = msgbox
+        utils.umsgbox = msgbox
+        utils.inputbox = inputbox
+        utils.editbox = editbox
+        utils.listbox = listbox
+        utils.choose = listbox  # a drop-down list in MUSHclient; the same question here
+        utils.multilistbox = multilistbox
 
     def _send_text(self, text: object = "") -> int:
         self._api.send(str(text))

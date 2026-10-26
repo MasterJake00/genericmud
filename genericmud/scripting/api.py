@@ -36,6 +36,22 @@ _MAX_EXECUTE_DEPTH = 20  # an alias that executes itself must terminate without 
 _COMMAND_VARIABLE_RE = re.compile(r"\$\{([^{}]+)\}")
 _MISSING = object()
 
+# MUSHclient's msgbox button sets, each with the names its buttons answer with, in order.
+MESSAGE_BUTTONS = {
+    "ok": ("ok",),
+    "okcancel": ("ok", "cancel"),
+    "yesno": ("yes", "no"),
+    "yesnocancel": ("yes", "no", "cancel"),
+    "retrycancel": ("retry", "cancel"),
+    "abortretryignore": ("abort", "retry", "ignore"),
+}
+_MESSAGE_ICONS = frozenset({"!", "?", "i", "."})
+
+
+def _is_index(value: object, count: int) -> bool:
+    """Whether ``value`` is a position in a list of ``count`` items (a bool is not)."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < count
+
 
 class ScriptApi:
     def __init__(
@@ -201,6 +217,67 @@ class ScriptApi:
 
     def is_connected(self) -> bool:
         return self._engine.connected
+
+    # --- asking the player (each returns None when they cancel or there's no window) ---
+
+    def ask_choice(
+        self, title: str, prompt: str, items: list[str], selected: int | None = None
+    ) -> int | None:
+        """Show a list and return the index of the item the player picked."""
+        items = [str(item) for item in items]
+        if not _is_index(selected, len(items)):
+            selected = None
+        answer = self._engine.sink.ask({
+            "kind": "choice", "title": str(title), "prompt": str(prompt), "items": items,
+            "selected": selected,
+        })
+        return answer if _is_index(answer, len(items)) else None
+
+    def ask_choices(
+        self, title: str, prompt: str, items: list[str], selected: list[int] | None = None
+    ) -> list[int] | None:
+        """Show a list the player can tick several items in; returns the ticked indexes."""
+        items = [str(item) for item in items]
+        ticked = sorted({index for index in selected or [] if _is_index(index, len(items))})
+        answer = self._engine.sink.ask({
+            "kind": "choices", "title": str(title), "prompt": str(prompt), "items": items,
+            "selected": ticked,
+        })
+        if not isinstance(answer, list):
+            return None
+        if not all(_is_index(index, len(items)) for index in answer):
+            return None
+        return sorted(set(answer))
+
+    def ask_text(
+        self, title: str, prompt: str, default: str = "", *, multiline: bool = False
+    ) -> str | None:
+        """Ask the player to type something; ``default`` is already filled in."""
+        answer = self._engine.sink.ask({
+            "kind": "text", "title": str(title), "prompt": str(prompt), "default": str(default),
+            "multiline": bool(multiline),
+        })
+        return answer if isinstance(answer, str) else None
+
+    def ask_message(
+        self, title: str, prompt: str, buttons: str = "ok", icon: str = "!", default: int = 1
+    ) -> str | None:
+        """Show a message with MUSHclient's button sets; returns the pressed button's name.
+
+        ``buttons`` is one of MESSAGE_BUTTONS, ``icon`` is "!", "?", "i" or "." (warning,
+        question, information, error), and ``default`` counts the buttons from 1.
+        """
+        if buttons not in MESSAGE_BUTTONS:
+            buttons = "ok"
+        if icon not in _MESSAGE_ICONS:
+            icon = "!"
+        if not (isinstance(default, int) and 1 <= default <= len(MESSAGE_BUTTONS[buttons])):
+            default = 1
+        answer = self._engine.sink.ask({
+            "kind": "message", "title": str(title), "prompt": str(prompt), "buttons": buttons,
+            "icon": icon, "default": default,
+        })
+        return answer if answer in MESSAGE_BUTTONS[buttons] else None
 
     def play(
         self,

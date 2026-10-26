@@ -141,7 +141,7 @@ class AppSink(EngineSink):
 
     def __init__(
         self, *, send, post, schedule, voice: VoiceRouter, buffer: Buffer, sound: SoundBus,
-        diag: DiagnosticLog | None = None, send_raw=None,
+        diag: DiagnosticLog | None = None, send_raw=None, ask=None,
     ) -> None:
         self._send = send
         self._send_raw = send_raw
@@ -151,6 +151,7 @@ class AppSink(EngineSink):
         self._buffer = buffer
         self._sound = sound
         self._diag = diag
+        self._ask = ask
         self.cues = 0  # play/music calls reaching the bus -- 0 means no cue ever fired
 
     def send(self, text: str) -> None:
@@ -217,6 +218,11 @@ class AppSink(EngineSink):
     def schedule(self, delay: float, callback: Callable[[], None]) -> object | None:
         return self._schedule(delay, callback)
 
+    def ask(self, request: dict) -> object | None:
+        if self._ask is None:
+            return None
+        return self._ask(request)
+
 
 class EngineApp:
     def __init__(
@@ -264,7 +270,11 @@ class EngineApp:
             buffer=self.buffer,
             sound=self.sound,
             diag=diag,
+            ask=self._ask_player,
         )
+        # Set by a front end that can show dialogs (the wx window); a pack's question to a
+        # window-less session is cancelled.
+        self.asker: Callable[[dict], object] | None = None
         self.engine = AutomationEngine(self.sink, sound=self.sound)
         self.engine.diag = diag  # sound-path trace, reached by ScriptApi/loader via the engine
         if diag is not None:
@@ -339,6 +349,22 @@ class EngineApp:
         values, safe to hand to the UI thread afterwards.
         """
         return list_variables(self.engine.all_mud_vars(), self.engine.all_vars())
+
+    def _ask_player(self, request: dict) -> object | None:
+        """Hand a pack's question to the window; with no window, or if it fails, it's Cancel."""
+        asker = self.asker
+        if asker is None:
+            return None
+        try:
+            return asker(request)
+        except Exception as exc:  # noqa: BLE001 - a failed dialog must not kill the pack's script
+            if self._diag is not None:
+                self._diag.event(
+                    "pack.ask.error", kind=request.get("kind"),
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
+            return None
 
     # --- soundpacks ---
 

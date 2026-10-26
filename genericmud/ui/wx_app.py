@@ -27,7 +27,7 @@ import traceback
 import webbrowser
 import zipfile
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import wx
@@ -85,7 +85,7 @@ from genericmud.packs.user_rules import (
 from genericmud.packs.world_share import export_world, import_world
 from genericmud.protocol.charset import AUTO, ENCODING_CHOICES, encoding_label
 from genericmud.scripting import user_scripts
-from genericmud.scripting.api import ScriptApi
+from genericmud.scripting.api import MESSAGE_BUTTONS, ScriptApi
 from genericmud.session.crashlog import install_loop_exception_handler
 from genericmud.session.credentials import PlaintextCredentialStore
 from genericmud.session.diaglog import DiagnosticLog, make_diagnostic_log
@@ -170,6 +170,11 @@ _FLUSH_INTERVAL_MS = 50  # batch output appends during floods
 # How long the variables window waits for the session's loop thread to hand over a
 # snapshot. A healthy loop answers in microseconds; this only bounds a wedged one.
 _VARIABLE_SNAPSHOT_TIMEOUT_S = 2.0
+# How long a soundpack's dialog waits for an answer before it's closed as cancelled. Every
+# tab waits with it (they share the loop thread), so a dialog nobody can see mustn't hold
+# them forever, but Cosmic Rage's menu items are paragraphs and reading eight of them with
+# a screen reader takes a few minutes.
+_PACK_QUESTION_TIMEOUT_S = 300.0
 _PACK_SOUND_SUFFIXES = frozenset({".wav", ".ogg", ".mp3", ".flac"})  # bundled-audio detection
 
 # Numpad compass (VIPMud/MUDBall convention): digits walk, 5/0 look, . scans,
@@ -263,6 +268,7 @@ class SessionPanel(wx.Panel):
         self._find_direction = False  # direction of the search in flight, for the caret sync
         self._find_restart = False  # next result starts from an output edge, inclusively
         self._keep_caret_on_focus = False  # one-shot: don't jump to the bottom this time
+        self._questions: list[_PackQuestion] = []  # pack dialogs the loop thread waits on
 
         # NVDA reads a control's name from a wx.StaticText created immediately
         # before it plus SetName() (the proven ffn-dl pattern). Both are required.
@@ -334,6 +340,7 @@ class SessionPanel(wx.Panel):
             encoding=self.world.encoding,
             other_worlds=lambda: [world.name for world in load_worlds()],
         )
+        self.app.asker = self._ask_from_pack
         # One codec for both directions: commands go out in the encoding output is read in.
         self._connection.text_codec = self.app.codec
         # Seed the persisted speech toggles; changes flow back out through pref_sink.
@@ -387,6 +394,8 @@ class SessionPanel(wx.Panel):
         app = self.app
         if app is None:
             return [], False
+        if self._questions:  # the loop thread is waiting on a pack's dialog, not us
+            return None
         result: concurrent.futures.Future = concurrent.futures.Future()
 
         def snapshot() -> None:
@@ -400,6 +409,68 @@ class SessionPanel(wx.Panel):
             return result.result(timeout=_VARIABLE_SNAPSHOT_TIMEOUT_S)
         except Exception:  # noqa: BLE001 - timeout, closed loop, or a failed read: say so
             return None
+
+    def _ask_from_pack(self, request: dict) -> object | None:  # loop thread
+        """Show a pack's question and wait for the answer; None when cancelled.
+
+        The pack's script stops here until the player answers, as it does in VIPMud and
+        MUSHclient, and every tab waits with it because they share this thread. A dialog
+        left for _PACK_QUESTION_TIMEOUT_S is closed and counts as cancelled.
+        """
+        if not self._alive:
+            return None
+        question = _PackQuestion(request)
+        self._questions.append(question)
+        try:
+            wx.CallAfter(self._show_question, question)
+            if not question.done.wait(_PACK_QUESTION_TIMEOUT_S):
+                wx.CallAfter(self._withdraw_question, question)
+                return None
+            return question.answer
+        finally:
+            self._questions.remove(question)
+
+    def _show_question(self, question: _PackQuestion) -> None:  # UI thread
+        if question.done.is_set() or not self._alive:
+            question.finish(None)
+            return
+        try:
+            question.finish(self._run_question_dialog(question))
+        finally:
+            question.finish(None)  # a dialog that failed is a cancel, never a stuck script
+
+    def _run_question_dialog(self, question: _PackQuestion) -> object | None:  # UI thread
+        request = question.request
+        title = self._question_title(request)
+        if request["kind"] == "message":
+            dialog = build_pack_message(self, request, title)
+        else:
+            dialog = PackQuestionDialog(self, request, title)
+        question.dialog = dialog
+        try:
+            result = dialog.ShowModal()
+            if request["kind"] == "message":
+                return pack_message_answer(request["buttons"], result)
+            return dialog.answer() if result == wx.ID_OK else None
+        finally:
+            question.dialog = None
+            dialog.Destroy()
+
+    def _withdraw_question(self, question: _PackQuestion) -> None:  # UI thread
+        """Cancel a question nobody answered in time, or one the closing tab leaves behind."""
+        question.finish(None)
+        if question.dialog is not None:
+            question.dialog.EndModal(wx.ID_CANCEL)
+
+    def _question_title(self, request: dict) -> str:
+        """The pack's title, or the world's name when it gave none. With several worlds open
+        the world is named as well: any tab's pack can ask, and the dialog covers them all."""
+        title = (request.get("title") or "").strip() or self.world.name
+        book = self.GetParent()
+        sessions = book.GetPageCount() if isinstance(book, wx.BookCtrlBase) else 1
+        if sessions > 1 and title != self.world.name:
+            title = f"{title} - {self.world.name}"
+        return title
 
     def _send_raw(self, data: bytes) -> None:
         try:
@@ -748,6 +819,8 @@ class SessionPanel(wx.Panel):
     def close(self) -> None:
         """Tear down the session; safe to call from the wx thread on tab close."""
         self._alive = False
+        for question in list(self._questions):  # free the loop thread to tear down
+            self._withdraw_question(question)
         self._loop.call_soon_threadsafe(self._teardown)
 
     def _teardown(self) -> None:  # loop thread
@@ -781,6 +854,114 @@ class SessionPanel(wx.Panel):
             self.app.sound.flush()
             self.app.forget_hidden_input()  # no WONT ECHO will come from a closed socket
             self.app.on_disconnected()  # VIPMud packs' OnDisconnect (they save settings there)
+
+
+class PackQuestionDialog(wx.Dialog):
+    """A soundpack's question: a list to choose one or several items from, or text to type.
+
+    Built from the request a pack's script made through ScriptApi's ask_* methods. The
+    prompt is a StaticText placed right before the control and the control is named after
+    it, the pattern NVDA reads reliably here. :meth:`answer` reads what the player chose.
+    """
+
+    def __init__(self, parent: wx.Window, request: dict, title: str) -> None:
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self._kind = request["kind"]
+        prompt = request.get("prompt") or ""
+        outer = wx.BoxSizer(wx.VERTICAL)
+        if prompt:
+            label = wx.StaticText(self, label=prompt.replace("&", "&&"))
+            label.Wrap(560)
+            outer.Add(label, 0, wx.LEFT | wx.RIGHT | wx.TOP | wx.EXPAND, 10)
+        if self._kind == "text":
+            multiline = bool(request.get("multiline"))
+            self._control = wx.TextCtrl(
+                self, value=request.get("default") or "",
+                style=wx.TE_MULTILINE if multiline else 0,
+                size=(560, 200) if multiline else (560, -1),
+            )
+            self._control.SelectAll()  # typing replaces what the pack filled in
+        elif self._kind == "choices":
+            # A multiple-selection list: NVDA says "selected" or "not selected" as the
+            # player arrows through, and Space switches the item.
+            self._control = wx.ListBox(
+                self, choices=request["items"], style=wx.LB_MULTIPLE, size=(560, 300)
+            )
+            for index in request.get("selected") or []:
+                self._control.SetSelection(index)
+        else:
+            self._control = wx.ListBox(
+                self, choices=request["items"], style=wx.LB_SINGLE, size=(560, 300)
+            )
+            selected = request.get("selected")
+            self._control.SetSelection(selected if selected is not None else 0)
+            self._control.Bind(wx.EVT_LISTBOX_DCLICK, lambda _event: self.EndModal(wx.ID_OK))
+        self._control.SetName(prompt or title)
+        outer.Add(self._control, 1, wx.ALL | wx.EXPAND, 10)
+        outer.Add(self.CreateStdDialogButtonSizer(wx.OK | wx.CANCEL), 0, wx.ALL | wx.EXPAND, 10)
+        self.SetSizerAndFit(outer)
+        self._control.SetFocus()
+
+    def answer(self) -> object | None:
+        if self._kind == "text":
+            return self._control.GetValue()
+        if self._kind == "choices":
+            return list(self._control.GetSelections())
+        index = self._control.GetSelection()
+        return index if index != wx.NOT_FOUND else None
+
+
+# How each of MUSHclient's button sets shows as a wx message dialog: its style, and the
+# button ids in the order of MESSAGE_BUTTONS. Retry/Cancel and Abort/Retry/Ignore are the
+# standard buttons relabelled.
+_MESSAGE_STYLES = {
+    "ok": (wx.OK, (wx.ID_OK,)),
+    "okcancel": (wx.OK | wx.CANCEL, (wx.ID_OK, wx.ID_CANCEL)),
+    "yesno": (wx.YES_NO, (wx.ID_YES, wx.ID_NO)),
+    "yesnocancel": (wx.YES_NO | wx.CANCEL, (wx.ID_YES, wx.ID_NO, wx.ID_CANCEL)),
+    "retrycancel": (wx.OK | wx.CANCEL, (wx.ID_OK, wx.ID_CANCEL)),
+    "abortretryignore": (wx.YES_NO | wx.CANCEL, (wx.ID_YES, wx.ID_NO, wx.ID_CANCEL)),
+}
+_MESSAGE_ICON_STYLES = {
+    "!": wx.ICON_WARNING, "?": wx.ICON_QUESTION, "i": wx.ICON_INFORMATION, ".": wx.ICON_ERROR,
+}
+_DEFAULT_BUTTON_STYLES = {wx.ID_NO: wx.NO_DEFAULT, wx.ID_CANCEL: wx.CANCEL_DEFAULT}
+
+
+def build_pack_message(parent: wx.Window | None, request: dict, title: str) -> wx.MessageDialog:
+    """The native message box for a pack's msgbox, with its buttons, icon and default."""
+    buttons = request["buttons"]
+    style, ids = _MESSAGE_STYLES[buttons]
+    style |= _MESSAGE_ICON_STYLES.get(request.get("icon"), wx.ICON_WARNING)
+    style |= _DEFAULT_BUTTON_STYLES.get(ids[request.get("default", 1) - 1], 0)
+    dialog = wx.MessageDialog(parent, request.get("prompt") or "", title, style)
+    if buttons == "retrycancel":
+        dialog.SetOKCancelLabels("&Retry", "Cancel")
+    elif buttons == "abortretryignore":
+        dialog.SetYesNoCancelLabels("&Abort", "&Retry", "&Ignore")
+    return dialog
+
+
+def pack_message_answer(buttons: str, result: int) -> str | None:
+    """The name of the button a message dialog's ShowModal result stands for."""
+    _style, ids = _MESSAGE_STYLES[buttons]
+    return MESSAGE_BUTTONS[buttons][ids.index(result)] if result in ids else None
+
+
+@dataclass
+class _PackQuestion:
+    """A question a pack's script is waiting on: asked on the loop thread, shown and
+    answered on the UI thread."""
+
+    request: dict
+    answer: object = None
+    done: threading.Event = field(default_factory=threading.Event)
+    dialog: wx.Dialog | None = None  # while it's on screen
+
+    def finish(self, answer: object) -> None:
+        if not self.done.is_set():
+            self.answer = answer
+            self.done.set()
 
 
 class FindDialog(wx.Dialog):

@@ -382,3 +382,226 @@ def test_the_automation_manager_refuses_a_hotkey_genericmud_already_uses(
         assert manager._edit_rule("key", free) == free
     finally:
         manager.Destroy()
+
+
+# --- soundpack questions (VIPMud #Pick/#Prompt, MUSHclient utils dialogs) ---
+
+
+def test_a_pick_list_starts_on_the_packs_item_and_answers_its_index(frame):
+    from genericmud.ui.wx_app import PackQuestionDialog
+
+    request = {
+        "kind": "choice", "title": "select monster", "prompt": "select monster",
+        "items": ["rabbit", "fox", "badger"], "selected": 1,
+    }
+    dialog = PackQuestionDialog(frame, request, "select monster")
+    try:
+        assert dialog.GetTitle() == "select monster"
+        assert dialog._control.GetName() == "select monster"
+        assert [dialog._control.GetString(i) for i in range(3)] == ["rabbit", "fox", "badger"]
+        assert dialog.answer() == 1
+        dialog._control.SetSelection(2)
+        assert dialog.answer() == 2
+    finally:
+        dialog.Destroy()
+
+
+def test_a_pick_list_without_a_starred_item_starts_on_the_first(frame):
+    from genericmud.ui.wx_app import PackQuestionDialog
+
+    request = {"kind": "choice", "title": "", "prompt": "", "items": ["a", "b"], "selected": None}
+    dialog = PackQuestionDialog(frame, request, "Miriani")
+    try:
+        assert dialog.answer() == 0
+        assert dialog._control.GetName() == "Miriani"  # no prompt: named after the title
+    finally:
+        dialog.Destroy()
+
+
+def test_a_several_item_list_ticks_the_defaults_and_answers_every_selected_index(frame):
+    from genericmud.ui.wx_app import PackQuestionDialog
+
+    request = {
+        "kind": "choices", "title": "Food", "prompt": "Pick",
+        "items": ["apple", "pepper", "potato"], "selected": [0],
+    }
+    dialog = PackQuestionDialog(frame, request, "Food")
+    try:
+        assert dialog.answer() == [0]
+        dialog._control.SetSelection(2)
+        assert dialog.answer() == [0, 2]
+    finally:
+        dialog.Destroy()
+
+
+def test_a_text_question_fills_in_the_default_and_answers_what_was_typed(frame):
+    from genericmud.ui.wx_app import PackQuestionDialog
+
+    request = {"kind": "text", "title": "Who", "prompt": "Name & rank?", "default": "Bob",
+               "multiline": False}
+    dialog = PackQuestionDialog(frame, request, "Who")
+    try:
+        assert dialog._control.GetValue() == "Bob"
+        assert not dialog._control.IsMultiLine()
+        assert dialog._control.GetName() == "Name & rank?"
+        dialog._control.SetValue("Alice")
+        assert dialog.answer() == "Alice"
+    finally:
+        dialog.Destroy()
+    request = {**request, "multiline": True}
+    dialog = PackQuestionDialog(frame, request, "Notes")
+    try:
+        assert dialog._control.IsMultiLine()
+    finally:
+        dialog.Destroy()
+
+
+@pytest.mark.parametrize(
+    ("buttons", "default", "flag", "results"),
+    [
+        ("yesno", 2, "NO_DEFAULT", {"ID_YES": "yes", "ID_NO": "no"}),
+        ("okcancel", 2, "CANCEL_DEFAULT", {"ID_OK": "ok", "ID_CANCEL": "cancel"}),
+        ("retrycancel", 1, None, {"ID_OK": "retry", "ID_CANCEL": "cancel"}),
+        ("abortretryignore", 3, "CANCEL_DEFAULT",
+         {"ID_YES": "abort", "ID_NO": "retry", "ID_CANCEL": "ignore"}),
+    ],
+)
+def test_a_msgbox_has_mushclients_buttons_and_answers_their_names(
+    frame, buttons, default, flag, results
+):
+    from genericmud.ui.wx_app import build_pack_message, pack_message_answer
+
+    request = {"kind": "message", "title": "Q", "prompt": "Sure?", "buttons": buttons,
+               "icon": "?", "default": default}
+    dialog = build_pack_message(frame, request, "Q")
+    try:
+        style = dialog.GetMessageDialogStyle()
+        assert style & wx.ICON_QUESTION
+        if flag is not None:
+            assert style & getattr(wx, flag)
+        if buttons == "abortretryignore":
+            labels = (dialog.GetYesLabel(), dialog.GetNoLabel(), dialog.GetCancelLabel())
+            assert [label.replace("&", "").replace("_", "") for label in labels] == [
+                "Abort", "Retry", "Ignore",
+            ]
+    finally:
+        dialog.Destroy()
+    for result, name in results.items():
+        assert pack_message_answer(buttons, getattr(wx, result)) == name
+    assert pack_message_answer("yesno", wx.ID_CANCEL) is None  # closed some other way
+
+
+def _question_panel(frame, monkeypatch, parent=None):
+    import asyncio
+
+    from genericmud.ui import wx_app
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+    loop = asyncio.new_event_loop()
+    panel = wx_app.SessionPanel(parent or frame, loop, {}, World("Test", "mud.example", 4000))
+    return panel, loop
+
+
+def _close_question_panel(panel, loop) -> None:
+    import asyncio
+
+    panel.Destroy()
+    loop.run_until_complete(asyncio.sleep(0.01))
+    loop.close()
+
+
+def _ask_on_another_thread(panel, request):
+    import threading
+
+    outcome: dict = {}
+    worker = threading.Thread(
+        target=lambda: outcome.setdefault("answer", panel._ask_from_pack(request)), daemon=True
+    )
+    worker.start()
+    return worker, outcome
+
+
+def test_a_packs_question_is_shown_on_the_ui_thread_and_answered_to_the_loop_thread(
+    frame, monkeypatch
+):
+    import time
+
+    from genericmud.ui import wx_app
+
+    shown: list[str] = []
+
+    def answer_fox(dialog):
+        shown.append(dialog.GetTitle())
+        dialog._control.SetSelection(1)
+        return wx.ID_OK
+
+    monkeypatch.setattr(wx_app.PackQuestionDialog, "ShowModal", answer_fox)
+    panel, loop = _question_panel(frame, monkeypatch)
+    try:
+        request = {"kind": "choice", "title": "", "prompt": "Choose an item",
+                   "items": ["rabbit", "fox"], "selected": None}
+        worker, outcome = _ask_on_another_thread(panel, request)
+        deadline = time.monotonic() + 5
+        while worker.is_alive() and time.monotonic() < deadline:
+            wx.GetApp().ProcessPendingEvents()
+            worker.join(0.01)
+        assert outcome == {"answer": 1}
+        assert shown == ["Test"]  # no title from the pack: the world's name
+        assert panel._questions == []
+    finally:
+        _close_question_panel(panel, loop)
+
+
+def test_an_unanswered_question_gives_up_as_cancelled(frame, monkeypatch):
+    from genericmud.ui import wx_app
+
+    monkeypatch.setattr(wx_app, "_PACK_QUESTION_TIMEOUT_S", 0.05)
+    panel, loop = _question_panel(frame, monkeypatch)
+    try:
+        request = {"kind": "text", "title": "Name", "prompt": "Name?", "default": "",
+                   "multiline": False}
+        worker, outcome = _ask_on_another_thread(panel, request)
+        worker.join(5)  # nothing pumps the UI, so the dialog never comes up
+        assert outcome == {"answer": None}
+        wx.GetApp().ProcessPendingEvents()  # the late show finds it already over
+    finally:
+        _close_question_panel(panel, loop)
+
+
+def test_closing_the_tab_frees_a_script_waiting_on_its_question(frame, monkeypatch):
+    import types
+
+    panel, loop = _question_panel(frame, monkeypatch)
+    try:
+        request = {"kind": "message", "title": "Q", "prompt": "Sure?", "buttons": "yesno",
+                   "icon": "?", "default": 1}
+        worker, outcome = _ask_on_another_thread(panel, request)
+        while not panel._questions and worker.is_alive():
+            worker.join(0.01)
+        # The variables window doesn't wait on a loop that's busy waiting on the player.
+        panel.app = types.SimpleNamespace()
+        assert panel.variable_snapshot() is None
+        panel.app = None
+        panel.close()
+        worker.join(5)
+        assert outcome == {"answer": None}
+    finally:
+        _close_question_panel(panel, loop)
+
+
+def test_the_world_is_named_on_a_question_when_several_are_open(frame, monkeypatch):
+    book = wx.Simplebook(frame)
+    panel, loop = _question_panel(frame, monkeypatch, parent=book)
+    try:
+        book.AddPage(panel, "Test")
+        assert panel._question_title({"title": "Are you sure?"}) == "Are you sure?"
+        book.AddPage(wx.Panel(book), "Other")
+        assert panel._question_title({"title": "Are you sure?"}) == "Are you sure? - Test"
+        assert panel._question_title({"title": ""}) == "Test"
+    finally:
+        book.RemovePage(0)
+        _close_question_panel(panel, loop)
+        book.Destroy()
