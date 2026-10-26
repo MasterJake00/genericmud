@@ -362,6 +362,19 @@ one rather than assuming. Sounds a pack can't find are reported instead of
 failing silently, and a pack that fails to load doesn't take the session with
 it.
 
+Soundpacks that come from a git repository (Miriani-Next, Toastush, Erion,
+Chatpack and Atlan's Mystavaria pack) are checked for updates when you connect,
+at most once a day, and genericMud tells you when one has something new. Type
+`/update` to install it, then reconnect. Only the files that changed are
+downloaded. When you've changed one of the pack's files yourself, your copy
+stays and the pack's new version goes next to it with `.new` on the end. A
+pack's first update can't tell yet which files you changed, so it treats any
+settings file that differs (the world file, `.ini`, `.cfg` and the like) that
+way. The packs' own update commands work too: `update`, `update check` and
+Miriani-Next's Ctrl+U use genericMud's updater, and the packs' settings for
+updating by themselves at login or while you're idle work as they did in
+MUSHclient.
+
 If the MUD drives the sounds itself (many do, over MSP or GMCP `Client.Media`),
 there's nothing to install: genericMud plays what the MUD asks for. Sounds are
 looked for in the world's Sounds folder first; when the MUD says where to

@@ -99,6 +99,12 @@ class EngineSink:
     def save_state(self) -> None:
         """Save the packs' variables soon (MUSHclient's SaveState); asks close together
         make one save."""
+    def update_packs(self, quiet: bool = False) -> None:
+        """Install what this world's packs' repositories have new (a pack's own update
+        command); ``quiet`` says nothing when there's nothing new."""
+    def check_pack_updates(self) -> None:
+        """Say whether this world's packs' repositories have anything new, without
+        installing it (a pack's own "update check")."""
     def ask(
         self, request: dict, while_waiting: Callable[[], None] | None = None
     ) -> object | None:

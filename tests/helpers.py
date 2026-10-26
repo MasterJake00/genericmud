@@ -30,6 +30,8 @@ class RecordingSink(EngineSink):
     styled: dict[int, list] = field(default_factory=dict)  # colour runs for lines[index]
     simulated: list[str] = field(default_factory=list)  # text packs handed in as if from the MUD
     save_requests: int = 0
+    update_requests: list[bool] = field(default_factory=list)  # quiet flag of each pack update ask
+    update_checks: int = 0
 
     def send(self, text: str) -> None:
         self.sent.append(text)
@@ -90,6 +92,12 @@ class RecordingSink(EngineSink):
 
     def save_state(self) -> None:
         self.save_requests += 1
+
+    def update_packs(self, quiet: bool = False) -> None:
+        self.update_requests.append(quiet)
+
+    def check_pack_updates(self) -> None:
+        self.update_checks += 1
 
     def run_pending(self) -> None:
         """Fire all scheduled callbacks (ignoring delay) and clear the queue."""

@@ -41,6 +41,7 @@ NEW_SUFFIX = ".new"  # the pack's new version of a file the player changed
 _BASELINE_HEADER = "# genericMud git sync baseline v1"
 _READ_CHUNK = 1 << 20  # hash files a megabyte at a time
 _WRITTEN = "w"  # the updater wrote or confirmed this file
+_UPDATER_FILES = (".gm_git", ".gm-update-")  # its baseline, check marker and scratch folder
 _KEPT = "k"  # the player's own copy, kept over the pack's
 
 # Kept on a pack's first update even when they differ from the repository: they're what a
@@ -260,7 +261,7 @@ def make_plan(
     if root is not None and root.is_dir():
         known = set(remote) | set(entries)
         for path in root.rglob("*"):
-            if not path.is_file() or path.name.startswith(BASELINE_NAME):
+            if not path.is_file() or path.name.startswith(_UPDATER_FILES):
                 continue
             repo_path = path.relative_to(root).as_posix()
             if repo_path not in known and not repo_path.endswith(NEW_SUFFIX):
@@ -276,10 +277,11 @@ class Applied:
     new_versions: list[str] = field(default_factory=list)  # player's files with a .new beside
     removed: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)  # blobs that never arrived
+    in_use: list[str] = field(default_factory=list)  # open elsewhere (a sound playing), left as is
 
     @property
     def complete(self) -> bool:
-        return not self.missing
+        return not self.missing and not self.in_use
 
 
 def apply_plan(
@@ -303,22 +305,23 @@ def apply_plan(
 
     # The pack's files: written in place, or beside the player's copy as .new.
     for repo_path, sha in plan.download.items():
-        if _place(pack_dir, prefix + repo_path, blobs.get(sha)):
-            applied.written.append(repo_path)
-        else:
-            applied.missing.append(repo_path)
+        outcome = _place(pack_dir, prefix + repo_path, blobs.get(sha))
+        _record(applied, applied.written, repo_path, outcome)
     for repo_path, sha in plan.modified.items():
-        if _place(pack_dir, prefix + repo_path + NEW_SUFFIX, blobs.get(sha)):
-            applied.new_versions.append(repo_path)
-        else:
-            applied.missing.append(repo_path)
+        outcome = _place(pack_dir, prefix + repo_path + NEW_SUFFIX, blobs.get(sha))
+        _record(applied, applied.new_versions, repo_path, outcome)
 
     # Files the repository dropped that are still as the updater left them.
     for repo_path in plan.remove:
         local = safepath.confine(pack_dir, prefix + repo_path)
-        if local is not None and local.is_file():
+        if local is None or not local.is_file():
+            continue
+        try:
             local.unlink()
-            applied.removed.append(repo_path)
+        except OSError:
+            applied.in_use.append(repo_path)
+            continue
+        applied.removed.append(repo_path)
 
     if not applied.complete:
         return applied
@@ -337,15 +340,37 @@ def apply_plan(
     return applied
 
 
-def _place(pack_dir: Path, relative: str, blob: Path | None) -> bool:
-    """Put ``blob`` at ``relative`` inside the pack, replacing what's there in one step."""
+_PLACED = "placed"
+_NO_BLOB = "missing"
+_IN_USE = "in use"
+
+
+def _place(pack_dir: Path, relative: str, blob: Path | None) -> str:
+    """Put ``blob`` at ``relative`` inside the pack, replacing what's there in one step.
+
+    On Windows a file something has open (a sound or the music playing from it) can't be
+    replaced; it's left as it is and reported, and the next update tries it again.
+    """
     if blob is None:
-        return False
+        return _NO_BLOB
     target = safepath.confine(pack_dir, relative)
     if target is None:
-        return False
+        return _NO_BLOB
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".part")
     shutil.copyfile(blob, temporary)
-    os.replace(temporary, target)
-    return True
+    try:
+        os.replace(temporary, target)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        return _IN_USE
+    return _PLACED
+
+
+def _record(applied: Applied, done: list[str], repo_path: str, outcome: str) -> None:
+    if outcome == _PLACED:
+        done.append(repo_path)
+    elif outcome == _IN_USE:
+        applied.in_use.append(repo_path)
+    else:
+        applied.missing.append(repo_path)

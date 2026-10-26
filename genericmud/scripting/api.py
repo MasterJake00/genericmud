@@ -233,6 +233,15 @@ class ScriptApi:
         """Save the packs' variables soon, not only when the session closes."""
         self._engine.sink.save_state()
 
+    def update_packs(self, quiet: bool = False) -> None:
+        """Install what this world's packs' repositories have new (a pack's own update
+        command, answered by genericMud's updater)."""
+        self._engine.sink.update_packs(quiet)
+
+    def check_pack_updates(self) -> None:
+        """Say whether this world's packs' repositories have anything new."""
+        self._engine.sink.check_pack_updates()
+
     def pack_window(self):
         """The window's clipboard, command box, notepads and browser (a PackWindow), or
         None when there's no window."""

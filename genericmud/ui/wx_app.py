@@ -60,6 +60,7 @@ from genericmud.packs import (
     PackStore,
     SetupResult,
     activate_world,
+    describe_update,
     detect_entry,
     entry_problem,
     git_sources,
@@ -1933,29 +1934,8 @@ class PackManagerDialog(wx.Dialog):
 
 
 def _git_update_message(result: GitUpdateResult) -> str:
-    """What updating a pack from its repository did, in a sentence or three."""
-    if result.up_to_date:
-        return f"{result.name} is up to date."
-    changes = [f"{result.written} {'file' if result.written == 1 else 'files'} updated"]
-    if result.removed:
-        changes.append(f"{result.removed} removed")
-    lines = [f"Updated {result.name}: {', '.join(changes)}."]
-    count = len(result.new_versions)
-    if count == 1:
-        changed = result.new_versions[0]
-        lines.append(
-            f"You'd changed {changed}, so your copy stayed, and the pack's new version is "
-            f"next to it as {changed}.new."
-        )
-    elif count > 1:
-        named = ", ".join(result.new_versions[:5])
-        more = f" and {count - 5} more" if count > 5 else ""
-        lines.append(
-            f"You'd changed {count} of its files, so your copies stayed, and the pack's new "
-            f"version of each is next to it with .new on the end: {named}{more}."
-        )
-    lines.append("Reconnect to apply.")
-    return " ".join(lines)
+    """What updating a pack from its repository did (shared with the /update command)."""
+    return describe_update(result)
 
 
 _SOURCE_MAX_BYTES = 3_000_000_000  # cap when following an installer's source repo (~3 GB)

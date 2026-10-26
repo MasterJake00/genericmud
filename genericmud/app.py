@@ -35,6 +35,8 @@ from genericmud.mapping import RoomMap, load_map, save_map, spoken_count
 from genericmud.model.buffer import Buffer, Line
 from genericmud.navigation import Navigator, SafeWalk, expand_speedwalk
 from genericmud.packs import ActivationResult, PackStore, activate_world, user_rules
+from genericmud.packs.pack_updates import PackUpdates
+from genericmud.packs.setup import GitUpdateResult
 from genericmud.protocol import msdp
 from genericmud.protocol import telnet as T
 from genericmud.protocol.charset import AUTO, ServerTextCodec
@@ -188,7 +190,7 @@ class AppSink(EngineSink):
     def __init__(
         self, *, send, post, schedule, voice: VoiceRouter, buffer: Buffer, sound: SoundBus,
         diag: DiagnosticLog | None = None, send_raw=None, ask=None, simulate=None,
-        save_state=None, window=None,
+        save_state=None, window=None, update_packs=None, check_pack_updates=None,
     ) -> None:
         self._send = send
         self._send_raw = send_raw
@@ -201,6 +203,8 @@ class AppSink(EngineSink):
         self._ask = ask
         self._simulate = simulate
         self._save_state = save_state
+        self._update_packs = update_packs
+        self._check_pack_updates = check_pack_updates
         self._window = window
         self.cues = 0  # play/music calls reaching the bus -- 0 means no cue ever fired
 
@@ -240,6 +244,14 @@ class AppSink(EngineSink):
     def save_state(self) -> None:
         if self._save_state is not None:
             self._save_state()
+
+    def update_packs(self, quiet: bool = False) -> None:
+        if self._update_packs is not None:
+            self._update_packs(quiet=quiet)
+
+    def check_pack_updates(self) -> None:
+        if self._check_pack_updates is not None:
+            self._check_pack_updates()
 
     def pack_window(self):
         return self._window() if self._window is not None else None
@@ -321,6 +333,9 @@ class EngineApp:
         self.buffer = Buffer()
         self.voice = voice
         self.packs = packs
+        # Checks this world's packs for updates on connect; /update installs them.
+        self.pack_updates: PackUpdates | None = None
+        self._world_packs: list[str] = []  # the packs enabled for this session's world
         self._send = send or (lambda _text: None)
         self._post = post or (lambda _message: None)
         # Wired by the UI to the transport; the engine only knows the server said goodbye.
@@ -358,6 +373,8 @@ class EngineApp:
             simulate=self._simulate,
             save_state=self._request_save,
             window=lambda: self.pack_window,
+            update_packs=self.update_packs,
+            check_pack_updates=self.check_pack_updates,
         )
         # Set by a front end that can show dialogs (the wx window): called with the question
         # and a function to call while it waits. A window-less session's questions are
@@ -547,7 +564,56 @@ class EngineApp:
             )
         self._vip_connection_changed(True)
         self.begin_login(world)
+        self._check_pack_updates(result)
         return result
+
+    def _check_pack_updates(self, result: ActivationResult | None) -> None:
+        """Ask this world's packs' repositories whether they have updates, in the background
+        (each at most once a day), so a pack with one can say so."""
+        if self.packs is None or result is None:
+            return
+        self._world_packs = [*result.loaded, *result.skipped_untrusted, *result.failed]
+        if self.pack_updates is None:
+            self.pack_updates = PackUpdates(
+                self.packs,
+                announce=lambda text: self._speak_system(text, interrupt=False),
+                installed=self._packs_updated,
+                diag=self._diag,
+            )
+        self.pack_updates.check_due(self._world_packs)
+
+    def update_packs(self, *, quiet: bool = False) -> None:
+        """Install whatever this world's packs' repositories have new (/update, or a pack's
+        own update command)."""
+        if self.pack_updates is None:
+            if not quiet:
+                self._speak_system("There are no soundpacks to update in this session.")
+            return
+        self.pack_updates.install(self._world_packs, quiet=quiet)
+
+    def check_pack_updates(self) -> None:
+        """Say whether this world's packs' repositories have anything new (a pack's own
+        "update check")."""
+        if self.pack_updates is None:
+            self._speak_system("There are no soundpacks to update in this session.")
+            return
+        self.pack_updates.check_now(self._world_packs)
+
+    def _packs_updated(self, results: dict[str, GitUpdateResult], quiet: bool) -> None:
+        """Tell each updated MUSHclient pack, the way its own updater plugin told it, so it
+        plays its update sounds and shows its changelog."""
+        activation = self._last_activation
+        if activation is None:
+            return
+        for pack_id, result in results.items():
+            pack = activation.packs.get(pack_id)
+            if not isinstance(pack, MushclientPack):
+                continue
+            try:
+                pack.pack_updated(result, quiet=quiet)
+            except Exception as exc:  # noqa: BLE001 - a pack's handler must not stop the rest
+                if self._diag is not None:
+                    self._diag.event("pack.update_notice_failed", id=pack_id, error=repr(exc))
 
     def _vip_connection_changed(self, connected: bool) -> None:
         """Run the VIPMud packs' OnConnect or OnDisconnect alias, once per change, and the
@@ -1690,6 +1756,8 @@ class EngineApp:
             self._label_room(rest)
         elif verb == "map":
             self._speak_system(self.map.summary())
+        elif verb == "update" and not rest:
+            self.update_packs()
         else:
             return False  # unknown /verb -> let the MUD have it (some use slash commands)
         return True

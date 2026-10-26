@@ -337,6 +337,71 @@ class GitUpdateResult:
     written: int = 0
     removed: int = 0
     new_versions: list[str] = field(default_factory=list)  # player's files, .new beside
+    in_use: list[str] = field(default_factory=list)  # open elsewhere, updated next time
+    # The files themselves, as the repository names them: a pack's own updater told the
+    # pack which ones changed, and Miriani-Next lists them atop its changelog.
+    written_files: list[str] = field(default_factory=list)
+    removed_files: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PendingUpdate:
+    """An update a pack's repository has waiting: how many files it would fetch."""
+
+    pack_id: str
+    name: str
+    files: int
+
+
+def check_pack_update(
+    store: PackStore, pack_id: str, source: UpdateSource, *, list_tree=git_remote.list_tree
+) -> PendingUpdate | None:
+    """Whether the pack's repository has anything new, without downloading it: None when the
+    pack is up to date. Raises :class:`PackError` when the repository can't be read."""
+    manifest = store.manifest(pack_id)
+    pack_dir = store.pack_dir(pack_id)
+    prefix = _repository_prefix(manifest.entry, source)
+    try:
+        tree = list_tree(source.repo_url)
+    except git_remote.RemoteError as error:
+        raise PackError(f"couldn't check {source.name} for updates: {error}") from error
+    baseline = git_sync.read_baseline(pack_dir)
+    plan = git_sync.make_plan(tree.files, pack_dir, prefix, baseline)
+    if plan.up_to_date:
+        return None
+    return PendingUpdate(pack_id, source.name, len(plan.download) + len(plan.modified))
+
+
+def describe_update(result: GitUpdateResult) -> str:
+    """What updating a pack from its repository did, in a sentence or three."""
+    if result.up_to_date and not result.in_use:
+        return f"{result.name} is up to date."
+    changes = [f"{result.written} {'file' if result.written == 1 else 'files'} updated"]
+    if result.removed:
+        changes.append(f"{result.removed} removed")
+    lines = [f"Updated {result.name}: {', '.join(changes)}."]
+    count = len(result.new_versions)
+    if count == 1:
+        changed = result.new_versions[0]
+        lines.append(
+            f"You'd changed {changed}, so your copy stayed, and the pack's new version is "
+            f"next to it as {changed}.new."
+        )
+    elif count > 1:
+        named = ", ".join(result.new_versions[:5])
+        more = f" and {count - 5} more" if count > 5 else ""
+        lines.append(
+            f"You'd changed {count} of its files, so your copies stayed, and the pack's new "
+            f"version of each is next to it with .new on the end: {named}{more}."
+        )
+    busy = len(result.in_use)
+    if busy:
+        lines.append(
+            f"{busy} {'file was' if busy == 1 else 'files were'} in use; update again after "
+            "you reconnect to finish."
+        )
+    lines.append("Reconnect to apply.")
+    return " ".join(lines)
 
 
 def update_pack_from_git(
@@ -385,7 +450,7 @@ def update_pack_from_git(
             new_versions=len(applied.new_versions), removed=len(applied.removed),
             missing=len(applied.missing), local_only=plan.local_only,
         )
-    if not applied.complete:
+    if applied.missing:
         raise PackError(
             f"{len(applied.missing)} of {source.name}'s updated files didn't arrive. Run the "
             "update again; it carries on from where it stopped."
@@ -396,6 +461,9 @@ def update_pack_from_git(
         written=len(applied.written),
         removed=len(applied.removed),
         new_versions=applied.new_versions,
+        in_use=applied.in_use,
+        written_files=applied.written,
+        removed_files=applied.removed,
     )
 
 

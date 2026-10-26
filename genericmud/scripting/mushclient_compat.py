@@ -401,6 +401,35 @@ _SPEECH_COMMANDS = (
 )
 _SPEECH_COMMAND_PRIORITY = -1_000_000  # after every alias of the pack's own
 _GMCP_HANDLER_ID = "3e7dedbe37e44942dd46d264"  # GMCP_handler_NJG broadcast identity
+# Miriani-Next's and Toastush's updater plugins (each an updater.xml) take an "update" command,
+# and the packs send it themselves: at login when the MUD says the pack is out of date and the
+# player turned automatic updates on, and hourly while idle when they turned that on. Skipping
+# the plugin sent those to the MUD. genericMud's own updater does the plugin's job, so it
+# answers the command; when it has installed something it tells the pack the way the plugin
+# did, so the pack plays its update sound and shows its changelog if its player asked for it.
+_UPDATER_PLUGIN = "updater.xml"
+_MIRIANI_NEXT_UPDATER = "706cd88f4d441a81439bd421"  # tells the pack with message 777 (or 999)
+_TOASTUSH_UPDATER = "508bd88f4d441f81466bf471"  # tells the pack with message 1
+_UPDATE_QUIET_WORDS = frozenset({"quietly", "-q", "--quiet"})
+_UPDATE_CHECK_WORDS = frozenset({"check", "-d", "--dry-run"})
+_UPDATE_HELP_WORDS = frozenset({"help", "-h", "--help"})
+# Toastush's other switches set how its own downloads ran; genericMud installs the same way
+# whichever it's given. Anything else (Miriani-Next's install, reinstall, switch and version,
+# which drive its Windows launcher) gets a line saying genericMud does the updating.
+_UPDATE_INSTALL_WORDS = frozenset({
+    "-c", "--clean-run", "-e", "--error-suppress", "-f", "--confirm", "-s", "--safe-run",
+    "--verbose",
+})
+_UPDATE_HELP = (
+    "genericMud keeps this soundpack up to date. Type update to install what's new, update "
+    "check to hear whether there's anything new, or update quietly to install without a word "
+    "when there's nothing."
+)
+_UPDATE_ELSEWHERE = (
+    "genericMud updates this soundpack itself, so there's no separate updater to install, "
+    "switch or ask for its version. Type update to install what's new, or update check to "
+    "hear whether there's anything new."
+)
 
 
 _XML_TRUE = frozenset({"y", "yes", "1", "-1", "true", "t"})
@@ -547,6 +576,7 @@ class MushclientPack:
         self._arrays: dict[str, dict[str, str]] = {}  # MUSHclient Array* API backing store
         self._timers: dict[str, dict] = {}  # AddTimer / XML <timer> state, by timer name
         self._speech_commands_installed = False
+        self._updater_id: str | None = None  # the updater plugin genericMud stands in for
         self._plain_include_depth = 0  # >0 while a non-plugin <include> loads
         # Tell/ColourTell text waiting for the note that ends its line
         self._pending_tell = ""
@@ -1204,8 +1234,10 @@ class MushclientPack:
     def _broadcast_plugin(self, message: object = 0, text: object = "", *_args: object) -> int:
         """MUSHclient ``BroadcastPlugin``: every other enabled plugin's OnPluginBroadcast
         hears it (never the sender, which could loop); answers how many did."""
-        sender = self._current_plugin
-        sender_id = self._get_plugin_id()
+        return self._broadcast_from(self._current_plugin, message, text)
+
+    def _broadcast_from(self, sender: str, message: object, text: object) -> int:
+        sender_id = "" if sender == "world" else sender
         sender_name = str(self._plugin_info.get(sender, {}).get("name", ""))
         heard = 0
         for plugin_id, hooks in list(self._hooks.items()):
@@ -4055,6 +4087,33 @@ class MushclientPack:
             }
         if path.name.casefold() in _SPEECH_PLUGINS:
             self._install_speech_commands()
+        if path.name.casefold() == _UPDATER_PLUGIN:
+            self._install_update_commands(plugin_id or "")
+
+    def _install_update_commands(self, plugin_id: str) -> None:
+        """Answer the pack's updater plugin's commands with genericMud's updater."""
+        if self._updater_id is not None:
+            return
+        self._updater_id = plugin_id
+        # A stand-in, like the speech commands: an alias of the pack's own takes it first.
+        self._api.add_alias(
+            r"^update(?: (.*))?$", self._update_command, regex=True,
+            priority=_SPEECH_COMMAND_PRIORITY, fallback=True,
+        )
+        if plugin_id == _MIRIANI_NEXT_UPDATER:
+            # Its OnPluginInstall binds this, and the pack's setup tells players about it.
+            self._api.add_key(_normalize_key_spec("ctrl+u"), lambda _ctx: self._api.update_packs())
+
+    def _update_command(self, ctx: MatchContext) -> None:
+        words = set((ctx.wildcards[1] if len(ctx.wildcards) > 1 else "").split())
+        if words & _UPDATE_HELP_WORDS:
+            self._note(_UPDATE_HELP)
+        elif words & _UPDATE_CHECK_WORDS:
+            self._api.check_pack_updates()
+        elif words <= _UPDATE_QUIET_WORDS | _UPDATE_INSTALL_WORDS:
+            self._api.update_packs(quiet=bool(words & _UPDATE_QUIET_WORDS))
+        else:
+            self._note(_UPDATE_ELSEWHERE)
 
     def _install_speech_commands(self) -> None:
         """Answer MushReader's and channel_history's commands with genericMud's own."""
@@ -4398,6 +4457,36 @@ class MushclientPack:
             self._saving_state = False
         self._world_event("close")
         self.dispatch("OnPluginClose")
+
+    def pack_updated(self, result, *, quiet: bool = False) -> None:
+        """genericMud's updater finished with this pack (``result`` is a GitUpdateResult): tell
+        the pack as the updater plugin genericMud stands in for told it."""
+        plugin_id = self._updater_id
+        if not plugin_id:
+            return
+
+        def ours(path: str) -> bool:  # leave out plugins genericMud never loads
+            return Path(path).name.casefold() not in _HOST_PLUGIN_REPLACEMENTS
+
+        written = [path for path in result.written_files if ours(path)]
+        removed = [path for path in result.removed_files if ours(path)]
+        if plugin_id == _MIRIANI_NEXT_UPDATER:
+            # As its update_watcher.xml reports a finished update: the pack plays its theme
+            # and, if its player turned automatic_changelog on, lists the files atop the
+            # changelog. 999 is its "already up to date", sent only when not asked quietly.
+            if written or removed:
+                report = {"result": "success", "files": written + removed, "channel": "stable"}
+                self._broadcast_from(plugin_id, 777, json.dumps(report))
+            elif result.up_to_date and not quiet:
+                self._broadcast_from(plugin_id, 999, "")
+        elif plugin_id == _TOASTUSH_UPDATER and (written or removed):
+            # Its broadcast_event: each entry is {path, index entry}; Toastush reads the path.
+            report = {
+                "create": [],
+                "delete": [[path, {}] for path in removed],
+                "update": [[path, {}] for path in written],
+            }
+            self._broadcast_from(plugin_id, 1, json.dumps(report))
 
     def dispatch_line(self, line: str) -> None:
         # A Tell that nothing finished still reaches the output, ahead of the MUD's line.

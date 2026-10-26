@@ -171,3 +171,26 @@ def test_an_update_that_stops_short_leaves_the_old_baseline(tmp_path):
     applied = git_sync.apply_plan(pack, "", plan, blobs, repo="r", commit="c", remote=remote)
     assert applied.missing == ["b.lua"]
     assert git_sync.read_baseline(pack) is None  # so the next update runs the whole way again
+
+
+def test_a_file_in_use_is_left_for_next_time(tmp_path, monkeypatch):
+    # On Windows the music playing from a file stops it being replaced.
+    pack = tmp_path / "pack"
+    _write(pack / "music.ogg", b"old tune")
+    _write(pack / "a.lua", b"a")
+    remote = {"music.ogg": blob_sha(b"new tune"), "a.lua": blob_sha(b"a2")}
+    plan = make_plan(remote, pack, "", None)
+    blobs = _blobs(tmp_path, b"new tune", b"a2")
+    real_replace = os.replace
+
+    def locked(source, target):
+        if Path(target).name == "music.ogg":
+            raise PermissionError("in use by another process")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(git_sync.os, "replace", locked)
+    applied = git_sync.apply_plan(pack, "", plan, blobs, repo="r", commit="c", remote=remote)
+    assert applied.in_use == ["music.ogg"] and applied.written == ["a.lua"]
+    assert (pack / "music.ogg").read_bytes() == b"old tune"
+    assert not list(pack.glob("*.part"))
+    assert git_sync.read_baseline(pack) is None  # the next update tries it again

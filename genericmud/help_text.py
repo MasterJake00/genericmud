@@ -269,6 +269,7 @@ Alt+M             Read this room and where its exits lead
 
 Tools:
 Ctrl+P            Manage soundpacks
+/update           Install soundpack updates for this world
 Ctrl+B            Open the Automation Manager
 Ctrl+Shift+V      List the MUD's variables and script values
 Ctrl+Shift+B      Browse soundpacks online
