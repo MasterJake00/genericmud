@@ -380,6 +380,11 @@ class ScriptApi:
         """Every script variable, by name (a copy)."""
         return self._engine.all_vars()
 
+    @property
+    def vars_version(self) -> int:
+        """Goes up whenever a variable changes, so a reader can tell nothing did."""
+        return self._engine.vars_version
+
     def delete_var(self, name: str) -> None:
         """Remove a variable entirely (VIPMud #unvar / MUSHclient DeleteVariable):
         a deleted variable must read as UNSET (nil / %defined 0), not empty-string."""

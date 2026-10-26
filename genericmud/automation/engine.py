@@ -201,6 +201,7 @@ class AutomationEngine:
         # (key, source, callback) log: conflict reports + replay-rebuild on remove_source.
         self._key_bindings: list[tuple[str, str, Callback]] = []
         self._vars: dict[str, str] = {}
+        self.vars_version = 0  # goes up whenever a variable changes; readers cache by it
         self._gvars: dict[str, str] = {}
         # Latest structured values supplied by the MUD through GMCP/MSDP/MSSP. These stay
         # separate from script variables: a server update must not overwrite a user's setting,
@@ -331,6 +332,7 @@ class AutomationEngine:
 
     def set_var(self, name: str, value: object) -> None:
         self._vars[name] = str(value)
+        self.vars_version += 1
 
     def remove_source(self, source: str) -> None:
         """Drop every rule and channel policy registered by one reloading source.
@@ -350,6 +352,7 @@ class AutomationEngine:
 
     def delete_var(self, name: str) -> None:
         self._vars.pop(name, None)
+        self.vars_version += 1
 
     def all_vars(self) -> dict[str, str]:
         """A snapshot of session variables (for pack-state persistence)."""
@@ -360,9 +363,11 @@ class AutomationEngine:
 
     def delete_gvar(self, name: str) -> None:
         self._gvars.pop(name, None)
+        self.vars_version += 1
 
     def set_gvar(self, name: str, value: object) -> None:
         self._gvars[name] = str(value)
+        self.vars_version += 1
 
     # --- structured MUD variables ---
 

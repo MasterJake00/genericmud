@@ -510,6 +510,7 @@ class MushclientPack:
         # goes when the rule does, so replaced and spent rules don't pile up being scanned.
         self._rules: dict[str, dict[tuple[str, str], PackRule]] = {TRIGGER: {}, ALIAS: {}}
         self._expanding: set[PackRule] = set()  # triggers whose match has @variables in it
+        self._expanded_version = -1  # the variables' version those matches were filled from
         self._rule_counter = 0  # engine names and internal labels for rules
         self._unique_number = 0
         self._random = random.Random()  # MtRand's own stream, so MtSrand can't touch others
@@ -2904,7 +2905,8 @@ class MushclientPack:
 
     def _register_rule(self, rule: PackRule) -> None:
         """Give the rule an engine rule compiled from its match as it stands now."""
-        pattern = self._rule_pattern(rule, self._variable_lookup())
+        expands = rule.kind == TRIGGER and rule.expand_variables and "@" in rule.match
+        pattern = self._rule_pattern(rule, self._variable_lookup() if expands else None)
         engine_name = f"mush-{rule.kind}-{self._next_rule_number()}"
         callback = self._rule_callback(rule)
         if rule.kind == TRIGGER:
@@ -2977,6 +2979,10 @@ class MushclientPack:
         does on every line, so a pack changing a variable changes what its triggers catch."""
         if not self._expanding:
             return
+        version = self._api.vars_version
+        if version == self._expanded_version:
+            return  # no variable changed since the last line: the patterns stand
+        self._expanded_version = version
         variables = self._variable_lookup()
         for rule in list(self._expanding):
             pattern = self._rule_pattern(rule, variables)
