@@ -876,3 +876,135 @@ def test_find_puts_the_matching_line_in_foundline():
     for key in ("f1", "f3", "f3"):
         engine.press_key(key)
     assert _said(sink) == ["the Dragon roars", "a red dragon"]
+
+
+# --- lists, files and loading (manual 5.2.2, 5.2.15, 5.2.21, 5.2.30, 5.2.42, 5.2.48, 5.2.61,
+# 5.2.71, 5.3.10) ---
+
+
+def test_additem_appends_to_a_list_variable():
+    _sink, engine, _pack = _load(
+        "#Var SampleList {Ann|Bob|Charles}\n#AddItem SampleList David\n"
+        "#AddItem Empty First\n#AddItem SampleList bob NoDuplicates\n"
+    )
+    assert engine.get_var("samplelist") == "Ann|Bob|Charles|David"
+    assert engine.get_var("empty") == "First"
+
+
+def test_star_conquest_saves_and_loads_its_buffer_list_in_a_text_file(tmp_path):
+    sink, engine, _pack = _load(
+        "#alias savebuffers {#delfile StarConquestBufferlist.txt;"
+        " #file 5 StarConquestBufferlist.txt; #write 5 @CurrentBufferList; #close 5}\n"
+        "#alias loadbuffers {#file 5 StarConquestBufferlist.txt;"
+        " #read 5 CurrentBufferList; #close 5}\n",
+        base_dir=str(tmp_path),
+    )
+    engine.set_var("currentbufferlist", "General|Tactical")
+    engine.process_input("savebuffers")
+    engine.process_input("savebuffers")  # #DelFile first, so it doesn't append twice
+    assert (tmp_path / "StarConquestBufferlist.txt").read_bytes() == b"General|Tactical\r\n"
+    engine.set_var("currentbufferlist", "")
+    engine.process_input("loadbuffers")
+    assert engine.get_var("currentbufferlist") == "General|Tactical"
+
+
+def test_a_sequential_file_reads_line_by_line_until_end_of_file(tmp_path):
+    # The manual's shout example, with #While and %EndOfFile.
+    (tmp_path / "Shout.txt").write_bytes(b"Hello there\r\nGoodbye\r\n")
+    sink, engine, _pack = _load(
+        "#alias shouts {#File 3 Shout.txt; #while {%EndOfFile(3)=0} {"
+        " #read 3 TempVariable; shout @TempVariable}; #read 3 After}",
+        base_dir=str(tmp_path),
+    )
+    engine.process_input("shouts")
+    assert sink.sent == ["shout Hello there", "shout Goodbye"]
+    assert engine.get_var("after") == "[EOF]"
+
+
+def test_write_noreturn_leaves_the_line_open(tmp_path):
+    _sink, _engine, _pack = _load(
+        "#file 1 {log.txt}\n#write 1 {north;} NoReturn\n#write 1 {east;} NoReturn\n#close 1",
+        base_dir=str(tmp_path),
+    )
+    assert (tmp_path / "log.txt").read_bytes() == b"north;east;"
+
+
+def test_a_saved_configuration_comes_back_when_the_file_is_loaded(tmp_path):
+    # The official Prometheus pack saves its settings as a script of #Var commands and
+    # loads it at startup; nothing was ever written before.
+    _sink, engine, pack = _load(
+        "#var varFile {Prometheus/variables.set}\n"
+        "#alias save {#DelFile {@varFile}; #File 3 {@varFile};"
+        " #Write 3 {~#Var vol {@vol}%CRLF~#Var silent {@silent}} NoReturn; #Close 3}",
+        base_dir=str(tmp_path),
+    )
+    engine.set_var("vol", "75")
+    engine.set_var("silent", "1")
+    engine.process_input("save")
+    engine.set_var("vol", "")
+    pack.load_source("#load {@varFile}")
+    assert engine.get_var("vol") == "75"
+    assert engine.get_var("silent") == "1"
+
+
+def test_delfile_only_deletes_that_file_in_the_pack(tmp_path):
+    (tmp_path / "keep").mkdir()
+    kept = tmp_path / "keep" / "notes.txt"
+    kept.write_text("mine", encoding="latin-1")
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("not the pack's", encoding="latin-1")
+    _sink, _engine, _pack = _load(
+        "#DelFile notes.txt\n#DelFile ../outside.txt\n", base_dir=str(tmp_path)
+    )
+    assert kept.exists()  # a same-named file elsewhere in the pack isn't "notes.txt"
+    assert outside.exists()
+
+
+def test_send_sends_a_file_with_a_prefix(tmp_path):
+    (tmp_path / "message.txt").write_bytes(b"first line\r\nsecond line\r\n")
+    sink, engine, _pack = _load(
+        "#alias post {#send message.txt {shout } {%crlf}}", base_dir=str(tmp_path)
+    )
+    engine.process_input("post")
+    assert sink.sent == ["shout first line", "shout second line"]
+
+
+def test_loading_a_file_again_runs_it_again_without_doubling_its_rules(tmp_path):
+    # Prometheus loads its whole pack on every "Logged in!"; VIPMud replaces what the
+    # file defined last time instead of keeping two of everything.
+    (tmp_path / "sub.set").write_text(
+        "#math loads {@loads + 1}\n#trigger {boom} {#say bang}\n", encoding="latin-1"
+    )
+    sink, engine, pack = _load("#load {sub.set}\n#load {sub.set}", base_dir=str(tmp_path))
+    engine.process_line(Line("boom"))
+    assert engine.get_var("loads") == "2"
+    assert _said(sink) == ["bang"]
+
+
+def test_unload_removes_what_a_file_defined(tmp_path):
+    # Cosmic Rage switches its gag files on and off with #Load and #UnLoad.
+    (tmp_path / "gags.set").write_text("#trigger {spam} {#gagline all}\n", encoding="latin-1")
+    _sink, engine, pack = _load(
+        "#alias gagson {#load {gags.set}}\n#alias gagsoff {#unload {gags.set}}\n",
+        base_dir=str(tmp_path),
+    )
+    engine.process_input("gagson")
+    assert engine.process_line(Line("spam")).gagged
+    engine.process_input("gagsoff")
+    assert not engine.process_line(Line("spam")).gagged
+    engine.process_input("gagson")
+    assert engine.process_line(Line("spam")).gagged
+
+
+def test_commands_can_be_abbreviated_like_in_vipmud(tmp_path):
+    (tmp_path / "sub.set").write_text("#VA loaded yes", encoding="latin-1")
+    sink, engine, _pack = _load(
+        "#V a 1\n#LO {sub.set}\n#TR {ping} {#Exec {pong}}\n"
+        "#For {x|y} {#VAR {item%i} %i}\n#Unvar a\n",
+        base_dir=str(tmp_path),
+    )
+    engine.process_line(Line("ping"))
+    assert engine.get_var("a", None) is None
+    assert engine.get_var("loaded") == "yes"
+    assert engine.get_var("itemx") == "x"
+    assert sink.sent == ["pong"]

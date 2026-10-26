@@ -28,11 +28,8 @@ def _load_lua(api: ScriptApi, entry: str, trusted: bool) -> LuaPackRuntime:
 
 
 def _load_vipmud(api: ScriptApi, entry: str, trusted: bool) -> VipMudPack:
-    # latin-1 like the rest of the VIPMud path (#LOAD, world import): .set packs are
-    # iso-8859-1, and utf-8 would crash the entry load on any high byte.
-    with open(entry, encoding="latin-1") as handle:
-        pack = VipMudPack(api)
-        pack.load_source(handle.read())
+    pack = VipMudPack(api)
+    pack.load_entry(entry)  # read as latin-1, like every .set the pack loads
     return pack
 
 

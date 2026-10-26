@@ -45,14 +45,41 @@ from genericmud.model.buffer import Line
 from genericmud.safepath import confine
 from genericmud.scripting.api import ScriptApi
 
+# VIPMud's commands, by full name. A pack may write any start of a name (#Tr, #Exec, #For,
+# #Va); where one start fits several, the first in this list wins.
+_COMMAND_NAMES = (
+    "VARIABLE", "TRIGGER", "ALIAS", "KEY", "IF", "PLAY", "PLAYLOOP", "PC", "SAY", "SUBSTITUTE",
+    "MATH", "GAGLINE", "GAGON", "ABORT", "ALARM", "ADDITEM", "AUTOMENU", "BELL", "BREAK",
+    "CLASS", "CLOSE", "CLIPBOARD", "CONFIGURE", "CONNECT", "CHARACTER", "DELCLASS", "DELFILE",
+    "DIRECTION", "EXECUTE", "EDIT", "ENDRECORD", "ERASE", "FILE", "FIND", "FORALL",
+    "GVARIABLE", "GTRIGGER", "GALIAS", "GKEY", "GCLASS", "GMATH", "GALARM", "GADDITEM",
+    "GPROMPT", "GREAD", "GUNALIAS", "GUNKEY", "GUNTRIGGER", "GUNVARIABLE", "GUNALARM",
+    "IGNORE", "KILLALL", "LOAD", "OFFLINE", "OK", "PASSTHRU", "PAUSE", "PICK", "PROMPT",
+    "QUIET", "QUIT", "READ", "RECORD", "RELOAD", "RESET", "SAVE", "SEND", "SETSPEECH", "STOP",
+    "SYSKEY", "TAB", "UNALARM", "UNALIAS", "UNCLASS", "UNGAGLINE", "UNGAGON", "UNKEY",
+    "UNLOAD", "UNPAUSE", "UNTAB", "UNTIL", "UNTRIGGER", "UNVARIABLE", "WAIT", "WHILE",
+    "WINDOW", "WRITE",
+)
+_COMMAND_NAME_SET = frozenset(_COMMAND_NAMES)
 # Definitions and their removals; the G forms are VIPMud's every-session versions, and one
 # session is all a pack sees here.
-_TRIGGER_COMMANDS = {"TRIGGER", "TRIG", "TR", "GTRIGGER", "GTRIG", "GTR"}
+_TRIGGER_COMMANDS = {"TRIGGER", "GTRIGGER"}
 _ALIAS_COMMANDS = {"ALIAS", "GALIAS"}
 _KEY_COMMANDS = {"KEY", "GKEY"}
-_UNTRIGGER_COMMANDS = {"UNTRIGGER", "UNTRIG", "GUNTRIGGER", "GUNTRIG"}
+_UNTRIGGER_COMMANDS = {"UNTRIGGER", "GUNTRIGGER"}
 _UNALIAS_COMMANDS = {"UNALIAS", "GUNALIAS"}
 _UNKEY_COMMANDS = {"UNKEY", "GUNKEY"}
+_SEQUENTIAL_HANDLES = frozenset("12345")  # #File handles 1-5 are text files; 6-10 records
+_SEND_LIMIT = 1000  # lines #Send sends from one file
+_PROTECTED_SUFFIXES = (".exe", ".dll", ".ini", ".cfg", ".hlp")  # #DelFile won't (manual)
+
+
+@lru_cache(maxsize=512)
+def _command_name(written: str) -> str:
+    """The command a pack means by ``written``: its full name when it's a start of one."""
+    if not written or written.isdigit() or written in _COMMAND_NAME_SET:
+        return written
+    return next((name for name in _COMMAND_NAMES if name.startswith(written)), written)
 _CLASS_ON = {"enable", "enabled", "on"}
 _CLASS_OFF = {"disable", "disabled", "off"}
 _SOUND_VARIANT_RE = re.compile(r"\*(\d+)(\.\w+)$")  # "name*N.ext": one random variant of 1..N
@@ -789,6 +816,15 @@ class _VipFile:
 
 
 @dataclass
+class _TextFile:
+    """A sequential #File (handles 1-5): read a line at a time, written by appending."""
+
+    reference: str  # as the pack named it; resolved when first read or written
+    lines: list[str] | None = None  # read on the first #Read
+    position: int = 0
+
+
+@dataclass
 class _Scope:
     """What a running script can see: the wildcards of the rule that started it, the line
     it fired on, and the #ForAll item it is working through (%i)."""
@@ -810,6 +846,7 @@ class _VipRule:
     classes: tuple[str, ...] = ()  # all of them have to be enabled for the rule to work
     engine_name: str = ""  # the engine rule's name, for removing it
     engine_rule: object | None = None
+    origin: str | None = None  # the file whose loading defined it, for #UnLoad
 
 
 class _KeyBinding:
@@ -869,8 +906,9 @@ class VipMudPack:
     def __init__(self, api: ScriptApi) -> None:
         self._api = api
         self._base_dir = api.base_dir
-        self._loaded: set[str] = set()  # files already #load-ed (cycle/dup guard)
-        self._files: dict[str, _VipFile] = {}  # #file handle -> open settings file
+        self._loaded: set[str] = set()  # files #Load has run, by resolved path
+        self._loading: list[str] = []  # files loading right now, innermost last
+        self._files: dict[str, _VipFile | _TextFile] = {}  # by #File handle
         self._handles: dict[str, str] = {}  # VIPMud play handle -> sound bus channel
         self._next_handle = 1
         self._exec_depth = 0  # bare-text -> alias-pipeline recursion guard
@@ -1087,7 +1125,7 @@ class VipMudPack:
             regex=True, name=engine_name,
         )
         rule.enabled = self._class_active(classes)
-        self._triggers[key] = _VipRule(body, classes, engine_name, rule)
+        self._triggers[key] = _VipRule(body, classes, engine_name, rule, self._origin())
 
     def _remove_trigger(self, key: str, class_name: str = "") -> None:
         old = self._triggers.get(key)
@@ -1100,7 +1138,9 @@ class VipMudPack:
         classes = self._rule_classes(args[2] if len(args) > 2 else None, scope)
         definitions = self._keys.setdefault(combo, {})
         definitions.pop(classes, None)  # the newest definition goes last
-        definitions[classes] = _VipRule(args[1].text if len(args) > 1 else "", classes)
+        definitions[classes] = _VipRule(
+            args[1].text if len(args) > 1 else "", classes, origin=self._origin()
+        )
         self._api.add_key(combo, _KeyBinding(self, combo))
 
     def _key_rule(self, combo: str) -> _VipRule | None:
@@ -1187,7 +1227,9 @@ class VipMudPack:
                 pattern, self._alias_runner(body), regex=True, name=engine_name
             )
         rule.enabled = self._class_active(classes)
-        self._aliases[(name.lower(), classes)] = _VipRule(body, classes, engine_name, rule)
+        self._aliases[(name.lower(), classes)] = _VipRule(
+            body, classes, engine_name, rule, self._origin()
+        )
 
     def _alias_runner(self, body: str):
         def run(ctx: MatchContext) -> None:
@@ -1253,9 +1295,11 @@ class VipMudPack:
         return float(number) if number is not None else None
 
     def _execute_statement(self, command: str | None, args: list[_Tok], scope: _Scope) -> None:
-        if command is None or command == "SEND":
+        if command is None:
             self._bare_or_send(args, scope)
-        elif command in _TRIGGER_COMMANDS and args:
+            return
+        command = _command_name(command)
+        if command in _TRIGGER_COMMANDS and args:
             self._define_trigger(args, scope)
         elif command in _ALIAS_COMMANDS and args:
             self._define_alias(args, scope)
@@ -1276,7 +1320,7 @@ class VipMudPack:
             self._execute_class(command, args, scope)
         elif command == "SAY" and args:
             self._execute_say(args, scope)
-        elif command in ("SUB", "SUBSTITUTE") and args and scope.line is not None:
+        elif command == "SUBSTITUTE" and args and scope.line is not None:
             # Shown and spoken in place of the line; triggers after this one still see the
             # line as the MUD sent it, so the packs' sounds on it still play.
             scope.line.substitute = self._expand(args[0].text, scope)
@@ -1294,18 +1338,20 @@ class VipMudPack:
             self._execute_find(args, scope)
         elif command in ("PLAY", "PLAYLOOP") and args:
             self._play(args, scope, loop=command == "PLAYLOOP")
-        elif command in ("VAR", "GVAR") and args:
+        elif command in ("VARIABLE", "GVARIABLE") and args:
             # #Var name [value]: no value still defines the variable, empty.
             name = _fold(self._expand(args[0].text, scope))  # @-indirect target supported
             value = self._expand(args[1].text, scope) if len(args) > 1 else ""
-            if command == "GVAR":  # global namespace; @-reads still resolve it
+            if command == "GVARIABLE":  # global namespace; @-reads still resolve it
                 self._api.set_gvar(name, value)
             else:
                 self._api.set_var(name, value)
-        elif command == "UNVAR" and args:
+        elif command in ("UNVARIABLE", "GUNVARIABLE") and args:
             self._api.delete_var(_fold(self._expand(args[0].text, scope)))
-        elif command == "MATH" and len(args) > 1:
+        elif command in ("MATH", "GMATH") and len(args) > 1:
             self._execute_math(args, scope)
+        elif command in ("ADDITEM", "GADDITEM") and len(args) > 1:
+            self._execute_additem(args, scope)
         elif command == "STOP":
             # VIPMud #Stop halts every playing sound. The api default channel ("sound")
             # is one this dialect never plays on -- every cue goes to a per-cue vip-N
@@ -1314,7 +1360,7 @@ class VipMudPack:
             self._api.flush()
         elif command == "IF" and args:
             self._execute_if(args, scope)
-        elif command in ("EXEC", "EXECUTE") and args:
+        elif command == "EXECUTE" and args:
             # #Exec runs its parameter, expanded once more, as commands of its own.
             self._execute_body(self._expand(args[0].text, scope), scope)
         elif command == "FORALL" and len(args) > 1:
@@ -1338,23 +1384,35 @@ class VipMudPack:
         elif command == "PC" and len(args) > 1:
             self._execute_pc(args, scope)
         elif command == "LOAD" and args:
-            self._load_file(self._expand(args[0].text, scope))
+            flags = self._options(args[1:], scope)
+            if "noexecute" not in flags:
+                self._load_file(self._expand(args[0].text, scope), keep="noremove" in flags)
+        elif command == "UNLOAD" and args:
+            real = self._resolve_in_pack(self._expand(args[0].text, scope), must_exist=True)
+            if real is not None:
+                self._unload(str(real))
         elif command == "FILE" and len(args) > 1:
             self._open_file(args, scope)
-        elif command == "READ" and len(args) > 2:
+        elif command in ("READ", "GREAD") and len(args) > 1:
             self._read_file(args, scope)
-        elif command == "WRITE" and len(args) > 2:
+        elif command == "WRITE" and len(args) > 1:
             self._write_file(args, scope)
         elif command == "CLOSE" and args:
-            self._close_file(args, scope)
-        elif command in ("CLIP", "CLIPBOARD") and args:
+            self._close_file(self._expand(args[0].text, scope).strip())
+        elif command == "DELFILE" and args:
+            self._delete_file(self._expand(args[0].text, scope).strip())
+        elif command == "SEND" and args:
+            self._send_file(args, scope)
+        elif command == "CLIPBOARD" and args:
             self._clipboard = self._expand(args[0].text, scope)
-        elif command in ("DIR", "DIRECTION") and len(args) > 1:
+        elif command == "DIRECTION" and len(args) > 1:
             way = self._expand(args[0].text, scope).strip().lower()
             back = self._expand(args[1].text, scope).strip()
             if way and back:
                 self._directions[way] = back
-        # Unknown #commands are ignored rather than sent to the MUD (Phase 2 features).
+        # Other #commands are ignored rather than sent to the MUD: the ones for VIPMud's own
+        # windows and menus (#Edit, #Window, #AutoMenu, #SysKey, #Tab) have genericMud
+        # equivalents, and #Pick and #Prompt need a menu to show.
 
     def _options(self, args: list[_Tok], scope: _Scope) -> set[str]:
         """Option words like "NoDisplay|Current", lowercased, from every parameter given."""
@@ -1466,25 +1524,86 @@ class VipMudPack:
         # so #file/#write can't create or overwrite a file elsewhere on disk.
         return confine(base, reference)
 
-    def _load_file(self, reference: str) -> None:
-        """``#LOAD {file}`` — load another ``.set`` from the pack so a loader script
-        pulls in all the pack's scripts. Confined to the pack dir; each file loads once."""
+    def load_entry(self, path: str | Path) -> None:
+        """Load the pack's own load script, remembered as a file like any #Load'ed one. An
+        unreadable entry raises, so activation reports the pack as failed."""
+        real = Path(path).resolve()
+        self._load_path(real, keep=False, source=real.read_text(encoding="latin-1"))
+
+    def _load_file(self, reference: str, *, keep: bool = False) -> None:
+        """``#LOAD {file} [NoRemove]``: run another ``.set`` from the pack, so a loader script
+        pulls in all the pack's scripts. Confined to the pack dir."""
         real = self._resolve_in_pack(reference, must_exist=True)
-        if real is None:
-            return
+        if real is not None:
+            self._load_path(real, keep=keep)
+
+    def _load_path(self, real: Path, *, keep: bool, source: str | None = None) -> None:
+        """Loading a file again replaces what it defined last time, unless NoRemove says to
+        keep it, then runs it again (Prometheus loads its whole pack on every login). A file
+        loading itself, directly or through others, is skipped."""
         key = str(real)
-        if key in self._loaded:  # don't re-load (handles #load cycles + duplicates)
+        if key in self._loading:
             return
+        if source is None:
+            try:
+                source = real.read_text(encoding="latin-1", errors="ignore")
+            except OSError:
+                return
+        if key in self._loaded and not keep:
+            self._unload(key)
         self._loaded.add(key)
-        self.load_source(real.read_text(encoding="latin-1", errors="ignore"))
+        self._loading.append(key)
+        steps = self._steps
+        self._steps = 0  # each file has its own budget: a big pack is many commands
+        try:
+            self._run_rule(source, _Scope([]))
+        finally:
+            self._loading.pop()
+            self._steps = steps
+
+    def _unload(self, key: str) -> None:
+        """``#UnLoad``: remove the triggers, aliases and keys a file defined."""
+        self._loaded.discard(key)
+        for name, rule in list(self._triggers.items()):
+            if rule.origin == key:
+                self._remove_trigger(name)
+        for alias_key, rule in list(self._aliases.items()):
+            if rule.origin == key:
+                self._remove_alias(alias_key)
+        for combo, definitions in list(self._keys.items()):
+            for classes in [c for c, rule in definitions.items() if rule.origin == key]:
+                del definitions[classes]
+            if not definitions:
+                self._remove_key(combo)
+
+    def _origin(self) -> str | None:
+        return self._loading[-1] if self._loading else None
+
+    def _execute_additem(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#AddItem list item [NoDuplicates]``: add an item to the end of a | list."""
+        name = _fold(self._expand(args[0].text, scope).strip())
+        item = self._expand(args[1].text, scope)
+        current = self._api.get_var(name, "") or ""
+        items = _list_items(current)
+        if "noduplicates" in self._options(args[2:], scope) and any(
+            existing.casefold() == item.casefold() for existing in items
+        ):
+            return
+        self._api.set_var(name, f"{current}|{item}" if current else item)
 
     def _open_file(self, args: list[_Tok], scope: _Scope) -> None:
-        """``#file <handle> {path} [mode]`` — open a VIPMud settings file under a handle so
-        #Read/#Write address it by record number. Reading the pack's shipped settings is what
-        turns its sound-enable flags on (e.g. Star Conquest gates every #Play on @silent=1, which
-        lives in Settings.set); without this they keep the off-by-default set before the read."""
+        """``#File handle {path} [record-length]``. Handles 1 to 5 are text files, read a
+        line at a time or written by appending; 6 to 10 are record files. A record file is
+        read now: reading the pack's shipped settings is what turns its sound-enable flags
+        on (Star Conquest gates every #Play on @silent=1, which lives in Settings.set).
+        Giving a handle a new file closes the old one first."""
         handle = self._expand(args[0].text, scope).strip()
-        path = self._resolve_in_pack(self._expand(args[1].text, scope), must_exist=False)
+        reference = self._expand(args[1].text, scope)
+        self._close_file(handle)
+        if handle in _SEQUENTIAL_HANDLES:
+            self._files[handle] = _TextFile(reference)
+            return
+        path = self._resolve_in_pack(reference, must_exist=False)
         values: list[str] = []
         if path is not None and path.is_file():
             try:
@@ -1493,37 +1612,100 @@ class VipMudPack:
                 values = []
         self._files[handle] = _VipFile(path=path, values=values)
 
+    def _text_lines(self, text_file: _TextFile) -> list[str]:
+        if text_file.lines is None:
+            path = self._resolve_in_pack(text_file.reference, must_exist=True)
+            try:
+                content = path.read_text(encoding="latin-1") if path is not None else ""
+            except OSError:
+                content = ""
+            text_file.lines = content.splitlines()
+        return text_file.lines
+
     def _read_file(self, args: list[_Tok], scope: _Scope) -> None:
-        """``#Read <handle> <var> <record>`` — read a 1-based record into the variable."""
-        vfile = self._files.get(self._expand(args[0].text, scope).strip())
-        if vfile is None:
-            return
-        index = _to_int(self._expand(args[2].text, scope), 0) - 1
-        if 0 <= index < len(vfile.values):
-            self._api.set_var(_fold(self._expand(args[1].text, scope)), vfile.values[index])
+        """``#Read handle variable [record]``: the next line of a text file ("[EOF]" past the
+        end), or the 1-based record of a record file."""
+        opened = self._files.get(self._expand(args[0].text, scope).strip())
+        name = _fold(self._expand(args[1].text, scope).strip())
+        if isinstance(opened, _TextFile):
+            lines = self._text_lines(opened)
+            value = lines[opened.position] if opened.position < len(lines) else "[EOF]"
+            opened.position += 1
+            self._api.set_var(name, value)
+        elif isinstance(opened, _VipFile) and len(args) > 2:
+            index = _to_int(self._expand(args[2].text, scope), 0) - 1
+            if 0 <= index < len(opened.values):
+                self._api.set_var(name, opened.values[index])
 
     def _write_file(self, args: list[_Tok], scope: _Scope) -> None:
-        """``#Write <handle> <value> <record>`` — set a 1-based record (flushed on #Close)."""
-        vfile = self._files.get(self._expand(args[0].text, scope).strip())
-        if vfile is None:
-            return
-        index = _to_int(self._expand(args[2].text, scope), 0) - 1
-        if index < 0:
-            return
-        while len(vfile.values) <= index:
-            vfile.values.append("")
-        vfile.values[index] = self._expand(args[1].text, scope)
-        vfile.dirty = True
-
-    def _close_file(self, args: list[_Tok], scope: _Scope) -> None:
-        """``#Close <handle>`` — flush a written settings file back to disk, then drop it."""
-        vfile = self._files.pop(self._expand(args[0].text, scope).strip(), None)
-        if vfile is not None and vfile.dirty and vfile.path is not None:
+        """``#Write handle value [record|NoReturn]``: append a line to a text file (with no
+        line ending after NoReturn), or set a 1-based record (flushed on #Close)."""
+        opened = self._files.get(self._expand(args[0].text, scope).strip())
+        value = self._expand(args[1].text, scope)
+        if isinstance(opened, _TextFile):
+            ending = "" if "noreturn" in self._options(args[2:], scope) else "\r\n"
+            path = self._writable(opened.reference)
+            if path is None:
+                return
             try:
-                vfile.path.parent.mkdir(parents=True, exist_ok=True)
-                vfile.path.write_bytes(_serialize_vip_settings(vfile.values))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="latin-1", errors="replace", newline="") as handle:
+                    handle.write(value + ending)
             except OSError:
                 pass
+        elif isinstance(opened, _VipFile) and len(args) > 2:
+            index = _to_int(self._expand(args[2].text, scope), 0) - 1
+            if index < 0:
+                return
+            while len(opened.values) <= index:
+                opened.values.append("")
+            opened.values[index] = value
+            opened.dirty = True
+
+    def _writable(self, reference: str) -> Path | None:
+        """Where a text file the pack writes goes: exactly the path it named, inside the pack.
+        Not a same-named file somewhere else in the pack, which reading can fall back on."""
+        if not self._base_dir:
+            return None
+        return confine(Path(self._base_dir).resolve(), reference.strip())
+
+    def _close_file(self, handle: str) -> None:
+        """``#Close handle``: flush a written record file back to disk and drop the handle."""
+        opened = self._files.pop(handle, None)
+        if isinstance(opened, _VipFile) and opened.dirty and opened.path is not None:
+            try:
+                opened.path.parent.mkdir(parents=True, exist_ok=True)
+                opened.path.write_bytes(_serialize_vip_settings(opened.values))
+            except OSError:
+                pass
+
+    def _delete_file(self, reference: str) -> None:
+        """``#DelFile path``: delete that file in the pack, if it's there. Never a file
+        outside the pack, and never a program or settings file (manual 5.2.15)."""
+        path = self._writable(reference)
+        if path is None or path.suffix.lower() in _PROTECTED_SUFFIXES:
+            return
+        try:
+            if path.is_file():
+                path.unlink()
+        except OSError:
+            pass
+
+    def _send_file(self, args: list[_Tok], scope: _Scope) -> None:
+        """``#Send file [prefix] [suffix]``: send each line of a text file in the pack to the
+        MUD as written, with the prefix and suffix around it."""
+        path = self._resolve_in_pack(self._expand(args[0].text, scope), must_exist=True)
+        if path is None:
+            return
+        prefix = self._expand(args[1].text, scope) if len(args) > 1 else ""
+        suffix = self._expand(args[2].text, scope) if len(args) > 2 else ""
+        suffix = suffix.replace("\r", "").replace("\n", "")  # each line is sent as a line anyway
+        try:
+            lines = path.read_text(encoding="latin-1").splitlines()
+        except OSError:
+            return
+        for line in lines[:_SEND_LIMIT]:
+            self._api.send(prefix + line + suffix)
 
     def _bare_or_send(self, args: list[_Tok], scope: _Scope) -> None:
         if not args:
@@ -2094,6 +2276,12 @@ class VipMudPack:
         if 1 <= index <= len(items):
             del items[index - 1]
         return "|".join(items)
+
+    def _function_endoffile(self, args: list[str], scope: _Scope) -> str:
+        opened = self._files.get(self._text_argument(args, 0, scope).strip())
+        if not isinstance(opened, _TextFile):
+            return "1"
+        return "1" if opened.position >= len(self._text_lines(opened)) else "0"
 
     def _function_eval(self, args: list[str], scope: _Scope) -> str:
         expression = ",".join(args)
