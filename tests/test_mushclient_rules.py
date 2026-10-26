@@ -104,7 +104,9 @@ def test_import_xml_counts_what_it_added_and_reports_bad_input():
         "<variables><variable name='v'>5</variable></variables>]])))\n"
         "Send(GetVariable('v'))"
     )
-    assert sink.sent == ["-1", "-2", "0", "4", "5"]
+    # MUSHclient's methods_xml.cpp answers -1 both for text that isn't XML and for XML
+    # that doesn't parse.
+    assert sink.sent == ["-1", "-1", "0", "4", "5"]
 
 
 def test_import_xml_replaces_a_rule_of_the_same_name_ignoring_case():

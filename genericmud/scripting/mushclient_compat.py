@@ -3515,7 +3515,8 @@ class MushclientPack:
     def _import_xml(self, xml: object = "", *_rest: object) -> int:
         """MUSHclient ``ImportXML``: add the triggers, aliases, timers and variables in an XML
         fragment, replacing any of the same name. Mush-Z brings in its 857 sound triggers this
-        way. Answers how many were added, -1 if it isn't XML and -2 if it doesn't parse."""
+        way. Answers how many were added, or -1 if it isn't XML or doesn't parse (MUSHclient's
+        methods_xml.cpp answers -1 for both)."""
         started = time.monotonic()
         try:
             return self._import_xml_text(str(xml or ""))
@@ -3541,7 +3542,7 @@ class MushclientPack:
             # load problems, named by the file that called ImportXML.
             where = self._current_document.name if self._current_document else "ImportXML"
             self._rule_errors.append((f"ImportXML in {where}", f"ParseError: {error}"))
-            return -2
+            return -1
         count = 0
         for kind, group_tag in ((TRIGGER, "triggers"), (ALIAS, "aliases")):
             for container in root.iter(group_tag):
