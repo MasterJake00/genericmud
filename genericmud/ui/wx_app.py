@@ -1031,10 +1031,10 @@ class SessionPanel(wx.Panel):
             self.app.on_focus_changed(focused)
 
     def apply_world_settings(self, world: World) -> None:  # UI thread
-        """Take a world's edited command stacking, logging and sound downloads now. How the
-        tab connects (host, port, TLS, encoding, sounds) stays as it opened, so a reconnect from
-        this tab doesn't reach a new host with the old encoding; those apply when the world is
-        opened again."""
+        """Take a world's edited command stacking, logging, login and sound downloads now. How
+        the tab connects (host, port, TLS, encoding, sounds) stays as it opened, so a reconnect
+        from this tab doesn't reach a new host with the old encoding; those apply when the world
+        is opened again."""
         self.world = replace(
             self.world,
             command_stacking=world.command_stacking,
@@ -1042,6 +1042,8 @@ class SessionPanel(wx.Panel):
             log_automatically=world.log_automatically,
             log_files=world.log_files,
             log_commands=world.log_commands,
+            connect_method=world.connect_method,
+            post_connect_commands=world.post_connect_commands,
             download_sounds=world.download_sounds,
         )
         if self.app is not None:

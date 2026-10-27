@@ -597,6 +597,10 @@ class EngineApp:
         self.log_automatically = world.log_automatically
         self.log_files = world.log_files
         self.log_commands = world.log_commands
+        # How this world logs in, and what it types once connected. A reconnect from this tab
+        # reads both again, so an edit has to reach the running session and not just the file.
+        self.connect_method = world.connect_method
+        self.post_connect_commands = world.post_connect_commands
         self.download_media = world.download_sounds
 
     def on_connect(self, world: str, *, socket_open: bool = True) -> ActivationResult | None:
