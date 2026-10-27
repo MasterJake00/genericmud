@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import ctypes
 import itertools
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -47,14 +46,23 @@ if TYPE_CHECKING:
 MUSIC_CATEGORY = "music"
 _SLIDE_TO_STOP = -1.0  # sliding BASS's volume to -1 fades to silence and stops the stream
 
-# Every cue BASS may still call back about, by its serial number, holding its callbacks. ctypes
-# frees a callback nothing refers to, and BASS calling a freed one would crash genericMud, so a
-# cue stays here (one table for every session) until BASS has freed its stream and a grace
-# period has passed, by when none of its callbacks can still be running on BASS's thread.
-_kept: dict[int, _Cue] = {}
-_serials = itertools.count(1)
-_GRACE_SECONDS = 10.0
-_clock = time.monotonic
+# What each of BASS's syncs does, by the number BASS hands back with it, for every session. A
+# cue's actions leave as BASS frees its stream, from whichever thread frees it.
+_actions: dict[int, Callable[[int], None]] = {}
+_action_numbers = itertools.count(1)  # from 1: BASS hands back 0 as nothing
+
+
+def _run_action(_sync: int, channel: int, _data: int, number: object) -> None:
+    """Run the action filed under ``number``, if it's still filed."""
+    action = _actions.get(number)
+    if action is not None:
+        action(channel)
+
+
+# The one callback BASS holds, for every sync of every cue. ctypes frees a callback nothing
+# refers to, and BASS calling one that's been freed would crash genericMud; this one lasts as
+# long as genericMud, so whatever thread BASS calls from and whenever, it's there.
+_dispatch = bass_library.SyncProc(_run_action)
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -82,10 +90,8 @@ class _Cue:
     end: int = 0  # byte position it ends at each time round
     fading_away: bool = False
     effects: dict[int, _Effect] = field(default_factory=dict)  # by BASS's handle for each
-    serial: int = 0  # its own number: BASS's handles are only numbers, never reused, measured
-    callbacks: list[object] = field(default_factory=list)  # the ones BASS holds for it
+    actions: list[int] = field(default_factory=list)  # the numbers its syncs' actions are under
     freed: bool = False  # BASS has freed the stream, so its handle mustn't be used again
-    freed_seen_at: float | None = None  # when genericMud noticed, for the grace period
 
 
 class BassSoundBackend(SoundBackend):
@@ -398,11 +404,14 @@ class BassSoundBackend(SoundBackend):
             self._warn(file)
             return None
         self._forget_finished()
-        cue = _Cue(stream=stream, gain=gain, pan=pan, serial=next(_serials))
-        _kept[cue.serial] = cue
+        cue = _Cue(stream=stream, gain=gain, pan=pan)
 
         def freed(_channel: int) -> None:
+            # BASS calls this as it frees the stream: our own BASS_StreamFree, or its own at the
+            # end of an auto-free stream. No sync of it comes after.
             cue.freed = True
+            for number in cue.actions:
+                _actions.pop(number, None)
 
         self._sync(cue, SYNC_FREE | SYNC_MIXTIME, 0, freed)
         cue.end = self._bass.BASS_ChannelGetLength(stream, POS_BYTE)
@@ -466,32 +475,21 @@ class BassSoundBackend(SoundBackend):
             self._sync(cue, SYNC_END | SYNC_MIXTIME, 0, round_again)
 
     def _sync(self, cue: _Cue, kind: int, position: int, action: Callable[[int], None]) -> None:
-        """Have BASS call ``action`` with the cue's stream when ``kind`` happens to it."""
-
-        def call(_sync: int, channel: int, _data: int, _user: object) -> None:
-            action(channel)
-
-        callback = bass_library.SyncProc(call)
-        cue.callbacks.append(callback)
-        self._bass.BASS_ChannelSetSync(cue.stream, kind, position, callback, None)
+        """Have BASS run ``action`` with the cue's stream when ``kind`` happens to it, through
+        the one lasting callback."""
+        number = next(_action_numbers)
+        _actions[number] = action
+        cue.actions.append(number)
+        self._bass.BASS_ChannelSetSync(cue.stream, kind, position, _dispatch, number)
 
     def _forget_finished(self) -> None:
-        """Let go of cues BASS has freed: this backend's record of them at once, and their
-        callbacks once the grace period has passed."""
+        """Let go of this backend's record of cues BASS has freed."""
         for channel, cue in list(self._cues.items()):
             if cue.freed:
                 del self._cues[channel]
         if self._music is not None and self._music.freed:
             self._music = None
             self._music_channel = None
-        now = _clock()
-        for serial, cue in list(_kept.items()):
-            if not cue.freed:
-                continue
-            if cue.freed_seen_at is None:
-                cue.freed_seen_at = now
-            elif now - cue.freed_seen_at >= _GRACE_SECONDS:
-                del _kept[serial]
 
     def _bytes(self, stream: int, seconds: float) -> int:
         if seconds <= 0:

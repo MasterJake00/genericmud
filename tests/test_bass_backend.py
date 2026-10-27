@@ -126,9 +126,9 @@ class _FakeBass:
         state = self.streams.get(stream)
         if state is None:
             return False
-        for kind, _parameter, callback in state["syncs"]:
+        for kind, _parameter, callback, user in state["syncs"]:
             if kind & ~SYNC_MIXTIME == SYNC_FREE:
-                callback(1, stream, 0, None)
+                callback(1, stream, 0, user)
         del self.streams[stream]
         for effect, effect_state in list(self.effects.items()):
             if effect_state["stream"] == stream:
@@ -195,22 +195,22 @@ class _FakeBass:
         state["flags"] = (state["flags"] & ~mask) | (flags & mask)
         return state["flags"]
 
-    def BASS_ChannelSetSync(self, stream, kind, parameter, callback, _user):  # noqa: N802
-        self.streams[stream]["syncs"].append((kind, parameter, callback))
+    def BASS_ChannelSetSync(self, stream, kind, parameter, callback, user):  # noqa: N802
+        self.streams[stream]["syncs"].append((kind, parameter, callback, user))
         return 1
 
     def reach(self, stream: int, position: int) -> None:
         """The stream plays past ``position``: its position syncs there run."""
-        for kind, parameter, callback in self.streams[stream]["syncs"]:
+        for kind, parameter, callback, user in self.streams[stream]["syncs"]:
             if kind & ~SYNC_MIXTIME == 0 and parameter == position:
-                callback(1, stream, 0, None)
+                callback(1, stream, 0, user)
 
     def end_pass(self, stream: int) -> None:
         """The stream reaches its end: its end syncs run, and it stops unless it loops."""
         state = self.streams[stream]
-        for kind, _parameter, callback in state["syncs"]:
+        for kind, _parameter, callback, user in state["syncs"]:
             if kind & SYNC_END:
-                callback(1, stream, 0, None)
+                callback(1, stream, 0, user)
         if not state["flags"] & SAMPLE_LOOP:
             state["playing"] = False
             if state["flags"] & STREAM_AUTOFREE:
@@ -524,27 +524,23 @@ def test_a_freed_cues_handle_is_never_used_again():
     assert state["playing"] and state["attributes"][ATTRIB_VOL] == 1.0
 
 
-def test_callbacks_stay_alive_until_bass_has_freed_their_stream_and_a_while_after(
-    monkeypatch,
-):
-    # BASS calls a cue's callbacks from its own thread, and one freed while BASS might still
-    # call it would crash genericMud. They go only once BASS has freed the stream and a grace
-    # period has passed, by when none of them can still be running.
-    now = [100.0]
-    monkeypatch.setattr(bass_backend, "_clock", lambda: now[0])
+def test_bass_holds_one_callback_for_good_and_a_cues_actions_go_once_it_is_freed():
+    # BASS calls back from its own thread, and calling a callback ctypes had freed would crash
+    # genericMud. So BASS only ever holds one, which is never freed, and it finds each
+    # cue's action by a number BASS hands back. A cue's actions go once BASS frees it.
     fake, backend, _errors = _backend()
     backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True, timing=CueTiming(fade_in=1.0))
     rain = backend._cues["rain"]
-    assert len(rain.callbacks) >= 2  # BASS holds its free and its fade-in callbacks
+    syncs = fake.streams[rain.stream]["syncs"]
+    assert len(syncs) >= 2  # it's freed, and it fades in each time round
+    assert all(callback is bass_backend._dispatch for _kind, _parameter, callback, _user in syncs)
+    numbers = [user for _kind, _parameter, _callback, user in syncs]
     backend.set_looping("rain", False)
     backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)  # a new cue tidies up
-    assert rain.serial in bass_backend._kept  # still playing out
+    assert all(number in bass_backend._actions for number in numbers)  # still playing out
     fake.end_pass(rain.stream)
     backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)
-    assert rain.serial in bass_backend._kept  # freed, but within the grace period
-    now[0] += 60
-    backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)
-    assert rain.serial not in bass_backend._kept
+    assert not any(number in bass_backend._actions for number in numbers)
 
 
 def test_the_panic_key_stops_a_cue_while_it_fades_away():
