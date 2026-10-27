@@ -41,6 +41,7 @@ from genericmud.render.ansi import strip_ansi
 from genericmud.scripting.api import MESSAGE_BUTTONS, ScriptApi
 from genericmud.scripting.guard import ScriptGuard
 from genericmud.scripting.lua_runtime import install_pack_require, make_sandboxed_runtime
+from genericmud.scripting.mushclient_bass import BassWrapper
 from genericmud.scripting.mushclient_rules import (
     ALIAS,
     ANSI_BOLD,
@@ -912,96 +913,8 @@ class MushclientPack:
         return ppi
 
     def _make_bass_bridge(self):
-        """MUSHclient BASS class surface backed by genericMud's sound bus."""
-        api = self._api
-        streams: list[dict[str, object]] = []
-
-        def stream_create_file(*args: object):
-            # Colon call: bass, mem, file, offset, length, flags.
-            file = str(args[2] if len(args) > 2 else "")
-            flags = int(_to_float(args[5]) or 0) if len(args) > 5 else 0
-            state: dict[str, object] = {
-                "active": False,
-                "channel": f"mush-bass-{len(streams) + 1}",
-                "file": file,
-                "gain": 1.0,
-                "pan": 0.0,
-                "loop": bool(flags & 4),
-            }
-            streams.append(state)
-            stream = self._lua.eval(
-                "setmetatable({}, {__index = function() return function() return 0 end end})"
-            )
-
-            def play(*_args: object) -> int:
-                api.play(
-                    str(state["file"]),
-                    channel=str(state["channel"]),
-                    gain=float(state["gain"]),
-                    pan=float(state["pan"]),
-                    loop=bool(state["loop"]),
-                )
-                state["active"] = True
-                return _SCRIPT_ERROR_OK
-
-            def stop(*_args: object) -> int:
-                api.stop(str(state["channel"]))
-                state["active"] = False
-                return _SCRIPT_ERROR_OK
-
-            def set_attribute(_stream: object, attribute: object = 0, value: object = 0) -> int:
-                number = int(_to_float(attribute) or 0)
-                scalar = _to_float(value) or 0.0
-                if number == 2:
-                    state["gain"] = scalar
-                    if state["active"]:
-                        api.adjust(str(state["channel"]), gain=scalar)
-                elif number == 3:
-                    state["pan"] = scalar
-                    if state["active"]:
-                        api.adjust(str(state["channel"]), pan=scalar)
-                return _SCRIPT_ERROR_OK
-
-            stream.Play = play
-            stream.Stop = stop
-            stream.Free = stop
-            stream.Pause = stop
-            stream.IsActive = lambda *_a: 1 if state["active"] else 0
-            stream.SetAttribute = set_attribute
-            stream.SlideAttribute = set_attribute
-            return stream
-
-        def set_attribute(*args: object) -> int:
-            # Colon call: bass, stream, attribute, value.
-            if len(args) >= 4:
-                setter = args[1]["SetAttribute"]
-                setter(args[1], args[2], args[3])
-            return _SCRIPT_ERROR_OK
-
-        def free(*_args: object) -> int:
-            for state in streams:
-                if state["active"]:
-                    api.stop(str(state["channel"]))
-                    state["active"] = False
-            return _SCRIPT_ERROR_OK
-
-        # Anything of BASS's genericMud doesn't model answers 0, BASS's "fine" and "nothing".
-        bass = self._lua.eval(
-            "setmetatable({}, {__call = function(t) return t end,"
-            " __index = function() return function() return 0 end end})"
-        )
-        bass.Init = lambda *_a: _SCRIPT_ERROR_OK
-        # Miriani-Next checks the device before every sound and recovers it on an error.
-        bass.CheckDeviceHealth = lambda *_a: _SCRIPT_ERROR_OK
-        bass.RecoverFromDeviceFailure = lambda *_a: (True, "Recovered")
-        bass.IsInitialized = lambda *_a: True
-        bass.Free = free
-        bass.GetConfig = lambda *_a: 0
-        bass.GetVersion = lambda *_a: 0
-        bass.SetConfig = lambda *_a: _SCRIPT_ERROR_OK
-        bass.StreamCreateFile = stream_create_file
-        bass.SetAttribute = set_attribute
-        return bass
+        """The BASS wrapper class packs ship, as genericMud's sound bus (see mushclient_bass)."""
+        return BassWrapper(lua=self._lua, api=self._api, to_number=_to_float).build()
 
     def _make_json_bridge(self):
         """JSON codec for packs whose bundled implementation depends on native LPeg.

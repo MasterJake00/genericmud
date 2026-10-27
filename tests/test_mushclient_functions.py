@@ -296,6 +296,7 @@ def test_utils_hashes_hex_base64_and_timer_match_mushclient():
 def test_miriani_next_bass_device_checks_answer_ok(tmp_path):
     # Miriani-Next checks the audio device before every sound and recovers it on an error;
     # without these every one of its sounds stopped at a nil method.
+    (tmp_path / "x.ogg").write_bytes(b"OggS")  # a missing file is BASS's "can't open", 2
     sink = RecordingSink()
     pack = MushclientPack(ScriptApi(AutomationEngine(sink), source="m", base_dir=str(tmp_path)))
     pack.load_source(
