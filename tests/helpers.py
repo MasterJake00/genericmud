@@ -58,9 +58,11 @@ class RecordingSink(EngineSink):
         gain: float = 1.0,
         pan: float = 0.0,
         loop: bool = False,
+        times: int = 1,
     ) -> None:
         self.played.append(
-            {"file": file, "channel": channel, "gain": gain, "pan": pan, "loop": loop}
+            {"file": file, "channel": channel, "gain": gain, "pan": pan, "loop": loop,
+             "times": times}
         )
 
     def stop(self, channel: str) -> None:

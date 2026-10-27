@@ -19,7 +19,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from genericmud.sound.bus import CueTiming
+from genericmud.sound.bus import PAUSED, PLAYING, STOPPED, CueTiming, SoundBackend, SourceInfo
 
 if TYPE_CHECKING:
     from genericmud.session.diaglog import DiagnosticLog
@@ -46,7 +46,7 @@ def stereo_volume(gain: float, pan: float) -> tuple[float, float]:
     return _clamp(gain * min(1.0, 1.0 - pan)), _clamp(gain * min(1.0, 1.0 + pan))
 
 
-class PygameSoundBackend:
+class PygameSoundBackend(SoundBackend):
     """A SoundBus backend over an injected ``pygame.mixer`` (or a compatible stub)."""
 
     def __init__(
@@ -66,6 +66,7 @@ class PygameSoundBackend:
         self._levels: dict[str, tuple[float, float]] = {}  # category -> (gain, pan) for adjust()
         self._warned: set[str] = set()  # paths already reported, so a missing cue warns once
         self._music_channel: str | None = None  # logical channel the streaming music cue is on
+        self._paused: set[str] = set()  # logical channels held by pause()
 
     def play(
         self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1,
@@ -75,6 +76,7 @@ class PygameSoundBackend:
         if sound is None:  # missing/undecodable file: skip the cue, don't crash the line
             self._trace(file, "SKIP", gain=gain)
             return
+        self._paused.discard(channel)
         try:
             mixer_channel = self._channel(channel, loop)
             # pygame's loops counts the repeats after the first play. Of a cue's timing it
@@ -139,6 +141,46 @@ class PygameSoundBackend:
         existing = self._channels.get(channel)
         if existing is not None:
             existing.stop()
+
+    def pause(self, channel: str) -> None:
+        try:
+            if channel == MUSIC_CATEGORY or channel == self._music_channel:
+                self._mixer.music.pause()
+            existing = self._channels.get(channel)
+            if existing is not None:
+                existing.pause()
+        except Exception:  # noqa: BLE001 - a mixer fault must not crash the caller
+            return
+        self._paused.add(channel)
+
+    def resume(self, channel: str) -> None:
+        self._paused.discard(channel)
+        try:
+            if channel == MUSIC_CATEGORY or channel == self._music_channel:
+                self._mixer.music.unpause()
+            existing = self._channels.get(channel)
+            if existing is not None:
+                existing.unpause()
+        except Exception:  # noqa: BLE001 - a mixer fault must not crash the caller
+            pass
+
+    def state(self, channel: str) -> int:
+        if channel in self._paused:
+            return PAUSED
+        return PLAYING if self.is_playing(channel) else STOPPED
+
+    def source_info(self, file: str) -> SourceInfo | None:
+        """A sound's length, from the decoded copy play() keeps anyway, and the mixer's own
+        rate and channels, which pygame converts every sound to."""
+        sound = self._sound(file)
+        if sound is None:
+            return None
+        try:
+            seconds = float(sound.get_length())
+            rate, _size, channels = self._mixer.get_init()
+        except Exception:  # noqa: BLE001 - a stub or a closed mixer can't say
+            return None
+        return SourceInfo(seconds=seconds, rate=int(rate), channels=int(channels))
 
     def fade_away(self, channel: str, seconds: float) -> None:
         """Fade a cue out over ``seconds`` and stop it, as pygame's own fadeout does."""

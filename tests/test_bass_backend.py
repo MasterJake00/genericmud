@@ -81,6 +81,18 @@ class _FakeBass:
 
     def BASS_ChannelPlay(self, stream, _restart):  # noqa: N802
         self.streams[stream]["playing"] = True
+        self.streams[stream]["paused"] = False
+        return 1
+
+    def BASS_ChannelPause(self, stream):  # noqa: N802
+        self.streams[stream]["paused"] = True
+        return 1
+
+    def BASS_ChannelGetInfo(self, stream, reference):  # noqa: N802
+        if stream not in self.streams:
+            return 0
+        reference._obj.freq = 22050
+        reference._obj.chans = 1
         return 1
 
     def BASS_StreamFree(self, stream):  # noqa: N802
@@ -88,6 +100,8 @@ class _FakeBass:
 
     def BASS_ChannelIsActive(self, stream):  # noqa: N802
         state = self.streams.get(stream)
+        if state and state.get("paused"):
+            return 3  # BASS_ACTIVE_PAUSED
         return ACTIVE_PLAYING if state and state["playing"] else ACTIVE_STOPPED
 
     def BASS_ChannelSetAttribute(self, stream, attribute, value):  # noqa: N802
@@ -322,6 +336,53 @@ def test_frequency_changes_how_fast_a_cue_plays():
     assert state["attributes"][ATTRIB_FREQ] == 22050
 
 
+def test_a_paused_cue_says_so_and_carries_on_when_resumed():
+    # Miriani-Next frees every stream whose IsActive says stopped and keeps playing (1),
+    # stalled (2) and paused (3) ones: a pause has to read as a pause.
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/song.ogg", "song", 1.0, 0.0, True)
+    assert backend.state("song") == ACTIVE_PLAYING
+    backend.pause("song")
+    assert backend.state("song") == 3
+    backend.resume("song")
+    assert backend.state("song") == ACTIVE_PLAYING
+    assert backend.state("nothing") == ACTIVE_STOPPED
+
+
+def test_slides_glide_each_axis_and_positions_move_in_seconds():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/engine.ogg", "engine", 1.0, 0.0, True)
+    backend.slide("engine", gain=0.2, frequency=11025, seconds=1.5)
+    stream, state = _only_stream(fake)
+    assert state["slides"] == [(ATTRIB_VOL, 0.2, 1500), (ATTRIB_FREQ, 11025, 1500)]
+    backend.seek("engine", 4.5)
+    assert backend.position("engine") == 4.5
+    backend.set_looping("engine", False)
+    assert not state["flags"] & SAMPLE_LOOP
+    backend.set_looping("engine", True)
+    assert state["flags"] & SAMPLE_LOOP
+
+
+def test_a_file_is_measured_without_being_played():
+    fake, backend, _errors = _backend(missing=("/sounds/gone.ogg",))
+    info = backend.source_info("/sounds/lp.ogg")
+    assert (info.seconds, info.rate, info.channels) == (10.0, 22050, 1)
+    assert fake.streams == {}  # opened to read, and closed again
+    assert backend.source_info("/sounds/gone.ogg") is None
+
+
+def test_the_bus_scales_a_slide_and_takes_a_slide_below_zero_as_a_fade_away():
+    fake, backend, _errors = _backend()
+    bus = SoundBus(backend)
+    bus.set_volume("rain", 0.5)
+    bus.play("/sounds/rain.ogg", "rain", loop=True)
+    _stream, state = _only_stream(fake)
+    bus.slide("rain", gain=0.8, seconds=2.0)
+    assert state["slides"][-1] == (ATTRIB_VOL, 0.4, 2000)
+    bus.slide("rain", gain=-1.0, seconds=1.0)
+    assert state["slides"][-1] == (ATTRIB_VOL, -1.0, 1000)
+
+
 # Real BASS, when this machine has it.
 
 _FOLDER = os.environ.get(bass_library.ENVIRONMENT_FOLDER)
@@ -455,3 +516,28 @@ def test_real_bass_fades_a_cue_in_and_away(real_bass, tmp_path):
     assert backend.is_playing("fading")
     time.sleep(0.6)
     assert not backend.is_playing("fading")
+
+
+@needs_bass
+def test_real_bass_pauses_resumes_seeks_and_measures(real_bass, tmp_path):
+    import time
+
+    tone = _tone(tmp_path / "tone.wav", seconds=2.0)
+    backend = BassSoundBackend(real_bass.core)
+    info = backend.source_info(str(tone))
+    assert (round(info.seconds, 2), info.rate, info.channels) == (2.0, 22050, 1)
+    backend.play(str(tone), "held", 1.0, 0.0, True)
+    time.sleep(0.2)
+    backend.pause("held")
+    assert backend.state("held") == 3
+    time.sleep(0.1)  # the reported position settles as the device's buffer drains
+    held_at = backend.position("held")
+    time.sleep(0.2)
+    assert backend.position("held") == held_at
+    backend.resume("held")
+    time.sleep(0.2)
+    assert backend.position("held") > held_at
+    backend.seek("held", 1.5)
+    assert 1.5 <= backend.position("held") < 1.7
+    backend.stop("held")
+

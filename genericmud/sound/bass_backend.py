@@ -15,6 +15,7 @@ device opens, and pygame otherwise.
 
 from __future__ import annotations
 
+import ctypes
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -34,7 +35,7 @@ from genericmud.sound.bass_library import (
     SYNC_MIXTIME,
     SYNC_POS,
 )
-from genericmud.sound.bus import CueTiming
+from genericmud.sound.bus import CueTiming, SoundBackend, SourceInfo
 
 if TYPE_CHECKING:
     from genericmud.session.diaglog import DiagnosticLog
@@ -64,7 +65,7 @@ class _Cue:
     fading_away: bool = False
 
 
-class BassSoundBackend:
+class BassSoundBackend(SoundBackend):
     """A SoundBus backend over BASS's functions (the loaded library, or a stand-in in tests)."""
 
     def __init__(
@@ -165,6 +166,81 @@ class BassSoundBackend:
             bass.BASS_ChannelSetAttribute(cue.stream, ATTRIB_PAN, _clamp(pan, -1.0, 1.0))
         if frequency is not None and frequency >= 0:
             bass.BASS_ChannelSetAttribute(cue.stream, ATTRIB_FREQ, frequency)
+
+    def slide(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None, seconds: float = 0.0,
+    ) -> None:
+        """Glide a cue's volume, pan or pitch to a new value over ``seconds``, as BASS's own
+        slides do (the packs' fades)."""
+        cue = self._cue_for(channel)
+        if cue is None:
+            return
+        bass = self._bass
+        duration = _milliseconds(seconds)
+        if gain is not None and not cue.fading_away:
+            cue.gain = gain
+            level = _clamp(gain, 0.0, 1.0)
+            bass.BASS_ChannelSlideAttribute(cue.stream, ATTRIB_VOL, level, duration)
+        if pan is not None:
+            cue.pan = pan
+            balance = _clamp(pan, -1.0, 1.0)
+            bass.BASS_ChannelSlideAttribute(cue.stream, ATTRIB_PAN, balance, duration)
+        if frequency is not None and frequency >= 0:
+            bass.BASS_ChannelSlideAttribute(cue.stream, ATTRIB_FREQ, frequency, duration)
+
+    def pause(self, channel: str) -> None:
+        cue = self._cue_for(channel)
+        if cue is not None:
+            self._bass.BASS_ChannelPause(cue.stream)
+
+    def resume(self, channel: str) -> None:
+        cue = self._cue_for(channel)
+        if cue is not None:
+            self._bass.BASS_ChannelPlay(cue.stream, False)
+
+    def state(self, channel: str) -> int:
+        """BASS's own answer: 0 stopped, 1 playing, 2 stalled, 3 paused."""
+        cue = self._cue_for(channel)
+        if cue is None:
+            return ACTIVE_STOPPED
+        return self._bass.BASS_ChannelIsActive(cue.stream)
+
+    def position(self, channel: str) -> float:
+        cue = self._cue_for(channel)
+        if cue is None:
+            return 0.0
+        bass = self._bass
+        played = bass.BASS_ChannelGetPosition(cue.stream, POS_BYTE)
+        return bass.BASS_ChannelBytes2Seconds(cue.stream, played)
+
+    def seek(self, channel: str, seconds: float) -> None:
+        cue = self._cue_for(channel)
+        if cue is not None:
+            bass = self._bass
+            bass.BASS_ChannelSetPosition(cue.stream, self._bytes(cue.stream, seconds), POS_BYTE)
+
+    def set_looping(self, channel: str, loop: bool) -> None:
+        cue = self._cue_for(channel)
+        if cue is not None:
+            self._bass.BASS_ChannelFlags(cue.stream, SAMPLE_LOOP if loop else 0, SAMPLE_LOOP)
+
+    def source_info(self, file: str) -> SourceInfo | None:
+        """What ``file`` holds, read by opening it to decode and closing it again."""
+        bass = self._bass
+        path, flags = bass_library.path_argument(file)
+        stream = bass.BASS_StreamCreateFile(False, path, 0, 0, flags | bass_library.STREAM_DECODE)
+        if not stream:
+            return None
+        try:
+            length = bass.BASS_ChannelGetLength(stream, POS_BYTE)
+            seconds = bass.BASS_ChannelBytes2Seconds(stream, length)
+            details = bass_library.ChannelInfo()
+            if not bass.BASS_ChannelGetInfo(stream, ctypes.byref(details)):
+                return None
+            return SourceInfo(seconds=seconds, rate=details.freq, channels=details.chans)
+        finally:
+            bass.BASS_StreamFree(stream)
 
     def _cue_for(self, channel: str) -> _Cue | None:
         cue = self._cues.get(channel)

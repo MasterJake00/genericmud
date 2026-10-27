@@ -18,6 +18,10 @@ from dataclasses import dataclass, replace
 
 DEFAULT_CATEGORY = "sound"
 MUSIC_CATEGORY = "music"
+# A cue's state, numbered as BASS numbers them, so a pack's BASS wrapper hears what it expects.
+STOPPED = 0
+PLAYING = 1
+PAUSED = 3
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,16 @@ class CueTiming:
     finish: float = 0.0
     fade_in: float = 0.0
     fade_out: float = 0.0
+
+
+@dataclass(frozen=True)
+class SourceInfo:
+    """What a sound file holds: how long it plays, in seconds, its sample rate in Hz, and how
+    many channels it has."""
+
+    seconds: float
+    rate: int
+    channels: int
 
 
 class SoundBackend:
@@ -71,6 +85,38 @@ class SoundBackend:
     ) -> None:
         """Re-level, re-pan or re-pitch a playing cue (``frequency`` is the rate it plays at, in
         Hz, 0 for its own); backends without live control ignore it."""
+
+    def slide(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None, seconds: float = 0.0,
+    ) -> None:
+        """Move a playing cue's volume, pan or pitch to a new value over ``seconds``; a backend
+        that can't glide sets it at once."""
+        self.adjust(channel, gain, pan, frequency=frequency)
+
+    def pause(self, channel: str) -> None:
+        """Hold a playing cue where it is, for :meth:`resume`; backends that can't, don't."""
+
+    def resume(self, channel: str) -> None:
+        """Carry on a paused cue from where it was held."""
+
+    def state(self, channel: str) -> int:
+        """STOPPED, PLAYING or PAUSED."""
+        return PLAYING if self.is_playing(channel) else STOPPED
+
+    def position(self, channel: str) -> float:
+        """How far into its file the cue is, in seconds; 0 when the backend can't tell."""
+        return 0.0
+
+    def seek(self, channel: str, seconds: float) -> None:
+        """Move a cue to ``seconds`` into its file; backends that can't, don't."""
+
+    def set_looping(self, channel: str, loop: bool) -> None:
+        """Have a playing cue go round again when it ends, or stop going round."""
+
+    def source_info(self, file: str) -> SourceInfo | None:
+        """What ``file`` holds, without playing it; None when the backend can't tell."""
+        return None
 
 
 class SoundBus:
@@ -178,6 +224,43 @@ class SoundBus:
             self._backend.adjust(channel, effective, pan)
         else:
             self._backend.adjust(channel, effective, pan, frequency=frequency)
+
+    def slide(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None, seconds: float = 0.0,
+    ) -> None:
+        """Glide a playing cue's volume, pan or pitch over ``seconds``. ``gain`` is the CUE gain,
+        scaled like adjust's; below 0 it fades the cue away and stops it, as BASS does."""
+        if gain is not None and gain < 0:
+            self.fade_away(channel, seconds)
+            gain = None
+            if pan is None and frequency is None:
+                return
+        effective = self.effective_gain(channel, gain) if gain is not None else None
+        self._backend.slide(channel, effective, pan, frequency=frequency, seconds=seconds)
+
+    def pause(self, channel: str) -> None:
+        self._backend.pause(channel)
+
+    def resume(self, channel: str) -> None:
+        self._playing.add(channel)
+        self._backend.resume(channel)
+
+    def state(self, channel: str) -> int:
+        """STOPPED, PLAYING or PAUSED, as BASS numbers them."""
+        return self._backend.state(channel)
+
+    def position(self, channel: str) -> float:
+        return self._backend.position(channel)
+
+    def seek(self, channel: str, seconds: float) -> None:
+        self._backend.seek(channel, max(0.0, seconds))
+
+    def set_looping(self, channel: str, loop: bool) -> None:
+        self._backend.set_looping(channel, loop)
+
+    def source_info(self, file: str) -> SourceInfo | None:
+        return self._backend.source_info(file)
 
     def flush(self) -> None:
         """Stop every playing category (the sound panic key, e.g. Shift+F11)."""

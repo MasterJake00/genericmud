@@ -337,8 +337,10 @@ class ScriptApi:
         gain: float = 1.0,
         pan: float = 0.0,
         loop: bool = False,
+        times: int = 1,
     ) -> bool:
-        """Play a cue; returns whether the file resolved to something that exists.
+        """Play a cue (``times`` times when it doesn't loop); returns whether the file resolved
+        to something that exists.
 
         The return drives dialect-level failure reporting: VIPMud's %playhandle is 0
         when a play failed, and packs branch on it (Cosmic Rage speaks the failure and
@@ -350,7 +352,10 @@ class ScriptApi:
                 channel=channel, gain=gain, loop=loop,
             )
         resolved, exists = self._resolve(file)
-        self._engine.sink.play(resolved, channel, gain, pan, loop)
+        if times == 1:  # sinks written before repeats still take a cue
+            self._engine.sink.play(resolved, channel, gain, pan, loop)
+        else:
+            self._engine.sink.play(resolved, channel, gain, pan, loop, times=max(1, times))
         return exists
 
     def sound_exists(self, file: str) -> bool:
@@ -363,6 +368,45 @@ class ScriptApi:
     def is_playing(self, channel: str = "sound") -> bool:
         """Whether a cue is still audible on ``channel`` (backend truth, not history)."""
         return self._engine.sound.is_playing(channel)
+
+    def sound_state(self, channel: str = "sound") -> int:
+        """The cue's state as BASS numbers it: 0 stopped, 1 playing, 3 paused."""
+        return self._engine.sound.state(channel)
+
+    def pause(self, channel: str) -> None:
+        self._engine.sound.pause(channel)
+
+    def resume(self, channel: str) -> None:
+        self._engine.sound.resume(channel)
+
+    def slide(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None, seconds: float = 0.0,
+    ) -> None:
+        """Glide a playing cue's volume, pan or pitch over ``seconds`` (a pack's fades); a
+        volume below 0 fades it away and stops it."""
+        self._engine.sound.slide(channel, gain, pan, frequency=frequency, seconds=seconds)
+
+    def fade_away(self, channel: str, seconds: float) -> None:
+        self._engine.sound.fade_away(channel, seconds)
+
+    def sound_position(self, channel: str) -> float:
+        """How far into its file the cue on ``channel`` is, in seconds."""
+        return self._engine.sound.position(channel)
+
+    def seek(self, channel: str, seconds: float) -> None:
+        self._engine.sound.seek(channel, seconds)
+
+    def set_looping(self, channel: str, loop: bool) -> None:
+        self._engine.sound.set_looping(channel, loop)
+
+    def source_info(self, file: str):
+        """What ``file`` holds (a SourceInfo: length, rate, channels), found the way play()
+        finds it, or None when it isn't there or can't be read."""
+        resolved, exists = self._resolve(file)
+        if not exists:
+            return None
+        return self._engine.sound.source_info(resolved)
 
     def music(self, file: str, channel: str = "music") -> None:
         if self._engine.diag is not None:

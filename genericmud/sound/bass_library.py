@@ -67,6 +67,22 @@ else:
 _DWORD = ctypes.c_uint32
 _QWORD = ctypes.c_uint64
 _BOOL = ctypes.c_int
+
+
+class ChannelInfo(ctypes.Structure):
+    """BASS_CHANNELINFO: what a stream holds."""
+
+    _fields_ = [
+        ("freq", _DWORD),  # sample rate, in Hz
+        ("chans", _DWORD),
+        ("flags", _DWORD),
+        ("ctype", _DWORD),
+        ("origres", _DWORD),
+        ("plugin", _DWORD),
+        ("sample", _DWORD),
+        ("filename", ctypes.c_char_p),
+    ]
+
 # Each function genericMud calls: (name, result type, argument types).
 _SIGNATURES = (
     ("BASS_GetVersion", _DWORD, ()),
@@ -77,6 +93,8 @@ _SIGNATURES = (
     ("BASS_StreamFree", _BOOL, (_DWORD,)),
     ("BASS_ChannelPlay", _BOOL, (_DWORD, _BOOL)),
     ("BASS_ChannelStop", _BOOL, (_DWORD,)),
+    ("BASS_ChannelPause", _BOOL, (_DWORD,)),
+    ("BASS_ChannelGetInfo", _BOOL, (_DWORD, ctypes.POINTER(ChannelInfo))),
     ("BASS_ChannelIsActive", _DWORD, (_DWORD,)),
     ("BASS_ChannelSetAttribute", _BOOL, (_DWORD, _DWORD, ctypes.c_float)),
     ("BASS_ChannelGetAttribute", _BOOL, (_DWORD, _DWORD, ctypes.POINTER(ctypes.c_float))),

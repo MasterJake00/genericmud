@@ -304,6 +304,7 @@ class AppSink(EngineSink):
         gain: float = 1.0,
         pan: float = 0.0,
         loop: bool = False,
+        times: int = 1,
     ) -> None:
         self.cues += 1
         if self._diag is not None:
@@ -313,7 +314,7 @@ class AppSink(EngineSink):
                 cat_gain=policy.gain, muted=policy.muted, cue_gain=gain,
                 effective=self._sound.effective_gain(channel, gain),
             )
-        self._sound.play(file, channel, gain, pan, loop)
+        self._sound.play(file, channel, gain, pan, loop, times=times)
 
     def stop(self, channel: str) -> None:
         self._sound.stop(channel)

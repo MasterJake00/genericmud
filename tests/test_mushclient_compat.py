@@ -673,6 +673,7 @@ def test_miriani_bass_module_routes_stream_to_sound_bus(tmp_path):
         "gain": 0.4,
         "pan": -0.5,
         "loop": True,
+        "times": 1,
     }
 
 
