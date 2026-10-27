@@ -7,6 +7,40 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.20.0 — 2026-10-27
+
+**A new sound engine**
+
+* genericMud now plays sound through BASS, the sound library MUSHclient
+  soundpacks are made for. It plays every kind of sound file the vault's packs
+  ship, including MP3 inside WAV files and, on Windows and Mac, Chatpack's .m4a
+  sounds, which the old engine couldn't play. On Linux the .m4a sounds still
+  don't play. If BASS can't start, genericMud uses its old sound engine.
+* Sounds can change pitch, fade, slide their volume and pan, pause and carry
+  on, and start or finish partway through, as packs and MUDs ask.
+
+**Soundpacks**
+
+* Erion, Mata's Empire, Mystavaria, Cosmic Rage, SquareSoft, the V.I. Mush
+  bundle, Krinnzenn's pack and Mush-Z sound as they do in MUSHclient: music and
+  ambience fade out instead of cutting off, pitch and pan changes work, and
+  their volume keys change the sounds already playing. Cosmic Rage's sounds
+  that come without a pan play in the middle instead of far left.
+* Miriani-Next, Toastush, Chatpack and the Yu-Gi-Oh pack can pause their
+  sounds, slide and pitch them, and tell when one has finished, so Miriani-Next
+  no longer keeps every sound it ever played. The Yu-Gi-Oh pack's life point
+  sounds play, once for each hundred points lost.
+* Chatpack's sound effects work: the echo its env command puts on every sound,
+  and the echo, reverb, flanger and gargle ChatMUD asks for.
+* VIP Mud packs' #PC Frequency changes a sound's pitch.
+* Scripts using MUSHclient's PlaySound get its volume and pan as MUSHclient
+  reads them. A volume of 0, MUSHclient's loudest, played silent.
+
+**Sounds the MUD sends**
+
+* GMCP Client.Media sounds start and finish where the MUD says, fade in and
+  out, and fade away when the MUD stops them, as in Mudlet.
+
 ## 0.19.0 — 2026-10-27
 
 **Soundpack updates**
