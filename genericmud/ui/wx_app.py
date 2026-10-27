@@ -1446,6 +1446,7 @@ _LOG_FILE_LABELS = ("A new file each session", "One file per day", "One file for
 _CONNECT_LABELS = (
     ("none", "No auto-connect — send no login"),
     ("prompts", "Answer the MUD's prompts — name, then password when asked"),
+    ("mxp", "Let the MUD ask (MXP) — send the login only when the MUD requests it"),
     ("mush", "MUSH/MOO — send CONNECT name password"),
     ("diku", "Diku — send name, then password"),
 )

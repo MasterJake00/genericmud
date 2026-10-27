@@ -29,7 +29,7 @@ LOG_FILES = ("session", "day", "world")
 # blind. MXP is deliberately absent: the client does not parse MXP yet (see protocol/telnet.py
 # and connection.py), so a MXP login could not be sent without advertising a protocol whose
 # markup would then leak into the output.
-CONNECT_METHODS = ("none", "prompts", "mush", "diku")
+CONNECT_METHODS = ("none", "prompts", "mxp", "mush", "diku")
 # What an absent setting means, and what a new world starts on. "none" for both: with no
 # login stored there is nothing to send, so a world that offered to log in and then did
 # nothing would be worse than one that never offered. It also keeps the setting honest --
