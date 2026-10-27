@@ -497,7 +497,8 @@ uv run ruff check .
 
 Native Python asyncio engine (transport, telnet/MCCP/GMCP/MSDP/MSSP/MSP, ANSI,
 triggers/aliases/timers, room mapping, Lua + VIPMud + MUSHclient dialects, voice
-router) with a wxPython native UI, pygame audio, and an alternate web UI
+router) with a wxPython native UI, BASS audio (pygame when a build has no BASS),
+and an alternate web UI
 (`--web`) over a localhost WebSocket. The engine is headless-testable; the whole
 suite runs without a display, socket, or screen reader. Runtime deps: `lupa`
 (Lua) and `regex` (ReDoS-safe matching). Extras: `.[gui]` webview shell,
@@ -514,5 +515,16 @@ frozen app for the current platform with `uv run python tools/build_app.py` —
 `.exe` onedir on Windows, `genericMud.app` on macOS, an onedir tarball on Linux.
 CI builds all three on tags (`build-windows.yml`, `build-macos.yml`,
 `build-linux.yml`).
+
+Sound plays through [BASS](https://www.un4seen.com), the library soundpacks are
+made for, with its BASS_FX add-on. `uv run python tools/fetch_bass.py build/bass`
+downloads them for your platform, checked against pinned checksums; the build
+bundles that folder, and `GENERICMUD_BASS_DIR=build/bass` runs the tests against
+the real library. Without it, a source checkout plays through pygame.
+
+BASS is by Un4seen Developments and BASS_FX by JOBnik! (Arthur Aminov). BASS is
+free for non-commercial use, which genericMud is; selling genericMud, or anything
+built from it, needs a BASS licence from un4seen.com. BASS_FX may be passed on
+free of charge.
 
 Windows packaging and running from source: `WINDOWS.md`.
