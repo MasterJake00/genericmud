@@ -54,6 +54,7 @@ def pack(tmp_path):
         def __init__(self) -> None:
             self.fake = fake
             self.bass = lua.eval("require('miriani.lib.audio.bass')()")
+            self.wrapper = pack._bass_wrapper
 
         def call(self, target, name, *args):
             return caller(target, name, *args)
@@ -295,3 +296,27 @@ def test_toastushs_wrapper_sets_attributes_by_name(pack):
     _handle, state = pack.playing()
     assert state["attributes"][ATTRIB_VOL] == 0.3
     assert state["attributes"][ATTRIB_FREQ] == 30000
+
+
+def test_streams_that_have_ended_dont_pile_up(pack):
+    # Miriani-Next makes a stream for every sound it plays, all session long.
+    for _ in range(300):
+        stream = pack.stream(flags=AUTO_FREE)
+        pack.call(stream, "Play")
+        handle, _state = pack.playing()
+        pack.fake.end_pass(handle)
+    assert len(pack.wrapper.streams) <= 257
+
+
+def test_bass_free_ends_streams_it_no_longer_lists(pack):
+    # BASS_Free frees every stream. One the pack still holds, though it has ended and been
+    # dropped from the list, is gone too.
+    first = pack.stream()
+    pack.call(first, "Play")
+    handle, _state = pack.playing()
+    pack.fake.end_pass(handle)
+    for _ in range(300):
+        pack.stream()
+    pack.call(pack.bass, "Free")
+    assert pack.call(first, "Play") == 5  # BASS_ERROR_HANDLE
+    assert pack.call(first, "IsActive") == 0

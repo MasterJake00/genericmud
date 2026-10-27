@@ -942,7 +942,8 @@ class MushclientPack:
 
     def _make_bass_bridge(self):
         """The BASS wrapper class packs ship, as genericMud's sound bus (see mushclient_bass)."""
-        return BassWrapper(lua=self._lua, api=self._api, to_number=_to_float).build()
+        self._bass_wrapper = BassWrapper(lua=self._lua, api=self._api, to_number=_to_float)
+        return self._bass_wrapper.build()
 
     def _make_json_bridge(self):
         """JSON codec for packs whose bundled implementation depends on native LPeg.

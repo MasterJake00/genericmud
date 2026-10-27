@@ -91,6 +91,8 @@ _EFFECT_SETTINGS = {
         "high_frequency_rt_ratio": "fHighFreqRTRatio",
     },
 }
+# Past this many, streams that can't be playing are dropped from the list BASS:Free() stops.
+_KEPT_STREAMS = 256
 # What a stream whose file couldn't be measured is taken to hold: CD-quality stereo.
 _DEFAULT_RATE = 44100
 _DEFAULT_CHANNELS = 2
@@ -167,6 +169,7 @@ class _Stream:
     repeats: int = 1  # a stream data is put into plays the data this many times
     started: bool = False
     freed: bool = False
+    generation: int = 0  # which BASS:Free() it was made after
     effects: list[_StreamEffect] = field(default_factory=list)
 
     @property
@@ -189,7 +192,9 @@ class BassWrapper:
     lua: object  # the pack's Lua runtime
     api: object  # its ScriptApi
     to_number: Callable[[object], float | None]
-    streams: list[_Stream] = field(default_factory=list)
+    streams: list[_Stream] = field(default_factory=list)  # the ones that may be playing
+    next_number: int = 1
+    generation: int = 0  # goes up at each BASS:Free(), which frees every stream made before
 
     def build(self):
         """The BASS object the pack's ``require`` gets: callable, as the wrapper's class is."""
@@ -243,7 +248,9 @@ class BassWrapper:
         return self._object(stream)
 
     def _add(self, file: str, flags: object, seconds: float, rate: int, channels: int) -> _Stream:
-        number = len(self.streams) + 1
+        self._forget_ended()
+        number = self.next_number
+        self.next_number += 1
         stream = _Stream(
             number=number,
             channel=f"mush-bass-{number}",
@@ -252,15 +259,34 @@ class BassWrapper:
             seconds=seconds,
             rate=rate or _DEFAULT_RATE,
             channels=channels or _DEFAULT_CHANNELS,
+            generation=self.generation,
         )
         self.streams.append(stream)
         return stream
 
+    def _forget_ended(self) -> None:
+        """Drop the streams that can't be playing from the list BASS:Free() stops, once it
+        grows: Miriani-Next makes a stream for every sound. A pack still holding one of them
+        uses it as before, and BASS:Free() still ends it (see generation)."""
+        if len(self.streams) <= _KEPT_STREAMS:
+            return
+        self.streams = [
+            stream for stream in self.streams
+            if not self._gone(stream)
+            and (not stream.started or self._state(stream) != _ACTIVE_STOPPED)
+        ]
+
+    def _gone(self, stream: _Stream) -> bool:
+        """Whether BASS would have freed the stream: by itself, or at a BASS:Free() since."""
+        return stream.freed or stream.generation != self.generation
+
     def _free_all(self, *_args) -> int:
         for stream in self.streams:
-            if not stream.freed:
+            if not self._gone(stream):
                 self.api.stop(stream.channel)
                 stream.freed = True
+        self.streams.clear()
+        self.generation += 1  # and every stream made before is gone with them
         return _OK
 
     def _set_attribute_of(self, _bass, stream=None, attribute=0, value=0):
@@ -280,7 +306,7 @@ class BassWrapper:
     def _object(self, stream: _Stream):
         def call(action):
             def method(_object, *args):
-                if stream.freed:
+                if self._gone(stream):
                     return _ERROR_HANDLE
                 return action(stream, *args)
 
@@ -331,7 +357,7 @@ class BassWrapper:
             if key != "position":
                 return False
             seconds = self.to_number(value)
-            if seconds is not None and not stream.freed:
+            if seconds is not None and not self._gone(stream):
                 self.api.seek(stream.channel, seconds)
             return True
 
@@ -376,7 +402,7 @@ class BassWrapper:
         return _OK
 
     def _free(self, stream: _Stream) -> int:
-        if stream.freed:
+        if self._gone(stream):
             return _ERROR_HANDLE
         self.api.stop(stream.channel)
         stream.freed = True
@@ -384,7 +410,7 @@ class BassWrapper:
 
     def _state(self, stream: _Stream) -> int:
         """IsActive: 0 stopped, 1 playing, 3 paused, as BASS answers it."""
-        if stream.freed or not stream.started:
+        if self._gone(stream) or not stream.started:
             return _ACTIVE_STOPPED
         return self.api.sound_state(stream.channel)
 
