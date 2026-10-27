@@ -7,6 +7,27 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.19.0 — 2026-10-27
+
+**Soundpack updates**
+
+* Miriani-Next, Toastush, Erion, Chatpack and Atlan's Mystavaria pack are
+  checked for updates when you connect, at most once a day, and genericMud
+  tells you when one has something new. Type /update to install it, then
+  reconnect.
+* Updates download only the files that changed, so they take seconds instead
+  of fetching the whole pack again. That includes Update from source in the
+  soundpack manager.
+* Files you've changed are kept: the pack's new version goes next to yours
+  with .new on the end. A pack's first update can't tell yet what you
+  changed, so it keeps settings files that way, like the world file and .ini
+  and .cfg files.
+* Miriani-Next's and Toastush's own update commands work: update, update
+  quietly, update check, and Ctrl+U in Miriani-Next. Their settings for
+  updating by themselves at login or while you're idle work too, instead of
+  sending "update" to the MUD. After an update they play their update sounds
+  and, if you asked for it, show their changelog.
+
 ## 0.18.1 — 2026-10-26
 
 **MUSHclient soundpacks**
