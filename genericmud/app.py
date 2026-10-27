@@ -1567,17 +1567,25 @@ class EngineApp:
         term = message.get("term", "")
         forward = bool(message.get("forward", False))
         restart = bool(message.get("restart", False)) or not self.review.active
-        if restart:
-            # A new Find starts at the chosen edge and includes that edge line. Repeats
-            # remain exclusive, so F3 advances instead of finding the same line forever.
+        if message.get("from_bottom"):
+            # The reader has been put back below the newest line, so the search goes on
+            # from there: back, the newest line is the first one it looks at; forward,
+            # there's nothing past it.
             self.review.enter()
-            if forward:
-                self.review.top()
+            include_current = not forward
+        else:
+            if restart:
+                # A new Find starts at the chosen edge and includes that edge line. Repeats
+                # remain exclusive, so F3 advances instead of finding the same line forever.
+                self.review.enter()
+                if forward:
+                    self.review.top()
+            include_current = restart
         hit = self.review.search(
             term,
             forward=forward,
             case_sensitive=bool(message.get("case_sensitive", False)),
-            include_current=restart,
+            include_current=include_current,
         )
         self._post(protocol.find_result(hit, found=bool(hit)))
         self._speak_review(hit or f"not found: {term}")

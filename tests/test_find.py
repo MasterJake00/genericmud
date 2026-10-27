@@ -95,6 +95,34 @@ def test_reopening_find_restarts_from_the_direction_edge():
     ]
 
 
+def test_a_find_from_the_bottom_goes_back_from_the_newest_line_not_the_last_match():
+    # Going back to the output puts the reader at the newest line, and F3 then searches
+    # from there instead of carrying on from the line it found last.
+    app, _backend, posted = _app("first dragon", "second dragon", "third dragon", "tail")
+    app.on_ws_message(protocol.find("dragon", restart=True))
+    app.on_ws_message(protocol.find("dragon"))
+    app.on_ws_message(protocol.find("dragon", from_bottom=True))
+    app.on_ws_message(protocol.find("dragon"))
+    assert [message["text"] for message in _results(posted)] == [
+        "third dragon",
+        "second dragon",
+        "third dragon",
+        "second dragon",
+    ]
+
+
+def test_from_the_bottom_back_includes_the_newest_line_and_forward_finds_nothing():
+    app, _backend, posted = _app("old dragon", "middle", "new dragon")
+    app.on_ws_message(protocol.find("dragon", forward=True, restart=True))
+    app.on_ws_message(protocol.find("dragon", forward=True, from_bottom=True))
+    app.on_ws_message(protocol.find("dragon", from_bottom=True))
+    assert [(message["text"], message["found"]) for message in _results(posted)] == [
+        ("old dragon", True),
+        ("", False),
+        ("new dragon", True),
+    ]
+
+
 def test_case_sensitive_find_skips_the_wrong_case():
     app, _backend, posted = _app("a dragon roars", "a Dragon sleeps", "tail")
     app.on_ws_message(protocol.find("dragon", case_sensitive=True))

@@ -290,6 +290,9 @@ class SessionPanel(wx.Panel):
         self._find = FindState()  # sticky across searches; F3 repeats whatever is in here
         self._find_direction = False  # direction of the search in flight, for the caret sync
         self._find_restart = False  # next result starts from an output edge, inclusively
+        # The output put the reader back at the bottom since a search last found something,
+        # so the next one searches from there, not on from the line it found.
+        self._find_from_bottom = False
         self._keep_caret_on_focus = False  # one-shot: don't jump to the bottom this time
         self._questions: list[_PackQuestion] = []  # pack dialogs the loop thread waits on
         self._notepad_windows: dict[str, PackNotepadFrame] = {}  # packs' notepads, by title
@@ -730,6 +733,7 @@ class SessionPanel(wx.Panel):
         else:
             self.output.SetInsertionPointEnd()
             self.output.ShowPosition(self.output.GetLastPosition())
+            self._find_from_bottom = True  # and F3 goes on from here, too
         event.Skip()
 
     # --- find (output only) ---
@@ -778,13 +782,17 @@ class SessionPanel(wx.Panel):
         if not self._find.term:
             self._open_find()
             return
-        self._run_find(not self._find.forward if reverse else self._find.forward)
+        forward = not self._find.forward if reverse else self._find.forward
+        self._run_find(forward, from_bottom=self._find_from_bottom)
 
-    def _run_find(self, forward: bool, *, restart: bool = False) -> None:
+    def _run_find(
+        self, forward: bool, *, restart: bool = False, from_bottom: bool = False
+    ) -> None:
         if self.app is None:
             return
         self._find_direction = forward  # _sync_find_caret needs the direction actually used
-        self._find_restart = restart
+        # A search from the bottom lands on its edge occurrence, as a new search does.
+        self._find_restart = restart or from_bottom
         self._loop.call_soon_threadsafe(
             self.app.on_ws_message,
             protocol.find(
@@ -792,6 +800,7 @@ class SessionPanel(wx.Panel):
                 forward=forward,
                 case_sensitive=self._find.case_sensitive,
                 restart=restart,
+                from_bottom=from_bottom,
             ),
         )
 
@@ -810,7 +819,8 @@ class SessionPanel(wx.Panel):
         restart = self._find_restart
         self._find_restart = False
         if not message.get("found"):
-            return
+            return  # still at the bottom, if that's where it searched from
+        self._find_from_bottom = False  # the next search goes on from this match
         if self._pending:
             self._flush_output()  # the matched line may still be in the append batch
         lines = self.output.GetValue().split("\n")

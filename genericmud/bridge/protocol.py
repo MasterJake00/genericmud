@@ -76,14 +76,20 @@ def find(
     forward: bool = False,
     case_sensitive: bool = False,
     restart: bool = False,
+    from_bottom: bool = False,
 ) -> dict[str, Any]:
-    """Ask the engine to search the scrollback. Backwards by default: it is history."""
+    """Ask the engine to search the scrollback. Backwards by default: it is history.
+
+    ``restart`` starts a new search at the edge it runs from; ``from_bottom`` searches on
+    from below the newest line, where the reader has just been put back.
+    """
     return {
         "type": FIND,
         "term": term,
         "forward": forward,
         "case_sensitive": case_sensitive,
         "restart": restart,
+        "from_bottom": from_bottom,
     }
 
 

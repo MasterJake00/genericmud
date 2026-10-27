@@ -1196,3 +1196,78 @@ def test_a_pack_update_from_its_repository_says_what_it_did():
         "and the pack's new version of each is next to it with .new on the end: a.mcl, b.ini. "
         "Reconnect to apply."
     )
+
+
+def test_after_the_output_puts_the_reader_back_at_the_bottom_f3_searches_from_there(
+    frame, monkeypatch
+):
+    # Find a line, go away and come back: the output puts you at the newest line, and F3
+    # then searches from there instead of carrying on from the line it found last. Back
+    # finds the newest match; forward finds nothing past the bottom, and going back after
+    # that still starts from the bottom.
+    import asyncio
+
+    from genericmud.app import EngineApp
+    from genericmud.bridge import protocol
+    from genericmud.protocol.telnet import DataReceived
+    from genericmud.ui import wx_app
+    from genericmud.ui.scrollback import FindState
+    from genericmud.voice.router import VoiceRouter
+    from tests.helpers import RecordingBackend
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+    loop = asyncio.new_event_loop()
+    panel = wx_app.SessionPanel(frame, loop, {}, World("Test", "mud.example", 4000))
+    posted: list[dict] = []
+    try:
+        voice = VoiceRouter(RecordingBackend(), clock=lambda: 0.0)
+        panel.app = EngineApp(voice, post=posted.append, keymap={})
+        lines = (
+            "first dragon", "a road", "second dragon", "a field", "third dragon", "a hill"
+        )
+        for text in lines:
+            panel.app.on_telnet_event(DataReceived(text.encode() + b"\r\n"))
+            panel._handle_message(protocol.line(text))
+        panel._flush_output()
+        posted.clear()
+
+        def search(action) -> None:
+            action()
+            loop.run_until_complete(asyncio.sleep(0))  # the engine's turn
+            for message in posted:
+                if message["type"] == protocol.FIND_RESULT:
+                    panel._handle_message(message)
+            posted.clear()
+
+        def caret_line() -> str:
+            _found, _column, line = panel.output.PositionToXY(panel.output.GetInsertionPoint())
+            return panel.output.GetLineText(line)
+
+        def come_back() -> None:
+            panel._on_output_focus(wx.FocusEvent(wx.wxEVT_SET_FOCUS))
+
+        panel._find = FindState(term="dragon")
+        search(lambda: panel._run_find(False, restart=True))
+        search(lambda: panel._find_again(reverse=False))
+        assert caret_line() == "second dragon"
+        come_back()
+        assert caret_line() == ""  # at the bottom, below the newest line
+        search(lambda: panel._find_again(reverse=False))
+        assert caret_line() == "third dragon"
+        search(lambda: panel._find_again(reverse=False))
+        assert caret_line() == "second dragon"  # and on from there
+
+        panel._find = FindState(term="dragon", forward=True)
+        come_back()
+        search(lambda: panel._find_again(reverse=False))
+        assert caret_line() == ""  # nothing past the bottom
+        search(lambda: panel._find_again(reverse=True))
+        assert caret_line() == "third dragon"
+    finally:
+        panel.app = None
+        panel.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()
