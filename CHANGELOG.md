@@ -7,6 +7,15 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.20.1 — 2026-10-27
+
+**Finding in the output**
+
+* After a Find, going back to the output puts you at the newest line, and F3
+  now searches from there too. It used to carry on from the line the last search
+  found. Searching backwards from the bottom finds the newest match; searching
+  forwards finds nothing past the bottom.
+
 ## 0.20.0 — 2026-10-27
 
 **A new sound engine**
