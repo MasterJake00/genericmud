@@ -602,6 +602,7 @@ class MushclientPack:
         self._opened_at = time.time()  # GetInfo(306): when this world was opened
         self._connected_at: float | None = None  # GetInfo(301) and GetConnectDuration
         self._saving_state = False  # SaveState can't run inside OnPluginSaveState
+        self._in_sound_hook = False  # a plugin's OnPluginPlaySound is running
         self._notepads: dict[str, str] = {}  # MUSHclient notepads by title
         self._loading_plugins: dict[str, int] = {}  # plugins whose files are loading now
         self._plugin_files: dict[str, set[Path]] = {}  # plain includes each plugin loaded
@@ -2810,14 +2811,41 @@ class MushclientPack:
         elif 1 <= number <= _SOUND_BUFFERS:
             self._api.stop(_buffer_channel(number))
 
-    def _sound(self, arg: object = "", *_rest: object) -> None:
-        """MUSHclient ``Sound``: a path plays it; a ``key=value`` string is a control
-        directive (``volume=``/``pan=``/``freq=``) for the current cue."""
+    def _sound(self, arg: object = "", *_rest: object) -> int:
+        """MUSHclient ``Sound``: a plugin that plays sounds its own way gets it first (see
+        _hand_sound_to_plugin). Otherwise a path plays it, and a ``key=value`` string is a
+        control directive (``volume=``/``pan=``/``freq=``) for the current cue."""
         text = str(arg)
+        if not text:
+            return ERROR_CODES["eNoNameSpecified"]
+        if self._hand_sound_to_plugin(text):
+            return E_OK
         if "=" in text:
             self._sound_control(text)
-        elif text:
-            self._api.play(text, channel=_SOUND_CHANNEL)
+        elif not self._api.play(text, channel=_SOUND_CHANNEL):
+            return ERROR_CODES["eCannotPlaySound"]
+        return E_OK
+
+    def _hand_sound_to_plugin(self, name: str) -> bool:
+        """MUSHclient's PlaySoundFile, for Sound() and triggers' sounds: the first enabled
+        plugin with an OnPluginPlaySound plays ``name`` its own way, and nothing else does. The
+        LuaAudio packs play every sound through audio.dll like this, their volume keys'
+        Sound("volume=x") included. A sound played inside that hook isn't handed on again, so
+        the hook can't call itself. Answers whether a plugin took it."""
+        if self._in_sound_hook:
+            return False
+        for plugin_id, hooks in list(self._hooks.items()):
+            if plugin_id == "world" or hooks.get("OnPluginPlaySound") is None:
+                continue  # MUSHclient asks plugins only, never the world's script
+            if not self._plugin_enabled(plugin_id):
+                continue
+            self._in_sound_hook = True
+            try:
+                self._call_hook(plugin_id, "OnPluginPlaySound", name)
+            finally:
+                self._in_sound_hook = False
+            return True
+        return False
 
     def _sound_control(self, directive: str) -> None:
         key, _, raw = directive.partition("=")
@@ -3191,7 +3219,7 @@ class MushclientPack:
             previous = self._current_plugin
             self._current_plugin = rule.plugin
             try:
-                if rule.sound:
+                if rule.sound and not self._hand_sound_to_plugin(rule.sound):
                     self._api.play(rule.sound)
                 if rule.send:
                     self._send_rule_text(rule, ctx)
