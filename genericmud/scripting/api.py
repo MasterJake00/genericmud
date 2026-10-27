@@ -408,6 +408,27 @@ class ScriptApi:
             return None
         return self._engine.sound.source_info(resolved)
 
+    def add_effect(
+        self, channel: str, kind: int, settings: dict[str, float] | None = None,
+        priority: int = 0,
+    ) -> int:
+        """Put one of BASS's DirectX 8 effects (echo, reverb, flanger, gargle and the rest;
+        see bass_effects) on the cue playing on ``channel``, with settings by BASS's names.
+        Answers a handle for it, or 0 when that can't be had."""
+        return self._engine.sound.add_effect(channel, kind, settings, priority)
+
+    def set_effect(self, channel: str, effect: int, settings: dict[str, float]) -> bool:
+        return self._engine.sound.set_effect(channel, effect, settings)
+
+    def effect_settings(self, channel: str, effect: int) -> dict[str, float] | None:
+        return self._engine.sound.effect_settings(channel, effect)
+
+    def remove_effect(self, channel: str, effect: int) -> None:
+        self._engine.sound.remove_effect(channel, effect)
+
+    def reset_effects(self, channel: str, effect: int = 0) -> None:
+        self._engine.sound.reset_effects(channel, effect)
+
     def music(self, file: str, channel: str = "music") -> None:
         if self._engine.diag is not None:
             self._engine.diag.event(

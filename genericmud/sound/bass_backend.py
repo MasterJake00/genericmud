@@ -5,9 +5,10 @@ there replaces the one playing), one music stream, live volume and pan changes, 
 that's missing or unreadable reported once. BASS mixes any number of streams at once, so
 unlike pygame there's no pool of channels to share out and no cue is ever cut off for another.
 
-It also does what pygame couldn't: a cue's pitch changes live (VIPMud's #PC Frequency), and a
+It also does what pygame couldn't: a cue's pitch changes live (VIPMud's #PC Frequency), a
 cue starts and finishes where a MUD says within its file and fades in, out and away
-(Client.Media), each done the way Mudlet does it.
+(Client.Media), each done the way Mudlet does it, and a cue takes BASS's effects (the echo,
+reverb, flanger and gargle ChatMUD asks Chatpack for; see bass_effects).
 
 Build it with :func:`make_sound_backend`, which uses BASS when the build has it and an audio
 device opens, and pygame otherwise.
@@ -17,10 +18,10 @@ from __future__ import annotations
 
 import ctypes
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from genericmud.sound import bass_library
+from genericmud.sound import bass_effects, bass_library
 from genericmud.sound.bass_library import (
     ACTIVE_STOPPED,
     ATTRIB_FREQ,
@@ -54,6 +55,16 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 
 @dataclass
+class _Effect:
+    """An effect on a cue. A gargle made from BASS_FX's volume envelope keeps its own settings
+    and the envelope BASS reads."""
+
+    kind: int
+    envelope: bass_effects.GargleEnvelope | None = None
+    settings: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass
 class _Cue:
     """A playing stream and what its callbacks need, which adjust() and fade_away() change."""
 
@@ -63,6 +74,7 @@ class _Cue:
     fade_in: float = 0.0  # seconds, each time round
     end: int = 0  # byte position it ends at each time round
     fading_away: bool = False
+    effects: dict[int, _Effect] = field(default_factory=dict)  # by BASS's handle for each
 
 
 class BassSoundBackend(SoundBackend):
@@ -225,6 +237,77 @@ class BassSoundBackend(SoundBackend):
         if cue is not None:
             self._bass.BASS_ChannelFlags(cue.stream, SAMPLE_LOOP if loop else 0, SAMPLE_LOOP)
 
+    def add_effect(
+        self, channel: str, kind: int, settings: dict[str, float] | None = None,
+        priority: int = 0,
+    ) -> int:
+        """Put one of BASS's DirectX 8 effects on the cue playing on ``channel`` (``kind`` is
+        BASS's number for it, as in bass_effects), with ``settings`` by BASS's names; settings
+        BASS refuses leave it at its own. Answers BASS's handle for the effect, or 0 when
+        nothing plays there or BASS can't have that effect here. Gargle, which BASS lacks off
+        Windows, is made from BASS_FX's volume envelope there."""
+        cue = self._cue_for(channel)
+        if cue is None or kind not in bass_effects.SETTINGS:
+            return 0
+        bass = self._bass
+        handle = bass.BASS_ChannelSetFX(cue.stream, kind, priority)
+        if handle:
+            cue.effects[handle] = _Effect(kind=kind)
+        elif kind == bass_effects.DX8_GARGLE:
+            handle = self._envelope_gargle(cue, priority)
+        if not handle:
+            self._trace_effect(kind, "MISSING", error=bass.BASS_ErrorGetCode())
+            return 0
+        if settings:
+            self.set_effect(channel, handle, settings)
+        return handle
+
+    def set_effect(self, channel: str, effect: int, settings: dict[str, float]) -> bool:
+        """Change the settings named, by BASS's names, of an effect on the cue playing on
+        ``channel``. False when it isn't there, or BASS refuses a value, which leaves every
+        setting as it was."""
+        cue = self._cue_for(channel)
+        found = cue.effects.get(effect) if cue is not None else None
+        if found is None:
+            return False
+        bass = self._bass
+        if found.envelope is not None:
+            return self._set_envelope_gargle(cue, effect, found, settings)
+        structure = bass_effects.STRUCTURES[found.kind]()
+        if not bass.BASS_FXGetParameters(effect, ctypes.byref(structure)):
+            return False
+        bass_effects.write_settings(structure, found.kind, settings)
+        return bool(bass.BASS_FXSetParameters(effect, ctypes.byref(structure)))
+
+    def effect_settings(self, channel: str, effect: int) -> dict[str, float] | None:
+        """An effect's settings by BASS's names, or None when it isn't there."""
+        cue = self._cue_for(channel)
+        found = cue.effects.get(effect) if cue is not None else None
+        if found is None:
+            return None
+        if found.envelope is not None:
+            return dict(found.settings)
+        structure = bass_effects.STRUCTURES[found.kind]()
+        if not self._bass.BASS_FXGetParameters(effect, ctypes.byref(structure)):
+            return None
+        return bass_effects.read_settings(structure, found.kind)
+
+    def remove_effect(self, channel: str, effect: int) -> None:
+        cue = self._cue_for(channel)
+        if cue is not None and cue.effects.pop(effect, None) is not None:
+            self._bass.BASS_ChannelRemoveFX(cue.stream, effect)
+
+    def reset_effects(self, channel: str, effect: int = 0) -> None:
+        """Clear what an effect has built up (an echo still sounding), or every effect's on the
+        cue when ``effect`` is 0."""
+        cue = self._cue_for(channel)
+        if cue is None:
+            return
+        if effect == 0:
+            self._bass.BASS_FXReset(cue.stream)
+        elif effect in cue.effects:
+            self._bass.BASS_FXReset(effect)
+
     def source_info(self, file: str) -> SourceInfo | None:
         """What ``file`` holds, read by opening it to decode and closing it again."""
         bass = self._bass
@@ -241,6 +324,41 @@ class BassSoundBackend(SoundBackend):
             return SourceInfo(seconds=seconds, rate=details.freq, channels=details.chans)
         finally:
             bass.BASS_StreamFree(stream)
+
+    def _envelope_gargle(self, cue: _Cue, priority: int) -> int:
+        """Gargle the cue with BASS_FX's volume envelope, at DirectX's own settings; answers
+        the envelope's handle, or 0 when BASS_FX isn't there either."""
+        bass = self._bass
+        handle = bass.BASS_ChannelSetFX(cue.stream, bass_effects.BFX_VOLUME_ENV, priority)
+        if not handle:
+            return 0
+        found = _Effect(kind=bass_effects.DX8_GARGLE)
+        if not self._set_envelope_gargle(cue, handle, found, bass_effects.GARGLE_DEFAULTS):
+            bass.BASS_ChannelRemoveFX(cue.stream, handle)
+            return 0
+        cue.effects[handle] = found
+        return handle
+
+    def _set_envelope_gargle(
+        self, cue: _Cue, handle: int, found: _Effect, settings: dict[str, float],
+    ) -> bool:
+        """Give a gargle made from the volume envelope new settings, refusing what DirectX
+        refuses: a rate outside 1 to 1000 Hz, or a wave shape other than 0 or 1."""
+        chosen = dict(found.settings or bass_effects.GARGLE_DEFAULTS)
+        chosen.update({name: settings[name] for name in chosen if name in settings})
+        rate = chosen["dwRateHz"]
+        shape = chosen["dwWaveShape"]
+        if not isinstance(rate, (int, float)) or not 1 <= rate <= 1000 or shape not in (0, 1):
+            return False
+        bass = self._bass
+        length = bass.BASS_ChannelGetLength(cue.stream, POS_BYTE)
+        seconds = bass.BASS_ChannelBytes2Seconds(cue.stream, length)
+        envelope = bass_effects.gargle_envelope(rate, shape, seconds)
+        if not bass.BASS_FXSetParameters(handle, ctypes.byref(envelope.settings)):
+            return False
+        found.envelope = envelope
+        found.settings = {"dwRateHz": int(rate), "dwWaveShape": int(shape)}
+        return True
 
     def _cue_for(self, channel: str) -> _Cue | None:
         cue = self._cues.get(channel)
@@ -370,6 +488,10 @@ class BassSoundBackend(SoundBackend):
     def _free(self, cue: _Cue | None) -> None:
         if cue is not None:
             self._bass.BASS_StreamFree(cue.stream)  # stops it too; one that ended is gone already
+
+    def _trace_effect(self, kind: int, result: str, **fields: object) -> None:
+        if self._diag is not None:
+            self._diag.event("backend.effect", kind=kind, result=result, **fields)
 
     def _trace(self, file: str, result: str, **fields: object) -> None:
         if self._diag is not None:

@@ -15,6 +15,13 @@ sounds by their length; a stand-in that said "playing" for ever, at position 0, 
 What would take a pack outside its own folder, or run its code, is refused the way BASS refuses
 things: a URL stream answers "can't open", a plugin (Chatpack's bass_aac) gets a pretend handle
 since BASS here decodes AAC itself where the system can, and an EAX environment answers "no EAX".
+
+Effects go on for real. Chatpack's AddFX(effect, settings) puts BASS's DirectX 8 effects on a
+stream by the wrapper's names for their settings (left_delay, wet_dry_mix), and ChatMUD's GMCP
+Client.Media.FX reaches it as addFx, lower case, which the wrapper doesn't have, so on Windows it
+fails; here it does what ChatMUD meant. A setting the effect doesn't have is passed over without
+the wrapper's printed list of the ones it does (ChatMUD's GMCP always sends one, the sound's key).
+An effect stays on its stream when the stream is played again, as in BASS.
 """
 
 from __future__ import annotations
@@ -22,11 +29,16 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from genericmud.sound import bass_effects
+
 # BASS's numbers, from bass.h.
 _OK = 0
 _ERROR_FILEOPEN = 2
 _ERROR_HANDLE = 5
+_ERROR_ILLTYPE = 19
+_ERROR_ILLPARAM = 20
 _ERROR_NOEAX = 22
+_ERROR_NOFX = 34
 _ATTRIB_FREQ = 1
 _ATTRIB_VOL = 2
 _ATTRIB_PAN = 3
@@ -44,6 +56,41 @@ _PLUGIN_HANDLE = 1  # what PluginLoad answers: a plugin "loaded", since none is 
 # Attribute names, as Toastush's older wrapper takes them (its BASS:SetAttribute(stream, "volume",
 # 0.5) looks the name up in its constants).
 _ATTRIBUTES = {"frequency": _ATTRIB_FREQ, "volume": _ATTRIB_VOL, "pan": _ATTRIB_PAN}
+# The wrapper's names for each effect's settings (Chatpack's fxparameters, which ChatMUD's GMCP
+# uses too), and BASS's.
+_MODULATION_SETTINGS = {
+    "wet_dry_mix": "fWetDryMix", "depth": "fDepth", "feedback": "fFeedback",
+    "frequency": "fFrequency", "waveform": "lWaveform", "delay": "fDelay", "phase": "lPhase",
+}
+_EFFECT_SETTINGS = {
+    bass_effects.DX8_CHORUS: _MODULATION_SETTINGS,
+    bass_effects.DX8_COMPRESSOR: {
+        "gain": "fGain", "attack": "fAttack", "release": "fRelease",
+        "threshold": "fThreshold", "ratio": "fRatio", "predelay": "fPredelay",
+    },
+    bass_effects.DX8_DISTORTION: {
+        "gain": "fGain", "edge": "fEdge", "post_eq_center_frequency": "fPostEQCenterFrequency",
+        "post_eq_bandwidth": "fPostEQBandwidth", "pre_lowpass_cutoff": "fPreLowpassCutoff",
+    },
+    bass_effects.DX8_ECHO: {
+        "wet_dry_mix": "fWetDryMix", "feedback": "fFeedback", "left_delay": "fLeftDelay",
+        "right_delay": "fRightDelay", "pan_delay": "lPanDelay",
+    },
+    bass_effects.DX8_FLANGER: _MODULATION_SETTINGS,
+    bass_effects.DX8_GARGLE: {"rate_hz": "dwRateHz", "wave_shape": "dwWaveShape"},
+    bass_effects.DX8_I3DL2REVERB: {
+        "room": "lRoom", "room_hf": "lRoomHF", "room_rolloff_factor": "flRoomRolloffFactor",
+        "decay_time": "flDecayTime", "decay_hf_ratio": "flDecayHFRatio",
+        "reflections": "lReflections", "reflections_delay": "flReflectionsDelay",
+        "reverb": "lReverb", "reverb_delay": "flReverbDelay", "diffusion": "flDiffusion",
+        "density": "flDensity", "hf_reference": "flHFReference",
+    },
+    bass_effects.DX8_PARAMEQ: {"center": "fCenter", "bandwidth": "fBandwidth", "gain": "fGain"},
+    bass_effects.DX8_REVERB: {
+        "in_gain": "fInGain", "reverb_mix": "fReverbMix", "reverb_time": "fReverbTime",
+        "high_frequency_rt_ratio": "fHighFreqRTRatio",
+    },
+}
 # What a stream whose file couldn't be measured is taken to hold: CD-quality stereo.
 _DEFAULT_RATE = 44100
 _DEFAULT_CHANNELS = 2
@@ -94,6 +141,16 @@ class _SoundData:
 
 
 @dataclass
+class _StreamEffect:
+    """An effect a pack put on a stream, kept so it goes on again each time the stream plays."""
+
+    kind: int
+    priority: int
+    settings: dict[str, float] = field(default_factory=dict)  # by BASS's names, as last set
+    handle: int = 0  # the effect on the cue playing now, 0 before the stream has played
+
+
+@dataclass
 class _Stream:
     """One stream a pack created, and the cue it plays as."""
 
@@ -110,6 +167,7 @@ class _Stream:
     repeats: int = 1  # a stream data is put into plays the data this many times
     started: bool = False
     freed: bool = False
+    effects: list[_StreamEffect] = field(default_factory=list)
 
     @property
     def bytes_per_second(self) -> int:
@@ -248,7 +306,10 @@ class BassWrapper:
             "GetData": lambda *_a: _SoundData(stream.file),
             "PutData": call(self._put_data),
             "Update": lambda *_a: _OK,
-            "FXReset": lambda *_a: _OK,
+            "SetFX": call(self._set_fx),
+            "AddFX": call(self._add_fx),
+            "addFx": call(self._add_fx),  # ChatMUD's spelling; see the module's notes
+            "FXReset": call(self._reset_effects),
             "OnReachedEnd": lambda *_a: None,
         })
 
@@ -298,6 +359,10 @@ class BassWrapper:
         )
         if stream.frequency:
             self.api.adjust(stream.channel, frequency=stream.frequency)
+        for effect in stream.effects:  # a new cue: its effects go on again
+            effect.handle = self.api.add_effect(
+                stream.channel, effect.kind, effect.settings or None, effect.priority
+            )
         return _OK
 
     def _pause(self, stream: _Stream, *_args) -> int:
@@ -385,6 +450,133 @@ class BassWrapper:
             self.api.set_looping(stream.channel, bool(changed & _SAMPLE_LOOP))
         stream.flags = changed
         return changed
+
+    # --- effects ---
+
+    def _new_effect(self, stream: _Stream, effect, priority) -> _StreamEffect | int:
+        """Put an effect on ``stream``: on its cue now when it has one, else when it plays.
+        Answers the effect, or BASS's error code when it can't be had."""
+        kind = self.to_number(effect)
+        if kind is None or int(kind) not in bass_effects.SETTINGS:
+            return _ERROR_ILLTYPE
+        entry = _StreamEffect(kind=int(kind), priority=int(self.to_number(priority) or 0))
+        if stream.started:
+            entry.handle = self.api.add_effect(stream.channel, entry.kind, None, entry.priority)
+            if not entry.handle:
+                if self._state(stream) == _ACTIVE_STOPPED:
+                    return _ERROR_HANDLE  # it has ended, and BASS has freed it
+                return _ERROR_NOFX
+            entry.settings = self.api.effect_settings(stream.channel, entry.handle) or {}
+        stream.effects.append(entry)
+        return entry
+
+    def _set_fx(self, stream: _Stream, effect=None, priority=0):
+        entry = self._new_effect(stream, effect, priority)
+        if isinstance(entry, int):
+            return entry
+        return self._effect_object(stream, entry)
+
+    def _add_fx(self, stream: _Stream, effect=None, options=None, *_args) -> None:
+        """Chatpack's AddFX: put on an effect with the settings named, by the wrapper's names in
+        any case."""
+        entry = self._new_effect(stream, effect, 0)
+        if isinstance(entry, int):
+            return
+        self._change_effect(stream, entry, self._bass_settings(entry.kind, options))
+
+    def _bass_settings(self, kind: int, table) -> dict[str, float]:
+        """An effect's settings from a Lua table by the wrapper's names, in any case, as BASS
+        names them. Names the effect doesn't have, and values that aren't numbers, are left
+        out."""
+        names = _EFFECT_SETTINGS[kind]
+        chosen = {}
+        if table is None or not hasattr(table, "items"):
+            return chosen
+        for key, value in table.items():
+            name = names.get(str(key).lower())
+            amount = value if isinstance(value, bool) else self.to_number(value)
+            if name is not None and amount is not None:
+                chosen[name] = amount
+        return chosen
+
+    def _change_effect(self, stream: _Stream, entry: _StreamEffect, settings: dict) -> int:
+        """New settings for an effect, by BASS's names. Answers BASS's code for fine, or for an
+        illegal parameter when it refuses one, which leaves them all as they were."""
+        if not settings:
+            return _OK
+        if not entry.handle:
+            entry.settings.update(settings)  # BASS checks them when the stream plays
+            return _OK
+        if not self.api.set_effect(stream.channel, entry.handle, settings):
+            return _ERROR_ILLPARAM
+        entry.settings = self.api.effect_settings(stream.channel, entry.handle) or {
+            **entry.settings, **settings
+        }
+        return _OK
+
+    def _reset_effects(self, stream: _Stream, *_args) -> int:
+        self.api.reset_effects(stream.channel)
+        return _OK
+
+    def _effect_object(self, stream: _Stream, entry: _StreamEffect):
+        """The object SetFX answers: its Parameters by the wrapper's names, which Update puts
+        on, and Remove and Reset."""
+        names = _EFFECT_SETTINGS[entry.kind]
+        parameters = self.lua.table()
+
+        def show() -> None:
+            for wrapper_name, bass_name in names.items():
+                parameters[wrapper_name] = entry.settings.get(bass_name, 0)
+
+        def set_parameters(_object, table=None, *_args) -> int:
+            return self._change_effect(stream, entry, self._bass_settings(entry.kind, table))
+
+        def get_parameters(_object, *_args) -> int:
+            if entry.handle:
+                entry.settings = (
+                    self.api.effect_settings(stream.channel, entry.handle) or entry.settings
+                )
+            show()
+            return _OK
+
+        def update(_object, *_args) -> int:
+            chosen = self._bass_settings(entry.kind, parameters)
+            result = self._change_effect(stream, entry, chosen)
+            get_parameters(_object)
+            return result
+
+        def remove(_object, *_args) -> int:
+            if entry in stream.effects:
+                stream.effects.remove(entry)
+            if entry.handle:
+                self.api.remove_effect(stream.channel, entry.handle)
+                entry.handle = 0
+            return _OK
+
+        def reset(_object, *_args) -> int:
+            if entry.handle:
+                self.api.reset_effects(stream.channel, entry.handle)
+            return _OK
+
+        show()
+        methods = self.lua.table_from({
+            "SetParameters": set_parameters,
+            "GetParameters": get_parameters,
+            "Update": update,
+            "Remove": remove,
+            "Reset": reset,
+        })
+
+        def read(key):
+            fields = {
+                "id": lambda: entry.handle,
+                "channel": lambda: stream.number,
+                "Parameters": lambda: parameters,
+            }
+            getter = fields.get(key)
+            return getter() if getter is not None else _nothing
+
+        return self._make(methods, read, lambda _key, _value: False)
 
     def _length_bytes(self, stream: _Stream, *_args) -> int:
         return self._bytes(stream, stream.seconds * stream.repeats)

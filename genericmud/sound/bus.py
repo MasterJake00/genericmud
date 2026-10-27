@@ -118,6 +118,27 @@ class SoundBackend:
         """What ``file`` holds, without playing it; None when the backend can't tell."""
         return None
 
+    def add_effect(
+        self, channel: str, kind: int, settings: dict[str, float] | None = None,
+        priority: int = 0,
+    ) -> int:
+        """Put one of BASS's DirectX 8 effects on a playing cue (see bass_effects); answers a
+        handle for it, or 0 when the backend can't. Only BASS has effects."""
+        return 0
+
+    def set_effect(self, channel: str, effect: int, settings: dict[str, float]) -> bool:
+        """Change an effect's settings; False when it isn't there or a value is refused."""
+        return False
+
+    def effect_settings(self, channel: str, effect: int) -> dict[str, float] | None:
+        return None
+
+    def remove_effect(self, channel: str, effect: int) -> None:
+        """Take an effect off its cue."""
+
+    def reset_effects(self, channel: str, effect: int = 0) -> None:
+        """Clear what an effect has built up, or every effect's on the cue for 0."""
+
 
 class SoundBus:
     def __init__(self, backend: SoundBackend | None = None, *, master: float = 1.0) -> None:
@@ -261,6 +282,24 @@ class SoundBus:
 
     def source_info(self, file: str) -> SourceInfo | None:
         return self._backend.source_info(file)
+
+    def add_effect(
+        self, channel: str, kind: int, settings: dict[str, float] | None = None,
+        priority: int = 0,
+    ) -> int:
+        return self._backend.add_effect(channel, kind, settings, priority)
+
+    def set_effect(self, channel: str, effect: int, settings: dict[str, float]) -> bool:
+        return self._backend.set_effect(channel, effect, settings)
+
+    def effect_settings(self, channel: str, effect: int) -> dict[str, float] | None:
+        return self._backend.effect_settings(channel, effect)
+
+    def remove_effect(self, channel: str, effect: int) -> None:
+        self._backend.remove_effect(channel, effect)
+
+    def reset_effects(self, channel: str, effect: int = 0) -> None:
+        self._backend.reset_effects(channel, effect)
 
     def flush(self) -> None:
         """Stop every playing category (the sound panic key, e.g. Shift+F11)."""

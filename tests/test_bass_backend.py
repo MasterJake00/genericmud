@@ -12,6 +12,17 @@ import pytest
 
 from genericmud.sound import bass_backend, bass_library
 from genericmud.sound.bass_backend import BassSoundBackend
+from genericmud.sound.bass_effects import (
+    BFX_VOLUME_ENV,
+    DX8_CHORUS,
+    DX8_COMPRESSOR,
+    DX8_DISTORTION,
+    DX8_ECHO,
+    DX8_FLANGER,
+    DX8_GARGLE,
+    DX8_PARAMEQ,
+    DX8_REVERB,
+)
 from genericmud.sound.bass_library import (
     ACTIVE_PLAYING,
     ACTIVE_STOPPED,
@@ -36,9 +47,13 @@ _LENGTH = 10 * _BYTES_PER_SECOND
 class _FakeBass:
     """BASS's functions as the backend calls them, keeping track of every stream."""
 
-    def __init__(self, missing: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self, missing: tuple[str, ...] = (), missing_effects: tuple[int, ...] = ()
+    ) -> None:
         self.missing = missing  # files that "don't exist"
+        self.missing_effects = missing_effects  # effects BASS lacks on this "platform"
         self.streams: dict[int, dict] = {}
+        self.effects: dict[int, dict] = {}  # by effect handle
         self.next_handle = 100
         self.error = 0
 
@@ -96,7 +111,54 @@ class _FakeBass:
         return 1
 
     def BASS_StreamFree(self, stream):  # noqa: N802
+        for effect, state in list(self.effects.items()):
+            if state["stream"] == stream:
+                del self.effects[effect]
         return 1 if self.streams.pop(stream, None) is not None else 0
+
+    def BASS_ChannelSetFX(self, stream, kind, _priority):  # noqa: N802
+        if stream not in self.streams:
+            self.error = 5  # BASS_ERROR_HANDLE
+            return 0
+        if kind in self.missing_effects:
+            self.error = 34  # BASS_ERROR_NOFX
+            return 0
+        self.next_handle += 1
+        self.effects[self.next_handle] = {
+            "stream": stream, "kind": kind, "settings": {}, "resets": 0,
+        }
+        return self.next_handle
+
+    def BASS_FXSetParameters(self, effect, reference):  # noqa: N802
+        state = self.effects.get(effect)
+        if state is None:
+            return 0
+        structure = reference._obj
+        values = {name: getattr(structure, name) for name, _type in structure._fields_}
+        # DirectX's echo takes delays from 1 to 2000 ms, and refuses the lot for one outside.
+        delays = [values.get(name, 1) for name in ("fLeftDelay", "fRightDelay")]
+        if state["kind"] == 3 and not all(1 <= delay <= 2000 for delay in delays):
+            self.error = 20  # BASS_ERROR_ILLPARAM
+            return 0
+        state["settings"] = values
+        return 1
+
+    def BASS_FXGetParameters(self, effect, reference):  # noqa: N802
+        state = self.effects.get(effect)
+        if state is None:
+            return 0
+        for name, value in state["settings"].items():
+            setattr(reference._obj, name, value)
+        return 1
+
+    def BASS_ChannelRemoveFX(self, _stream, effect):  # noqa: N802
+        return 1 if self.effects.pop(effect, None) is not None else 0
+
+    def BASS_FXReset(self, handle):  # noqa: N802
+        for effect, state in self.effects.items():
+            if handle in (effect, state["stream"]):
+                state["resets"] += 1
+        return 1
 
     def BASS_ChannelIsActive(self, stream):  # noqa: N802
         state = self.streams.get(stream)
@@ -383,6 +445,60 @@ def test_the_bus_scales_a_slide_and_takes_a_slide_below_zero_as_a_fade_away():
     assert state["slides"][-1] == (ATTRIB_VOL, -1.0, 1000)
 
 
+def test_an_effect_goes_on_the_playing_cue_with_the_settings_given():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    stream, _state = _only_stream(fake)
+    echo = backend.add_effect("rain", DX8_ECHO, {"fLeftDelay": 250.0, "fRightDelay": 750.0})
+    assert (fake.effects[echo]["stream"], fake.effects[echo]["kind"]) == (stream, DX8_ECHO)
+    settings = backend.effect_settings("rain", echo)
+    assert (settings["fLeftDelay"], settings["fRightDelay"]) == (250.0, 750.0)
+    assert backend.add_effect("idle", DX8_ECHO) == 0  # nothing plays there
+    assert backend.add_effect("rain", 99) == 0  # no such effect
+
+
+def test_a_refused_setting_leaves_every_setting_as_it_was():
+    _fake, backend, _errors = _backend()
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    echo = backend.add_effect("rain", DX8_ECHO, {"fLeftDelay": 250.0, "fRightDelay": 250.0})
+    assert not backend.set_effect("rain", echo, {"fLeftDelay": 5000.0, "fRightDelay": 100.0})
+    settings = backend.effect_settings("rain", echo)
+    assert (settings["fLeftDelay"], settings["fRightDelay"]) == (250.0, 250.0)
+
+
+def test_gargle_is_made_from_a_volume_envelope_where_bass_has_none():
+    # BASS lacks DirectX's gargle off Windows; ChatMUD asks Chatpack for it.
+    fake, backend, _errors = _backend(missing_effects=(DX8_GARGLE,))
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    gargle = backend.add_effect("rain", DX8_GARGLE, {"dwRateHz": 10, "dwWaveShape": 1})
+    assert fake.effects[gargle]["kind"] == BFX_VOLUME_ENV
+    # A square wave: four points in each tenth of a second of the ten-second sound, then one.
+    assert fake.effects[gargle]["settings"]["lNodeCount"] == 4 * 100 + 1
+    assert backend.effect_settings("rain", gargle) == {"dwRateHz": 10, "dwWaveShape": 1}
+    assert not backend.set_effect("rain", gargle, {"dwRateHz": 0})  # DirectX takes 1 to 1000
+    assert backend.effect_settings("rain", gargle)["dwRateHz"] == 10
+
+
+def test_an_effect_bass_lacks_here_answers_0():
+    _fake, backend, _errors = _backend(missing_effects=(DX8_COMPRESSOR,))
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    assert backend.add_effect("rain", DX8_COMPRESSOR) == 0
+
+
+def test_effects_come_off_and_start_afresh():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    echo = backend.add_effect("rain", DX8_ECHO)
+    reverb = backend.add_effect("rain", DX8_REVERB)
+    backend.reset_effects("rain", echo)
+    assert (fake.effects[echo]["resets"], fake.effects[reverb]["resets"]) == (1, 0)
+    backend.reset_effects("rain")
+    assert (fake.effects[echo]["resets"], fake.effects[reverb]["resets"]) == (2, 1)
+    backend.remove_effect("rain", echo)
+    assert list(fake.effects) == [reverb]
+    assert backend.effect_settings("rain", echo) is None
+
+
 # Real BASS, when this machine has it.
 
 _FOLDER = os.environ.get(bass_library.ENVIRONMENT_FOLDER)
@@ -541,3 +657,25 @@ def test_real_bass_pauses_resumes_seeks_and_measures(real_bass, tmp_path):
     assert 1.5 <= backend.position("held") < 1.7
     backend.stop("held")
 
+
+@needs_bass
+def test_real_bass_puts_its_effects_on_a_cue(real_bass, tmp_path):
+    tone = _tone(tmp_path / "tone.wav", seconds=2.0)
+    backend = BassSoundBackend(real_bass.core)
+    backend.play(str(tone), "fx", 1.0, 0.0, True)
+    echo = backend.add_effect("fx", DX8_ECHO, {"fLeftDelay": 250.0, "fRightDelay": 750.0})
+    assert echo
+    settings = backend.effect_settings("fx", echo)
+    assert (settings["fLeftDelay"], settings["fRightDelay"]) == (250.0, 750.0)
+    assert not backend.set_effect("fx", echo, {"fLeftDelay": 5000.0})  # past DirectX's 2 s
+    assert backend.effect_settings("fx", echo)["fLeftDelay"] == 250.0
+    # Gargle is BASS's own on Windows, and made from BASS_FX's volume envelope elsewhere.
+    gargle = backend.add_effect("fx", DX8_GARGLE, {"dwRateHz": 40, "dwWaveShape": 1})
+    assert gargle
+    assert backend.effect_settings("fx", gargle) == {"dwRateHz": 40, "dwWaveShape": 1}
+    for kind in (DX8_CHORUS, DX8_DISTORTION, DX8_FLANGER, DX8_PARAMEQ, DX8_REVERB):
+        assert backend.add_effect("fx", kind), kind
+    backend.reset_effects("fx")
+    backend.remove_effect("fx", echo)
+    assert backend.effect_settings("fx", echo) is None
+    backend.stop("fx")

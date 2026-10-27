@@ -107,6 +107,11 @@ _SIGNATURES = (
     ("BASS_ChannelSeconds2Bytes", _QWORD, (_DWORD, ctypes.c_double)),
     ("BASS_ChannelBytes2Seconds", ctypes.c_double, (_DWORD, _QWORD)),
     ("BASS_ChannelSlideAttribute", _BOOL, (_DWORD, _DWORD, ctypes.c_float, _DWORD)),
+    ("BASS_ChannelSetFX", _DWORD, (_DWORD, _DWORD, ctypes.c_int)),
+    ("BASS_ChannelRemoveFX", _BOOL, (_DWORD, _DWORD)),
+    ("BASS_FXSetParameters", _BOOL, (_DWORD, ctypes.c_void_p)),
+    ("BASS_FXGetParameters", _BOOL, (_DWORD, ctypes.c_void_p)),
+    ("BASS_FXReset", _BOOL, (_DWORD,)),
 )
 
 

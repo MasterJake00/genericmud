@@ -40,7 +40,7 @@ def pack(tmp_path):
     for name in ("hit.ogg", "lp.ogg", "theme.ogg"):
         (tmp_path / "sounds").mkdir(exist_ok=True)
         (tmp_path / "sounds" / name).write_bytes(b"OggS")
-    fake = _FakeBass()
+    fake = _FakeBass(missing_effects=(1,))  # no DirectX compressor, as off Windows
     bus = SoundBus(BassSoundBackend(fake))
     engine = AutomationEngine(_BusSink(bus), sound=bus)
     pack = MushclientPack(ScriptApi(engine, source="m", base_dir=str(tmp_path)))
@@ -72,6 +72,9 @@ def pack(tmp_path):
                 "return table.concat(names, ',') end"
             )(self.bass)
             return set(listed.split(","))
+
+        def table(self, **values):
+            return lua.table_from(values)
 
         def stream(self, file="sounds/hit.ogg", flags=0):
             return caller(self.bass, "StreamCreateFile", False, file, 0, 0, flags)
@@ -198,9 +201,82 @@ def test_a_freed_or_stopped_auto_free_stream_is_gone_as_in_bass(pack):
 
 
 def test_calls_the_stand_in_doesnt_model_answer_fine(pack):
-    stream = pack.stream()
-    assert pack.call(stream, "AddFX", 3, {}) == 0
     assert pack.call(pack.bass, "SetConfig", 0, 1) == 0
+
+
+def _effects(pack, stream_handle=None):
+    """The stand-in BASS's effects, as (kind, settings), on the one stream playing."""
+    handle = stream_handle if stream_handle is not None else pack.playing()[0]
+    return [
+        (state["kind"], state["settings"]) for state in pack.fake.effects.values()
+        if state["stream"] == handle
+    ]
+
+
+def test_chatpack_puts_an_echo_on_by_the_wrappers_setting_names(pack):
+    # Its env command: AddFX(dx8_echo, {left_delay = 1670, right_delay = 750}) on each sound.
+    stream = pack.stream(flags=LOOP)
+    pack.call(stream, "Play")
+    pack.call(stream, "AddFX", 3, pack.table(left_delay=1670, right_delay=750))
+    [(kind, settings)] = _effects(pack)
+    assert kind == 3
+    assert (settings["fLeftDelay"], settings["fRightDelay"]) == (1670, 750)
+
+
+def test_chatmuds_gmcp_effects_reach_the_sound_as_chatmud_meant(pack):
+    # ChatMUD's Client.Media.FX handler calls addFx, lower case, with the GMCP message's own
+    # fields: the sound's key among them, which no effect has.
+    stream = pack.stream(flags=LOOP)
+    pack.call(stream, "Play")
+    pack.call(stream, "addFx", 5, pack.table(key="rain", rate_hz=30, wave_shape=1))
+    [(kind, settings)] = _effects(pack)
+    assert kind == 5
+    assert (settings["dwRateHz"], settings["dwWaveShape"]) == (30, 1)
+
+
+def test_an_effect_put_on_before_playing_comes_on_with_the_sound(pack):
+    stream = pack.stream(flags=LOOP)
+    pack.call(stream, "AddFX", 4, pack.table(Feedback=-20))
+    assert pack.fake.effects == {}
+    pack.call(stream, "Play")
+    [(kind, settings)] = _effects(pack)
+    assert (kind, settings["fFeedback"]) == (4, -20)
+
+
+def test_an_effect_stays_on_a_stream_played_again(pack):
+    stream = pack.stream()  # not auto-free: it can be played again once stopped
+    pack.call(stream, "Play")
+    pack.call(stream, "AddFX", 3, pack.table(left_delay=500, right_delay=500))
+    pack.call(stream, "Stop")
+    pack.call(stream, "Play")
+    [(kind, settings)] = _effects(pack)
+    assert (kind, settings["fLeftDelay"]) == (3, 500)
+
+
+def test_an_effect_that_cant_be_had_answers_basss_error(pack):
+    stream = pack.stream(flags=LOOP)
+    pack.call(stream, "Play")
+    assert pack.call(stream, "SetFX", 1) == 34  # BASS_ERROR_NOFX: no compressor here
+    assert pack.call(stream, "SetFX", 99) == 19  # BASS_ERROR_ILLTYPE
+    pack.call(stream, "AddFX", 1, pack.table(gain=3))  # passed over, as nothing to add to
+    assert _effects(pack) == []
+
+
+def test_setfx_answers_an_effect_whose_parameters_update_and_which_comes_off(pack):
+    stream = pack.stream(flags=LOOP)
+    pack.call(stream, "Play")
+    effect = pack.call(stream, "SetFX", 3)
+    parameters = pack.get(effect, "Parameters")
+    parameters.left_delay = 400
+    parameters.right_delay = 900
+    assert pack.call(effect, "Update") == 0
+    [(_kind, settings)] = _effects(pack)
+    assert (settings["fLeftDelay"], settings["fRightDelay"]) == (400, 900)
+    parameters.left_delay = 9000  # past DirectX's 2 seconds: refused, and put back
+    assert pack.call(effect, "Update") == 20  # BASS_ERROR_ILLPARAM
+    assert parameters.left_delay == 400
+    assert pack.call(effect, "Remove") == 0
+    assert _effects(pack) == []
 
 
 def test_a_class_built_on_the_bass_class_gets_its_methods(pack):
