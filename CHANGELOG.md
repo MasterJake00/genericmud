@@ -7,6 +7,21 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.20.2 — 2026-10-27
+
+**Soundpacks**
+
+* Miriani-Next's room ambience plays. On its default setting it plays only while
+  its window is in front, and genericMud never told it when that was. Packs now
+  hear when their world comes to the front or goes behind, as in MUSHclient: you
+  switching tabs or switching to another program. Chatpack's option to keep
+  sounds out of the background, and the Yu-Gi-Oh pack's option for sounds while
+  its window isn't in front, work too.
+* Packs hear that the MUD is connected once the connection is open, so what a
+  pack sends as it connects reaches the MUD. A connection that fails is no longer
+  announced to them, so Mystavaria and Krinnzenn's pack don't start their music
+  for a MUD that's down.
+
 ## 0.20.1 — 2026-10-27
 
 **Finding in the output**
