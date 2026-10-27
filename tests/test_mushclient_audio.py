@@ -56,6 +56,7 @@ def audio(tmp_path):
             self.fake = fake
             self.sink = sink
             self.api = api
+            self.dll = pack._audio_dll
 
         def __getattr__(self, name):
             return lambda *args: caller(name, *args)
@@ -211,3 +212,12 @@ def test_delayed_plays_answer_nothing_and_play_once(audio):
     audio.sink.run_pending()
     assert not audio.stream("rain.ogg")["flags"] & SAMPLE_LOOP
     assert audio.stream("hit.ogg")["attributes"][ATTRIB_VOL] == pytest.approx(0.6)
+
+
+def test_delayed_sounds_that_have_ended_dont_pile_up(audio):
+    # A pack that only ever plays sounds after a delay keeps no record of the ones that ended.
+    for _ in range(5):
+        audio.playDelay("sounds/hit.ogg", 10)
+        audio.sink.run_pending()
+        audio.fake.end_pass(audio.handle("hit.ogg"))
+    assert len(audio.dll.sounds) <= 1

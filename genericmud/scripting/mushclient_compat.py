@@ -1938,8 +1938,8 @@ class MushclientPack:
         """Provide the ``audio`` global that the LuaAudio packs (Erion, Empire, Mystavaria,
         Cosmic Rage and others) play every sound through: audio.dll's functions, played on the
         sound bus (see mushclient_audio)."""
-        audio = AudioDll(lua=self._lua, api=self._api, to_number=_to_float)
-        self._lua.globals().audio = audio.build()
+        self._audio_dll = AudioDll(lua=self._lua, api=self._api, to_number=_to_float)
+        self._lua.globals().audio = self._audio_dll.build()
 
     def _install_nvda(self) -> None:
         """Provide the ``nvda`` object MushReader.dll would have installed.

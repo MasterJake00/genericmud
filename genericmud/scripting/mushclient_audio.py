@@ -109,7 +109,6 @@ class AudioDll:
         name = "" if file is None else str(file)
         if not name or not self.api.sound_exists(name):
             return 0  # BASS couldn't open it, and the DLL answers 0
-        self._forget_ended()
         level = self._new_level(volume, self.master)
         balance = self._new_pan(pan, self.default_pan)
         looping = self._whole(loop) not in (None, 0)
@@ -267,6 +266,9 @@ class AudioDll:
     # --- keeping track ---
 
     def _add(self, file: str, level: float, looping: bool) -> _Sound:
+        """Record a sound starting now, dropping first the ones that have ended, delayed
+        sounds' included."""
+        self._forget_ended()
         number = self.next_number
         self.next_number += 1
         sound = _Sound(
