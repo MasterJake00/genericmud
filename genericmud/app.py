@@ -562,8 +562,15 @@ class EngineApp:
         self.log_commands = world.log_commands
         self.download_media = world.download_sounds
 
-    def on_connect(self, world: str) -> ActivationResult | None:
-        """The on-connect sequence: register with the hub, activate packs, arm login."""
+    def on_connect(self, world: str, *, socket_open: bool = True) -> ActivationResult | None:
+        """The on-connect sequence: register with the hub, activate packs, arm login.
+
+        Packs hear that the MUD is connected once the connection is open: now when it
+        already is, or when on_socket_open() says so. The window readies packs before it
+        opens the connection, and a connection that fails never says so.
+        """
+        if not socket_open:
+            self.engine.connected = False  # packs' IsConnected(), until it opens
         if self.hub is not None and self.name:
             self.hub.register(self.name, self._dispatch_remote)
         if self.log_automatically:
@@ -586,7 +593,7 @@ class EngineApp:
                 mush=len(self._mush_packs),
             )
         try:
-            self._dispatch_plugin_lifecycle()
+            self._dispatch_plugin_install()
         except Exception as exc:  # noqa: BLE001 - sound hooks must not kill session setup
             if self._diag is not None:
                 self._diag.event(
@@ -598,10 +605,18 @@ class EngineApp:
                 "Soundpack startup hooks failed; sounds may be off.",
                 channel=SYSTEM_CHANNEL, interrupt=False,
             )
-        self._vip_connection_changed(True)
+        if socket_open:
+            self.on_socket_open()
         self.begin_login(world)
         self._check_pack_updates(result)
         return result
+
+    def on_socket_open(self) -> None:
+        """The connection to the MUD is open: packs hear it, as MUSHclient's
+        OnPluginConnect and the world's connect handler, and VIP Mud's OnConnect, once.
+        Anything a pack sends then reaches the MUD."""
+        self.engine.connected = True
+        self._vip_connection_changed(True)
 
     def _check_pack_updates(self, result: ActivationResult | None) -> None:
         """Ask this world's packs' repositories whether they have updates, in the background
@@ -726,21 +741,20 @@ class EngineApp:
 
         self._schedule(_STATE_SAVE_DELAY_SECONDS, save)
 
-    def _dispatch_plugin_lifecycle(self) -> None:
-        """Run each MUSHclient pack's install/connect hooks (MUSHclient calls these
-        itself; packs set their variable defaults in OnPluginInstall -- Erion turns
-        every sound toggle on there, so skipping it leaves the pack gated silent)."""
+    def _dispatch_plugin_install(self) -> None:
+        """Run each MUSHclient pack's install hook (MUSHclient calls it as the world
+        opens; packs set their variable defaults in OnPluginInstall -- Erion turns every
+        sound toggle on there, so skipping it leaves the pack gated silent). Their connect
+        hook follows once the connection is open (on_socket_open)."""
         if not self._mush_packs:
             return
         if self._diag is not None:
             # NB: event()'s first positional is named `stage` -- a stage= kwarg here
             # collides and raises (the 0.6.6 silent-session bug).
-            self._diag.event("plugin.lifecycle", phase="install+connect",
+            self._diag.event("plugin.lifecycle", phase="install",
                              packs=len(self._mush_packs))
         for pack in self._mush_packs:
             pack.dispatch_install()
-            pack.dispatch_connect()
-        self._mush_connected = True
         if self._msdp_offered:  # negotiation happened before packs were ready: replay it
             self._dispatch_msdp_start()
         self._arm_plugin_ticks()

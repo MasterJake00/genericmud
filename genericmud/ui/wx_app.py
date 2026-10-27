@@ -386,7 +386,9 @@ class SessionPanel(wx.Panel):
         if self.world.sounds:  # point @sppath at the world's sound folder before packs load
             self.app.engine.set_var("sppath", self.world.sounds)
             self.app.engine.sounds_dir = self.world.sounds  # and trust it, as packs can't be
-        self.app.on_connect(self.world.name)  # activate packs + arm auto-login before data
+        # Activate packs and arm auto-login before any data; they hear the MUD connected
+        # once the connection opens, below.
+        self.app.on_connect(self.world.name, socket_open=False)
         if self._diag is not None:
             self._diag.event("connect.begin", host=self.world.host, port=self.world.port)
         try:
@@ -397,6 +399,8 @@ class SessionPanel(wx.Panel):
             # Speak it too: connect failure and reconnect both speak, so success staying
             # echo-only was inconsistent and left a quiet MUD's first moment ambiguous.
             self.app.voice.speak(f"Connected to {self.world.name}.", channel="system")
+            # Nothing from the MUD has been read yet: the reading starts once this yields.
+            self.app.on_socket_open()
         except OSError as error:
             if self._diag is not None:
                 self._diag.event("connect.failed", error=str(error))

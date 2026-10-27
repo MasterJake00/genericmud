@@ -1271,3 +1271,79 @@ def test_after_the_output_puts_the_reader_back_at_the_bottom_f3_searches_from_th
         panel.Destroy()
         loop.run_until_complete(asyncio.sleep(0.01))
         loop.close()
+
+
+@pytest.mark.parametrize("connects", [True, False])
+def test_the_window_tells_packs_the_mud_connected_only_once_it_has(frame, monkeypatch, tmp_path,
+                                                                   connects):
+    # Packs are ready before the connection opens, and hear the MUD connected once it has:
+    # what a pack sends on connect reaches the MUD, and a connection that fails is never
+    # announced to them.
+    import asyncio
+
+    from genericmud.packs import PackStore
+    from genericmud.ui import wx_app
+    from tests.helpers import RecordingBackend
+
+    store = PackStore(tmp_path / "store")
+    source = tmp_path / "pack.xml"
+    source.write_text(
+        "<muclient><plugin id='hooks' name='hooks'/><script><![CDATA[\n"
+        "function OnPluginConnect() Note('the pack heard it') Send('hello mud') end\n"
+        "]]></script></muclient>",
+        encoding="latin-1",
+    )
+    store.install(source, world="Test", trust=True)
+    backend = RecordingBackend()
+
+    class _Connection:
+        sent: list[str] = []
+
+        def __init__(self) -> None:
+            self.connected = False
+            self.text_codec = None
+            self._on_event = None
+            self.auto_reconnect = False
+            self.on_status = None
+
+        def peer_address(self) -> str:
+            return ""
+
+        def suppress_reconnect(self, *_args) -> None:
+            pass
+
+        def withdraw_remote(self, *_args) -> None:
+            pass
+
+        async def connect(self, _host, _port, tls=False) -> None:
+            if not connects:
+                raise OSError("Connection refused")
+            self.connected = True
+
+        def send_line(self, text: str) -> None:
+            if not self.connected:
+                raise ConnectionError("not connected")
+            _Connection.sent.append(text)
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+    monkeypatch.setattr(wx_app, "MudConnection", _Connection)
+    monkeypatch.setattr(wx_app, "make_voice_backend", lambda: backend)
+    monkeypatch.setattr(wx_app, "make_sound_backend", lambda **_kwargs: None)
+    loop = asyncio.new_event_loop()
+    panel = wx_app.SessionPanel(frame, loop, {}, World("Test", "mud.example", 4000), packs=store)
+    try:
+        loop.run_until_complete(panel._start_inner())
+        if connects:
+            assert _Connection.sent == ["hello mud"]
+            assert backend.spoken.count("the pack heard it") == 1
+        else:
+            assert _Connection.sent == []
+            assert "the pack heard it" not in backend.spoken
+    finally:
+        panel.app = None
+        panel.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()

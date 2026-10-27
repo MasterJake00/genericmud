@@ -280,6 +280,57 @@ def test_a_mushclient_packs_connect_disconnect_and_close_hooks_follow_the_sessio
     assert second.engine.get_var("volume") == "70"  # saved by its OnPluginSaveState
 
 
+def _connect_hook_pack(store, tmp_path) -> None:
+    _install_mush(
+        store, tmp_path,
+        "<muclient><plugin id='hooks' name='hooks'/><script><![CDATA[\n"
+        "function OnPluginInstall() Note('installed') end\n"
+        "function OnPluginConnect() Note('connected') Send('hello mud') end\n"
+        "]]></script></muclient>",
+    )
+
+
+def test_packs_hear_the_mud_connected_once_the_connection_opens(tmp_path):
+    # The window gets packs ready before it opens the connection. MUSHclient calls
+    # OnPluginConnect, and VIP Mud OnConnect, once the MUD is there: a pack that sends
+    # something on connect had it dropped, sent to a connection not yet open.
+    store = PackStore(tmp_path / "store")
+    _connect_hook_pack(store, tmp_path)
+    vip = tmp_path / "vip.set"
+    vip.write_text("#alias OnConnect {#say greetings}\n", encoding="latin-1")
+    store.install(vip, world="vip", trust=True)
+    sent: list[str] = []
+    backend = RecordingBackend()
+    voice = VoiceRouter(backend, clock=lambda: 0.0)
+    app = EngineApp(voice, packs=store, name="mud", send=sent.append)
+    app.on_connect("mud", socket_open=False)
+    assert "installed" in backend.spoken
+    assert "connected" not in backend.spoken
+    assert sent == []
+    app.on_socket_open()
+    assert backend.spoken.count("connected") == 1
+    assert sent == ["hello mud"]
+    vip_backend = RecordingBackend()
+    vip_app = EngineApp(VoiceRouter(vip_backend, clock=lambda: 0.0), packs=store, name="vip")
+    vip_app.on_connect("vip", socket_open=False)
+    assert "greetings" not in vip_backend.spoken
+    vip_app.on_socket_open()
+    assert "greetings" in vip_backend.spoken
+
+
+def test_packs_never_hear_connected_when_the_connection_fails(tmp_path):
+    # Mystavaria starts its music when it hears the MUD connected; a MUD that's down never
+    # connects, so its music mustn't start. A later reconnect is heard once.
+    store = PackStore(tmp_path / "store")
+    _connect_hook_pack(store, tmp_path)
+    backend = RecordingBackend()
+    app = EngineApp(VoiceRouter(backend, clock=lambda: 0.0), packs=store, name="mud")
+    app.on_connect("mud", socket_open=False)
+    assert "connected" not in backend.spoken
+    app.on_connection_status("reconnected")
+    assert backend.spoken.count("connected") == 1
+
+
 def test_simulate_sends_text_through_triggers_the_output_and_speech(tmp_path):
     # Mush-Z strips its zchn: channel prefix and simulates the rest, so its other triggers
     # catch the line as if the MUD had sent it without one.
