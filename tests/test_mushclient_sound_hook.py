@@ -5,6 +5,8 @@ are MUSHclient's rules for it, from its PlaySoundFile."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from genericmud.automation.engine import AutomationEngine
@@ -69,7 +71,7 @@ def test_a_sound_played_inside_the_hook_plays_as_usual(tmp_path):
     sink, engine, pack = _pack(tmp_path, _listener("taker", 'Sound("beep.ogg")'))
     pack._execute_lua('Sound("sounds/door.ogg")')
     assert engine.get_var("heard_taker") == "sounds/door.ogg;"
-    assert [entry["file"].rsplit("/", 1)[-1] for entry in sink.played] == ["beep.ogg"]
+    assert [Path(entry["file"]).name for entry in sink.played] == ["beep.ogg"]
 
 
 def test_a_triggers_sound_goes_to_the_plugin_too(tmp_path):
