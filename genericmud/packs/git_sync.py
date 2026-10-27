@@ -22,7 +22,12 @@ modification time, so the next update can tell a file the player changed from on
 changed, and needn't hash a gigabyte to see that nothing moved. The first update of a pack has
 no baseline, so it can't tell those apart; it keeps the files players commonly change (world
 files, MUSHclient's settings, plugin state, logs) and refreshes the rest, as Miriani-Next's own
-updater does.
+updater does. A baseline that's there but damaged stops the update rather than being taken for
+a first one.
+
+A download can take a while, and the player may change a file meanwhile: every file is looked
+at again just before it's replaced or deleted, and one that changed since the plan was made is
+the player's.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import fnmatch
 import hashlib
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +49,10 @@ _READ_CHUNK = 1 << 20  # hash files a megabyte at a time
 _WRITTEN = "w"  # the updater wrote or confirmed this file
 _UPDATER_FILES = (".gm_git", ".gm-update-")  # its baseline, check marker and scratch folder
 _KEPT = "k"  # the player's own copy, kept over the pack's
+_SCRATCH_PREFIX = ".gm-update-"  # a file being written, before it's moved into place
+# Characters that end a line somewhere (str.splitlines splits on all of them): a path with one
+# can't be a line of the baseline.
+_LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
 # Kept on a pack's first update even when they differ from the repository: they're what a
 # player or MUSHclient itself changes. Miriani-Next's updater never overwrites these either.
@@ -50,6 +60,10 @@ _PROTECTED_PATTERNS = (
     "*.mcl", "*.ini", "*.cfg", "*.conf", "*.config", "*.db", "*.sqlite", "*.sqlite3",
     "*/state/*", "*/logs/*", "*/settings/*", "logs/*", "settings/*",
 )
+
+
+class BaselineDamaged(Exception):
+    """The baseline file is there but isn't one genericMud wrote, or not all of it."""
 
 
 @dataclass(frozen=True)
@@ -88,6 +102,9 @@ class Plan:
     remove: list[str] = field(default_factory=list)  # gone upstream, unchanged here
     kept: list[str] = field(default_factory=list)  # gone upstream, but changed here
     local_only: int = 0  # files the repository doesn't have and the updater never wrote
+    # How each file the plan writes over, deletes or vouches for looked when it was planned:
+    # (size, modification time), or None when it wasn't there. Checked again just before.
+    seen: dict[str, tuple[int, int] | None] = field(default_factory=dict)
 
     @property
     def up_to_date(self) -> bool:
@@ -134,17 +151,23 @@ def matches_blob(path: Path, sha: str) -> bool:
 
 
 def read_baseline(pack_dir: Path) -> Baseline | None:
-    """The baseline the last update left, or None when the pack has never been updated
-    this way (or the file isn't one genericMud wrote)."""
+    """The baseline the last update left, or None when the pack has never been updated this
+    way. One that's there but unreadable raises BaselineDamaged: without it the player's
+    changes can't be told from the pack's, so an update mustn't guess."""
     path = Path(pack_dir) / BASELINE_NAME
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
+    except (OSError, UnicodeDecodeError) as error:
+        raise BaselineDamaged(f"it can't be read ({error})") from error
+    lines = text.split("\n")  # only "\n": a path may hold any other character
+    if lines[-1] == "":
+        lines.pop()
     if not lines or lines[0] != _BASELINE_HEADER:
-        return None
+        raise BaselineDamaged("it doesn't begin the way genericMud writes it")
     baseline = Baseline()
-    for line in lines[1:]:
+    for number, line in enumerate(lines[1:], start=2):
         if line.startswith("# "):
             key, _, value = line[2:].partition(" ")
             if key in ("repo", "commit", "prefix"):
@@ -152,11 +175,12 @@ def read_baseline(pack_dir: Path) -> Baseline | None:
             continue
         # "<sha> <size> <mtime_ns> <owner> <path>": the path is the rest, spaces and all.
         parts = line.split(" ", 4)
-        if len(parts) != 5 or not parts[1].isdigit() or not parts[2].isdigit():
-            continue
+        if (
+            len(parts) != 5 or not parts[1].isdigit() or not parts[2].isdigit()
+            or parts[3] not in (_WRITTEN, _KEPT)
+        ):
+            raise BaselineDamaged(f"line {number} isn't one genericMud writes")
         sha, size, mtime_ns, owner, repo_path = parts
-        if owner not in (_WRITTEN, _KEPT):
-            continue
         baseline.entries[repo_path] = BaselineEntry(sha, int(size), int(mtime_ns), owner)
     return baseline
 
@@ -170,18 +194,55 @@ def write_baseline(pack_dir: Path, baseline: Baseline) -> None:
         f"# prefix {baseline.prefix}",
     ]
     for repo_path in sorted(baseline.entries):
+        if _LINE_BREAKS.intersection(repo_path):
+            continue  # it would add lines of its own; the file list never lets one through
         entry = baseline.entries[repo_path]
         lines.append(f"{entry.sha} {entry.size} {entry.mtime_ns} {entry.owner} {repo_path}")
-    path = Path(pack_dir) / BASELINE_NAME
-    temporary = path.with_name(path.name + ".part")
-    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    _write_new_file(Path(pack_dir) / BASELINE_NAME, ("\n".join(lines) + "\n").encode("utf-8"))
+
+
+def _write_new_file(target: Path, data: bytes) -> None:
+    """Write ``data`` to a freshly created file beside ``target`` and move it into place.
+
+    The scratch file gets a new, unguessable name and is created exclusively, so nothing that
+    was already there (a link out of the pack, a file of the player's) is ever written through.
+    """
+    handle, scratch = tempfile.mkstemp(prefix=_SCRATCH_PREFIX, suffix=".part", dir=target.parent)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        os.replace(scratch, target)
+    except BaseException:
+        Path(scratch).unlink(missing_ok=True)
+        raise
 
 
 def entry_for(path: Path, sha: str, owner: str = _WRITTEN) -> BaselineEntry:
     """A baseline entry for a file just written or checked to be blob ``sha``."""
     status = path.stat()
     return BaselineEntry(sha, status.st_size, status.st_mtime_ns, owner)
+
+
+def _snapshot(path: Path) -> tuple[int, int] | None:
+    """A file's size and modification time, or None when there's no file there."""
+    try:
+        status = path.stat()
+    except OSError:
+        return None
+    if not path.is_file():
+        return None
+    return status.st_size, status.st_mtime_ns
+
+
+def _inside(pack_dir: Path, relative: str) -> Path | None:
+    """``relative`` in the pack folder, or None when it would land outside it.
+
+    The path goes through the folder rather than to wherever its links resolve, so a link in
+    the pack is itself replaced or deleted, never the file it points at.
+    """
+    if safepath.confine(pack_dir, relative) is None:
+        return None
+    return Path(pack_dir) / relative.replace("\\", "/")
 
 
 def _still_as_recorded(path: Path, entry: BaselineEntry) -> bool:
@@ -225,6 +286,7 @@ def make_plan(
         local = safepath.confine(pack_dir, prefix + repo_path)
         if local is None:
             continue  # a path that would land outside the pack is never written or counted
+        plan.seen[repo_path] = _snapshot(_inside(pack_dir, prefix + repo_path))
         if not local.is_file():
             plan.download[repo_path] = sha
             continue
@@ -253,6 +315,7 @@ def make_plan(
             continue
         if not recorded.kept and _local_matches(local, recorded.sha, recorded):
             plan.remove.append(repo_path)
+            plan.seen[repo_path] = _snapshot(_inside(pack_dir, prefix + repo_path))
         else:
             plan.kept.append(repo_path)
 
@@ -278,10 +341,14 @@ class Applied:
     removed: list[str] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)  # blobs that never arrived
     in_use: list[str] = field(default_factory=list)  # open elsewhere (a sound playing), left as is
+    failed: list[str] = field(default_factory=list)  # couldn't be written; tried again next time
+    # A folder where the file goes, or a file where one of its folders goes: no retry fixes it.
+    blocked: list[str] = field(default_factory=list)
+    kept: list[str] = field(default_factory=list)  # dropped upstream, but changed meanwhile
 
     @property
     def complete(self) -> bool:
-        return not self.missing and not self.in_use
+        return not self.missing and not self.in_use and not self.failed
 
 
 def apply_plan(
@@ -297,27 +364,42 @@ def apply_plan(
     """Carry out ``plan`` with the fetched ``blobs`` (hash -> file), then save the baseline.
 
     Each file is written to a temporary name and moved into place, so an interrupted update
-    leaves every file either old or new, never half-written. The baseline is saved only when
-    every blob arrived, so an update that stopped short simply runs again.
+    leaves every file either old or new, never half-written. A file that changed since the plan
+    was made is the player's: it stays, and the pack's version goes beside it as .new. The
+    baseline is saved only when every blob arrived and everything that can be retried was
+    written, so an update that stopped short simply runs again.
     """
     pack_dir = Path(pack_dir)
     applied = Applied()
+    entries: dict[str, BaselineEntry] = {}  # the new baseline, filled in as files land
+    players: set[str] = set(plan.modified) | set(plan.held)
 
     # The pack's files: written in place, or beside the player's copy as .new.
     for repo_path, sha in plan.download.items():
+        target = _inside(pack_dir, prefix + repo_path)
+        if target is not None and _snapshot(target) != plan.seen.get(repo_path):
+            players.add(repo_path)  # the player changed it while the update downloaded
+            outcome = _place(pack_dir, prefix + repo_path + NEW_SUFFIX, blobs.get(sha))
+            _record(applied, applied.new_versions, repo_path, outcome)
+            continue
         outcome = _place(pack_dir, prefix + repo_path, blobs.get(sha))
         _record(applied, applied.written, repo_path, outcome)
+        if outcome == _PLACED:
+            entries[repo_path] = entry_for(target, sha)
     for repo_path, sha in plan.modified.items():
         outcome = _place(pack_dir, prefix + repo_path + NEW_SUFFIX, blobs.get(sha))
         _record(applied, applied.new_versions, repo_path, outcome)
 
     # Files the repository dropped that are still as the updater left them.
     for repo_path in plan.remove:
-        local = safepath.confine(pack_dir, prefix + repo_path)
-        if local is None or not local.is_file():
+        target = _inside(pack_dir, prefix + repo_path)
+        if target is None or _snapshot(target) is None:
+            continue
+        if _snapshot(target) != plan.seen.get(repo_path):
+            applied.kept.append(repo_path)  # changed while the update ran: the player's now
             continue
         try:
-            local.unlink()
+            target.unlink()
         except OSError:
             applied.in_use.append(repo_path)
             continue
@@ -326,16 +408,21 @@ def apply_plan(
     if not applied.complete:
         return applied
 
-    # The new baseline: what's now the pack's, and what's the player's.
+    # The rest of the baseline: the player's files, and the pack's that were right already.
     baseline = Baseline(repo=repo, commit=commit, prefix=prefix)
     for repo_path, sha in remote.items():
-        local = safepath.confine(pack_dir, prefix + repo_path)
-        if local is None or not local.is_file():
+        target = _inside(pack_dir, prefix + repo_path)
+        if target is None or _snapshot(target) is None:
             continue
-        if repo_path in plan.modified or repo_path in plan.held:
-            baseline.entries[repo_path] = entry_for(local, sha, _KEPT)
+        if repo_path in entries:
+            baseline.entries[repo_path] = entries[repo_path]
+        elif repo_path in players:
+            baseline.entries[repo_path] = entry_for(target, sha, _KEPT)
+        elif _snapshot(target) == plan.seen.get(repo_path) or matches_blob(target, sha):
+            baseline.entries[repo_path] = entry_for(target, sha)
         else:
-            baseline.entries[repo_path] = entry_for(local, sha)
+            # Checked when the plan was made, changed since: the player's, not the pack's.
+            baseline.entries[repo_path] = entry_for(target, sha, _KEPT)
     write_baseline(pack_dir, baseline)
     return applied
 
@@ -343,6 +430,8 @@ def apply_plan(
 _PLACED = "placed"
 _NO_BLOB = "missing"
 _IN_USE = "in use"
+_FAILED = "failed"
+_BLOCKED = "blocked"
 
 
 def _place(pack_dir: Path, relative: str, blob: Path | None) -> str:
@@ -353,24 +442,38 @@ def _place(pack_dir: Path, relative: str, blob: Path | None) -> str:
     """
     if blob is None:
         return _NO_BLOB
-    target = safepath.confine(pack_dir, relative)
+    target = _inside(pack_dir, relative)
     if target is None:
-        return _NO_BLOB
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(target.name + ".part")
-    shutil.copyfile(blob, temporary)
+        return _BLOCKED
+    if target.is_dir() and not target.is_symlink():
+        return _BLOCKED  # a folder of the same name is where the file goes
     try:
-        os.replace(temporary, target)
+        target.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
-        temporary.unlink(missing_ok=True)
+        return _BLOCKED  # a file is where one of its folders goes
+    try:
+        handle, scratch = tempfile.mkstemp(
+            prefix=_SCRATCH_PREFIX, suffix=".part", dir=target.parent
+        )
+    except OSError:
+        return _FAILED
+    try:
+        with os.fdopen(handle, "wb") as stream, blob.open("rb") as source:
+            shutil.copyfileobj(source, stream, _READ_CHUNK)
+    except OSError:
+        Path(scratch).unlink(missing_ok=True)
+        return _FAILED
+    try:
+        os.replace(scratch, target)
+    except OSError:
+        Path(scratch).unlink(missing_ok=True)
         return _IN_USE
     return _PLACED
 
 
 def _record(applied: Applied, done: list[str], repo_path: str, outcome: str) -> None:
-    if outcome == _PLACED:
-        done.append(repo_path)
-    elif outcome == _IN_USE:
-        applied.in_use.append(repo_path)
-    else:
-        applied.missing.append(repo_path)
+    lists = {
+        _PLACED: done, _IN_USE: applied.in_use, _FAILED: applied.failed,
+        _BLOCKED: applied.blocked, _NO_BLOB: applied.missing,
+    }
+    lists[outcome].append(repo_path)

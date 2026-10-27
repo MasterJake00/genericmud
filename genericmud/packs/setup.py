@@ -8,8 +8,10 @@ so it is testable headless; the caller persists the returned world and connects.
 
 from __future__ import annotations
 
+import os
 import re
 import tempfile
+import threading
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -338,6 +340,8 @@ class GitUpdateResult:
     removed: int = 0
     new_versions: list[str] = field(default_factory=list)  # player's files, .new beside
     in_use: list[str] = field(default_factory=list)  # open elsewhere, updated next time
+    failed: list[str] = field(default_factory=list)  # couldn't be written, tried next time
+    blocked: list[str] = field(default_factory=list)  # something of the same name in the way
     # The files themselves, as the repository names them: a pack's own updater told the
     # pack which ones changed, and Miriani-Next lists them atop its changelog.
     written_files: list[str] = field(default_factory=list)
@@ -365,16 +369,40 @@ def check_pack_update(
         tree = list_tree(source.repo_url)
     except git_remote.RemoteError as error:
         raise PackError(f"couldn't check {source.name} for updates: {error}") from error
-    baseline = git_sync.read_baseline(pack_dir)
+    baseline = _read_baseline(pack_dir, source)
     plan = git_sync.make_plan(tree.files, pack_dir, prefix, baseline)
     if plan.up_to_date:
         return None
     return PendingUpdate(pack_id, source.name, len(plan.download) + len(plan.modified))
 
 
+def _read_baseline(pack_dir: Path, source: UpdateSource) -> git_sync.Baseline | None:
+    try:
+        return git_sync.read_baseline(pack_dir)
+    except git_sync.BaselineDamaged as error:
+        raise PackError(
+            f"genericMud's record of which {source.name} files it installed is damaged "
+            f"({error}), so it can't tell your changes from the pack's, and nothing was "
+            f"changed. To update anyway, delete {git_sync.BASELINE_NAME} in the pack's "
+            "folder: your settings files will be kept, but other files you changed will be "
+            "replaced."
+        ) from error
+
+
+# One update of a pack folder at a time: two worlds that share a pack can both ask at once.
+_UPDATE_LOCKS: dict[str, threading.Lock] = {}
+_UPDATE_LOCKS_GUARD = threading.Lock()
+
+
+def _update_lock(pack_dir: Path) -> threading.Lock:
+    key = os.path.normcase(str(Path(pack_dir).resolve()))
+    with _UPDATE_LOCKS_GUARD:
+        return _UPDATE_LOCKS.setdefault(key, threading.Lock())
+
+
 def describe_update(result: GitUpdateResult) -> str:
     """What updating a pack from its repository did, in a sentence or three."""
-    if result.up_to_date and not result.in_use:
+    if result.up_to_date and not result.in_use and not result.failed and not result.blocked:
         return f"{result.name} is up to date."
     changes = [f"{result.written} {'file' if result.written == 1 else 'files'} updated"]
     if result.removed:
@@ -400,6 +428,20 @@ def describe_update(result: GitUpdateResult) -> str:
             f"{busy} {'file was' if busy == 1 else 'files were'} in use; update again after "
             "you reconnect to finish."
         )
+    failed = len(result.failed)
+    if failed:
+        lines.append(
+            f"{failed} {'file' if failed == 1 else 'files'} couldn't be written; check there's "
+            "space on the disk, then update again to finish."
+        )
+    blocked = len(result.blocked)
+    if blocked:
+        named = ", ".join(result.blocked[:5])
+        more = f" and {blocked - 5} more" if blocked > 5 else ""
+        lines.append(
+            f"{blocked} {'file' if blocked == 1 else 'files'} couldn't go in place, because a "
+            f"file or folder of the same name is in the way: {named}{more}."
+        )
     lines.append("Reconnect to apply.")
     return " ".join(lines)
 
@@ -421,6 +463,17 @@ def update_pack_from_git(
     manifest = store.manifest(pack_id)
     pack_dir = store.pack_dir(pack_id)
     prefix = _repository_prefix(manifest.entry, source)
+    with _update_lock(pack_dir):
+        return _update_from(
+            pack_id, pack_dir, prefix, source,
+            progress=progress, diag=diag, list_tree=list_tree, fetch_blobs=fetch_blobs,
+        )
+
+
+def _update_from(
+    pack_id: str, pack_dir: Path, prefix: str, source: UpdateSource, *,
+    progress, diag, list_tree, fetch_blobs,
+) -> GitUpdateResult:
     try:
         tree = list_tree(source.repo_url)
     except git_remote.RemoteError as error:
@@ -430,7 +483,7 @@ def update_pack_from_git(
             f"{source.name}'s repository no longer has {source.entry}, so genericMud won't "
             "update it from there. Please report this."
         )
-    baseline = git_sync.read_baseline(pack_dir)
+    baseline = _read_baseline(pack_dir, source)
     plan = git_sync.make_plan(tree.files, pack_dir, prefix, baseline)
     if plan.up_to_date and baseline is not None and baseline.commit == tree.commit:
         return GitUpdateResult(name=source.name, up_to_date=True)
@@ -448,7 +501,9 @@ def update_pack_from_git(
         diag.event(
             "pack.git_update", id=pack_id, commit=tree.commit, written=len(applied.written),
             new_versions=len(applied.new_versions), removed=len(applied.removed),
-            missing=len(applied.missing), local_only=plan.local_only,
+            missing=len(applied.missing), failed=len(applied.failed),
+            blocked=len(applied.blocked), kept=len(applied.kept),
+            local_only=plan.local_only, skipped=list(tree.skipped)[:20],
         )
     if applied.missing:
         raise PackError(
@@ -462,6 +517,8 @@ def update_pack_from_git(
         removed=len(applied.removed),
         new_versions=applied.new_versions,
         in_use=applied.in_use,
+        failed=applied.failed,
+        blocked=applied.blocked,
         written_files=applied.written,
         removed_files=applied.removed,
     )

@@ -425,3 +425,75 @@ def test_an_install_that_doesnt_line_up_with_its_repository_isnt_touched(tmp_pat
         )
     assert fetched == []
     assert git_sources.update_source("toastush") is not None
+
+
+def test_two_worlds_updating_one_pack_take_turns(tmp_path):
+    # Two worlds can share a pack, and each can ask for an update at the same moment.
+    import threading
+    import time
+
+    from genericmud.packs import git_sources
+    from genericmud.packs.setup import update_pack_from_git
+
+    store = _git_installed(tmp_path, {"worlds/Miriani.MCL": b"<world/>", "a.lua": b"old"})
+    list_tree, fetch_blobs, _fetched = _fake_remote(
+        {"worlds/Miriani.MCL": b"<world/>", "a.lua": b"new"}
+    )
+    inside = []
+    overlapped = []
+
+    def slow_list(url):
+        inside.append(1)
+        if len(inside) > 1:
+            overlapped.append(True)
+        time.sleep(0.2)
+        inside.pop()
+        return list_tree(url)
+
+    source = git_sources.update_source("toastush")
+    results = []
+
+    def update():
+        results.append(update_pack_from_git(
+            store, "toastush", source, list_tree=slow_list, fetch_blobs=fetch_blobs,
+        ))
+
+    threads = [threading.Thread(target=update) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert overlapped == []
+    assert sorted(result.up_to_date for result in results) == [False, True]
+
+
+def test_a_damaged_record_stops_the_update_and_says_how_to_go_on(tmp_path):
+    from genericmud.packs import git_sources, git_sync
+    from genericmud.packs.setup import check_pack_update, update_pack_from_git
+
+    store = _git_installed(tmp_path, {"worlds/Miriani.MCL": b"<world/>", "a.lua": b"mine"})
+    (store.pack_dir("toastush") / git_sync.BASELINE_NAME).write_text("garbage\n", "utf-8")
+    list_tree, fetch_blobs, fetched = _fake_remote(
+        {"worlds/Miriani.MCL": b"<world/>", "a.lua": b"theirs"}
+    )
+    source = git_sources.update_source("toastush")
+    with pytest.raises(PackError, match="damaged.*delete .gm_git.lst"):
+        update_pack_from_git(
+            store, "toastush", source, list_tree=list_tree, fetch_blobs=fetch_blobs,
+        )
+    with pytest.raises(PackError, match="damaged"):
+        check_pack_update(store, "toastush", source, list_tree=list_tree)
+    assert fetched == []
+    assert (store.pack_dir("toastush") / "a.lua").read_bytes() == b"mine"
+
+
+def test_an_update_says_what_couldnt_go_in_place():
+    from genericmud.packs.setup import GitUpdateResult, describe_update
+
+    said = describe_update(GitUpdateResult(
+        "Toastush", True, failed=["a.ogg"], blocked=["maps/town.lua", "music"],
+    ))
+    assert "1 file couldn't be written; check there's space on the disk" in said
+    assert "2 files couldn't go in place" in said and "maps/town.lua, music" in said
+    assert "is up to date" not in said
+

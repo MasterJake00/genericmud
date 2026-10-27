@@ -7,8 +7,10 @@ network.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import time
+import zlib
 from email.message import Message
 from pathlib import Path
 
@@ -190,8 +192,8 @@ def test_the_listing_is_refused_when_a_folder_is_missing(serve, monkeypatch):
     serve(_repository({"sounds/a.ogg": b"a", "sounds/b.ogg": b"b"}))
     real_objects = git_remote._objects
 
-    def without_trees_below_the_root(pack_file: Path):
-        for item in real_objects(pack_file):
+    def without_trees_below_the_root(pack_file: Path, limits):
+        for item in real_objects(pack_file, limits):
             if isinstance(item, Tree) and b"a.ogg" in [entry.path for entry in item.items()]:
                 continue
             yield item
@@ -199,3 +201,107 @@ def test_the_listing_is_refused_when_a_folder_is_missing(serve, monkeypatch):
     monkeypatch.setattr(git_remote, "_objects", without_trees_below_the_root)
     with pytest.raises(git_remote.RemoteError, match="incomplete"):
         git_remote.list_tree(REPO_URL)
+
+
+class _Endless:
+    """A response that never stops sending."""
+
+    status = 200
+    headers = Message()
+
+    def read(self, amount=None):
+        return b"x" * (amount or 1_000_000)
+
+    def geturl(self):
+        return REPO_URL
+
+    def close(self):
+        pass
+
+
+def test_reading_a_whole_response_stops_at_the_budget():
+    # dulwich reads some replies whole; one that never ends used to be read until memory ran
+    # out, the budget only counting it afterwards.
+    response = git_remote._Response(_Endless(), REPO_URL, git_remote._Budget(1_000_000))
+    with pytest.raises(git_remote.RemoteError, match="more data"):
+        response.read()
+
+
+def test_a_server_that_trickles_or_dawdles_is_given_up_on():
+    now = [0.0]
+    trickle = git_remote._Budget(10**9, seconds=600, clock=lambda: now[0])
+    for _second in range(60):
+        now[0] += 1
+        trickle.spend(1)  # a byte a second is fine for the first minute
+    now[0] += 1
+    with pytest.raises(git_remote.RemoteError, match="too slowly"):
+        trickle.spend(1)
+    now[0] = 0.0
+    steady = git_remote._Budget(10**12, seconds=600, clock=lambda: now[0])
+    now[0] = 601
+    with pytest.raises(git_remote.RemoteError, match="too long"):
+        steady.spend(10**9)
+
+
+def test_a_file_that_would_inflate_past_the_limit_is_refused_before_inflating(
+    serve, tmp_path, monkeypatch
+):
+    # Three megabytes of zeros compress to a few kilobytes: the byte budget doesn't see them.
+    zeros = b"\0" * (3 * 1024 * 1024)
+    serve(_advertising_blobs(_repository({"big.ogg": zeros}), zeros))
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("the pack was inflated before its sizes were checked")
+
+    monkeypatch.setattr(git_remote.PackData, "from_file", never)
+    limits = git_remote._Limits(object_bytes=1024 * 1024, total_bytes=1 << 30, objects=1000)
+    with pytest.raises(git_remote.RemoteError, match="bigger than"):
+        git_remote.fetch_blobs(REPO_URL, [git_sync.blob_sha(zeros)], tmp_path, limits=limits)
+
+
+def _pack_object(kind: int, payload: bytes, base: bytes = b"") -> bytes:
+    """One object of a git pack: its type and size header, a delta's base, zlib data."""
+    size = len(payload)
+    header = bytearray([(kind << 4) | (size & 0x0F)])
+    size >>= 4
+    while size:
+        header[-1] |= 0x80
+        header.append(size & 0x7F)
+        size >>= 7
+    return bytes(header) + base + zlib.compress(payload)
+
+
+def _delta_size(size: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = size & 0x7F
+        size >>= 7
+        out.append(byte | (0x80 if size else 0))
+        if not size:
+            return bytes(out)
+
+
+def test_a_delta_that_would_rebuild_something_huge_is_refused(tmp_path):
+    # A delta says how big the object it rebuilds is; a few bytes of copy instructions can
+    # make that gigabytes out of a small file.
+    base = _pack_object(3, b"x" * 100)
+    delta = _pack_object(6, _delta_size(100) + _delta_size(2**31), base=bytes([len(base)]))
+    body = b"PACK" + (2).to_bytes(4, "big") + (2).to_bytes(4, "big") + base + delta
+    pack_file = tmp_path / "huge.pack"
+    pack_file.write_bytes(body + hashlib.sha1(body).digest())
+    with pytest.raises(git_remote.RemoteError, match="bigger than"):
+        git_remote._check_sizes(pack_file, git_remote.FETCH_LIMITS)
+
+
+def test_names_no_file_could_safely_have_are_left_out(serve):
+    # A line break would add lines to the baseline, a colon writes to a hidden part of another
+    # file on Windows, and Windows drops a trailing space ("settings.ini " is settings.ini).
+    files = {
+        "good.ogg": b"g", "bad\nname.ogg": b"b", "settings.ini ": b"s", "con.ogg": b"c",
+        "a:b.ogg": b"a", "odd:folder/inner.ogg": b"i",
+    }
+    serve(_repository(files))
+    tree = git_remote.list_tree(REPO_URL)
+    assert set(tree.files) == {"good.ogg"}
+    assert len(tree.skipped) == 5
+

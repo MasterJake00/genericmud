@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from genericmud.packs import git_sync
 from genericmud.packs.git_sync import Baseline, blob_sha, make_plan
 
@@ -27,13 +29,36 @@ def test_a_windows_checkout_matches_the_repositorys_blob(tmp_path):
     assert not git_sync.matches_blob(path, blob_sha(b"Note('a')\nNote('c')\n"))
 
 
-def test_the_baseline_round_trips_and_ignores_files_it_did_not_write(tmp_path):
+def test_the_baseline_round_trips_and_a_damaged_one_is_not_taken_for_none(tmp_path):
+    # No baseline means a first update, which overwrites files it can't tell apart; a damaged
+    # one mustn't be taken for that, or a later update overwrites the player's changes.
+    assert git_sync.read_baseline(tmp_path) is None
     baseline = Baseline(repo="https://example.com/pack", commit="abc", prefix="wrapped/")
     baseline.entries["sounds/a b.ogg"] = git_sync.BaselineEntry("1" * 40, 12, 345)
     git_sync.write_baseline(tmp_path, baseline)
     assert git_sync.read_baseline(tmp_path) == baseline
-    (tmp_path / git_sync.BASELINE_NAME).write_text("something else\n", encoding="utf-8")
-    assert git_sync.read_baseline(tmp_path) is None
+    path = tmp_path / git_sync.BASELINE_NAME
+    for damage in (
+        "something else\n",
+        path.read_text(encoding="utf-8") + "not an entry\n",
+        path.read_text(encoding="utf-8").replace(" w ", " x "),
+    ):
+        path.write_text(damage, encoding="utf-8")
+        with pytest.raises(git_sync.BaselineDamaged):
+            git_sync.read_baseline(tmp_path)
+    path.write_bytes(b"\xff\xfe not text")
+    with pytest.raises(git_sync.BaselineDamaged):
+        git_sync.read_baseline(tmp_path)
+
+
+def test_a_path_with_a_line_break_cannot_add_lines_to_the_baseline(tmp_path):
+    baseline = Baseline()
+    baseline.entries["a.lua"] = git_sync.BaselineEntry("1" * 40, 1, 2)
+    forged = "x\n" + "2" * 40 + " 3 4 w settings.ini"
+    baseline.entries[forged] = git_sync.BaselineEntry("3" * 40, 5, 6)
+    baseline.entries["y\u2028z"] = git_sync.BaselineEntry("4" * 40, 7, 8)
+    git_sync.write_baseline(tmp_path, baseline)
+    assert set(git_sync.read_baseline(tmp_path).entries) == {"a.lua"}
 
 
 def test_a_first_update_downloads_what_differs_and_leaves_the_rest(tmp_path):
@@ -194,3 +219,128 @@ def test_a_file_in_use_is_left_for_next_time(tmp_path, monkeypatch):
     assert (pack / "music.ogg").read_bytes() == b"old tune"
     assert not list(pack.glob("*.part"))
     assert git_sync.read_baseline(pack) is None  # the next update tries it again
+
+
+
+def test_a_link_named_like_a_scratch_file_cannot_redirect_a_write(tmp_path):
+    # The scratch file used to be "<name>.part", opened without a care for what was there: a
+    # link of that name sent the pack's bytes out of the pack.
+    pack = tmp_path / "pack"
+    pack.mkdir()
+    outside = _write(tmp_path / "outside", b"player data")
+    try:
+        (pack / "a.lua.part").symlink_to(outside)
+        (pack / git_sync.BASELINE_NAME).with_name(git_sync.BASELINE_NAME + ".part").symlink_to(
+            outside
+        )
+    except OSError:
+        pytest.skip("this system can't make symlinks")
+    _write(pack / "notes.txt.part", b"a file of the player's")
+    remote = {"a.lua": blob_sha(b"new"), "notes.txt": blob_sha(b"notes")}
+    plan = make_plan(remote, pack, "", None)
+    applied = git_sync.apply_plan(
+        pack, "", plan, _blobs(tmp_path, b"new", b"notes"), repo="r", commit="c", remote=remote,
+    )
+    assert applied.complete
+    assert outside.read_bytes() == b"player data"
+    assert (pack / "a.lua").read_bytes() == b"new"
+    assert (pack / "notes.txt.part").read_bytes() == b"a file of the player's"
+    assert set(git_sync.read_baseline(pack).entries) == {"a.lua", "notes.txt"}
+
+
+def _planned(tmp_path: Path, files: dict[str, bytes], remote_files: dict[str, bytes]):
+    """A pack the updater wrote (``files``, with a baseline) and a plan to bring it up to
+    ``remote_files``."""
+    pack = tmp_path / "pack"
+    baseline = Baseline()
+    for name, data in files.items():
+        baseline.entries[name] = git_sync.entry_for(_write(pack / name, data), blob_sha(data))
+    remote = {name: blob_sha(data) for name, data in remote_files.items()}
+    return pack, remote, make_plan(remote, pack, "", baseline)
+
+
+def test_an_edit_made_while_the_update_downloads_is_kept(tmp_path):
+    pack, remote, plan = _planned(tmp_path, {"a.lua": b"old"}, {"a.lua": b"new"})
+    assert plan.download == {"a.lua": remote["a.lua"]}
+    _edit(pack / "a.lua", b"the player's edit, made during the download")
+    applied = git_sync.apply_plan(
+        pack, "", plan, _blobs(tmp_path, b"new"), repo="r", commit="c", remote=remote,
+    )
+    assert (pack / "a.lua").read_bytes() == b"the player's edit, made during the download"
+    assert (pack / "a.lua.new").read_bytes() == b"new"
+    assert applied.new_versions == ["a.lua"] and applied.written == []
+    assert git_sync.read_baseline(pack).entries["a.lua"].kept
+
+
+def test_a_file_edited_while_the_update_downloads_is_not_recorded_as_the_packs(tmp_path):
+    # It was right when the plan was made; recording its new size and time against the pack's
+    # hash would let the next update overwrite the player's edit.
+    pack, remote, plan = _planned(
+        tmp_path, {"same.lua": b"same", "b.lua": b"b"}, {"same.lua": b"same", "b.lua": b"b2"},
+    )
+    assert plan.unchanged == ["same.lua"]
+    _edit(pack / "same.lua", b"edited meanwhile")
+    git_sync.apply_plan(
+        pack, "", plan, _blobs(tmp_path, b"b2"), repo="r", commit="c", remote=remote,
+    )
+    remote["same.lua"] = blob_sha(b"same, v2")
+    later = make_plan(remote, pack, "", git_sync.read_baseline(pack))
+    assert later.modified == {"same.lua": remote["same.lua"]}
+    assert later.download == {}
+
+
+def test_a_dropped_file_edited_while_the_update_downloads_is_not_deleted(tmp_path):
+    pack, remote, plan = _planned(tmp_path, {"gone.lua": b"x", "a.lua": b"a"}, {"a.lua": b"a"})
+    assert plan.remove == ["gone.lua"]
+    _edit(pack / "gone.lua", b"the player's now")
+    applied = git_sync.apply_plan(pack, "", plan, {}, repo="r", commit="c", remote=remote)
+    assert (pack / "gone.lua").read_bytes() == b"the player's now"
+    assert applied.kept == ["gone.lua"] and applied.removed == []
+
+
+def test_something_in_the_way_is_reported_and_the_rest_still_lands(tmp_path):
+    # The repository has "maps/town.lua" where the pack has a file "maps", and "music" where
+    # the pack has a folder: neither can go in, and they mustn't stop everything else.
+    pack = tmp_path / "pack"
+    _write(pack / "maps", b"a file, not a folder")
+    (pack / "music").mkdir(parents=True)
+    remote = {
+        "maps/town.lua": blob_sha(b"town"), "music": blob_sha(b"tune"), "a.lua": blob_sha(b"a"),
+    }
+    plan = make_plan(remote, pack, "", None)
+    applied = git_sync.apply_plan(
+        pack, "", plan, _blobs(tmp_path, b"town", b"tune", b"a"),
+        repo="r", commit="c", remote=remote,
+    )
+    assert sorted(applied.blocked) == ["maps/town.lua", "music"]
+    assert applied.written == ["a.lua"] and applied.complete
+    assert set(git_sync.read_baseline(pack).entries) == {"a.lua"}
+    assert (pack / "maps").read_bytes() == b"a file, not a folder"
+
+
+def test_a_link_in_the_pack_is_replaced_or_removed_itself_not_what_it_points_at(tmp_path):
+    pack = tmp_path / "pack"
+    _write(pack / "real.ogg", b"real")
+    try:
+        (pack / "link.ogg").symlink_to(pack / "real.ogg")
+        (pack / "old.ogg").symlink_to(pack / "real.ogg")
+    except OSError:
+        pytest.skip("this system can't make symlinks")
+    # Written: the repository has a file where the pack has a link.
+    remote = {"real.ogg": blob_sha(b"real"), "link.ogg": blob_sha(b"l")}
+    plan = make_plan(remote, pack, "", None)
+    assert plan.download == {"link.ogg": remote["link.ogg"]}
+    git_sync.apply_plan(
+        pack, "", plan, _blobs(tmp_path, b"l"), repo="r", commit="c", remote=remote,
+    )
+    assert not (pack / "link.ogg").is_symlink()
+    assert (pack / "link.ogg").read_bytes() == b"l"
+    assert (pack / "real.ogg").read_bytes() == b"real"
+    # Removed: the repository dropped a file the updater recorded, which here is a link.
+    baseline = git_sync.read_baseline(pack)
+    baseline.entries["old.ogg"] = git_sync.entry_for(pack / "old.ogg", blob_sha(b"real"))
+    plan = make_plan(remote, pack, "", baseline)
+    assert plan.remove == ["old.ogg"]
+    git_sync.apply_plan(pack, "", plan, {}, repo="r", commit="c", remote=remote)
+    assert not (pack / "old.ogg").is_symlink() and not (pack / "old.ogg").exists()
+    assert (pack / "real.ogg").read_bytes() == b"real"

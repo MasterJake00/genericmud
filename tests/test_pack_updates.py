@@ -75,15 +75,32 @@ def test_a_pack_with_an_update_says_so_once_a_day(tmp_path):
     assert calls == ["toastush", "toastush"]
 
 
-def test_a_host_thats_down_is_asked_again_next_connect_without_a_word(tmp_path):
-    def unreachable(_store, _pack_id, _source):
+def test_a_host_thats_down_is_asked_again_an_hour_later_without_a_word(tmp_path):
+    # Not on every reconnect, which could be minutes apart, and not a whole day later.
+    asked = []
+
+    def unreachable(_store, pack_id, _source):
+        asked.append(pack_id)
         raise PackError("couldn't check Toastush for updates: the host is busy")
 
-    updates, said, _clock, _calls = _updates(tmp_path, check=unreachable)
+    updates, said, clock, _calls = _updates(tmp_path, check=unreachable)
     updates.check_due(["toastush"])
-    updates.check_due(["toastush"])
+    clock.now += 10 * 60
+    updates.check_due(["toastush"])  # ten minutes later: not yet
+    assert asked == ["toastush"]
+    clock.now += 50 * 60
+    updates.check_due(["toastush"])  # an hour on: again
+    assert asked == ["toastush", "toastush"]
     assert said == []
-    assert not (tmp_path / "store" / "packs" / "toastush" / ".gm_git.checked").exists()
+
+
+def test_an_update_that_cant_start_doesnt_leave_updates_stuck(tmp_path):
+    # Without a running loop nothing can run in the background; "already being installed"
+    # from then on would be a lie.
+    updates, said, _clock, _calls = _updates(tmp_path, runner=lambda job, done: False)
+    updates.install(["toastush"])
+    updates.install(["toastush"])
+    assert "Soundpack updates are already being installed." not in said
 
 
 def test_update_installs_and_says_what_it_did(tmp_path):

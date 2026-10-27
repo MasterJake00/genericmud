@@ -27,25 +27,28 @@ from genericmud.packs.setup import (
 from genericmud.packs.store import PackError, PackStore
 
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60  # each pack's repository is asked at most once a day
+RETRY_SECONDS = 60 * 60  # a check that failed (the host down) is tried again an hour later
 CHECKED_NAME = ".gm_git.checked"  # in the pack folder: when it was last checked
 
 # How a job runs off the app's loop: run_in_background(job, done) calls job() somewhere else and
-# then done(result or the exception it raised) back on the loop.
-Runner = Callable[[Callable[[], object], Callable[[object], None]], None]
+# then done(result or the exception it raised) back on the loop. It answers False when it can't
+# run the job at all.
+Runner = Callable[[Callable[[], object], Callable[[object], None]], object]
 # Told what an install did, pack by pack, once it's been announced: (results, quiet).
 Installed = Callable[[dict[str, GitUpdateResult], bool], None]
 
 
-def run_in_thread(job: Callable[[], object], done: Callable[[object], None]) -> None:
+def run_in_thread(job: Callable[[], object], done: Callable[[object], None]) -> bool:
     """Run ``job`` on a daemon thread and hand its outcome to ``done`` on the calling loop.
 
     Without a running loop (a headless test or tool driving the app by hand) there's nowhere
-    to report to, so nothing runs: update checks belong to a session that's actually up.
+    to report to, so nothing runs and this answers False: update checks belong to a session
+    that's actually up.
     """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        return
+        return False
 
     def run() -> None:
         try:
@@ -55,6 +58,7 @@ def run_in_thread(job: Callable[[], object], done: Callable[[object], None]) -> 
         loop.call_soon_threadsafe(done, outcome)
 
     threading.Thread(target=run, name="pack-update", daemon=True).start()
+    return True
 
 
 class PackUpdates:
@@ -106,7 +110,12 @@ class PackUpdates:
                     pending = self._check(self._store, pack_id, source)
                 except PackError as error:
                     self._trace("pack.update_check", id=pack_id, result="failed", error=str(error))
-                    continue  # a host that's down is asked again tomorrow, quietly
+                    # A host that's down is asked again in an hour, quietly: not on every
+                    # reconnect, and not a whole day later.
+                    self._mark_checked(
+                        pack_id, at=self._clock() - CHECK_INTERVAL_SECONDS + RETRY_SECONDS
+                    )
+                    continue
                 self._mark_checked(pack_id)
                 self._trace(
                     "pack.update_check", id=pack_id,
@@ -194,7 +203,8 @@ class PackUpdates:
                 reports.append(describe_update(result))
             return reports, results
 
-        self._run(job, lambda outcome: self._report_installed(outcome, quiet))
+        if self._run(job, lambda outcome: self._report_installed(outcome, quiet)) is False:
+            self._busy = False  # it couldn't start, so nothing is being installed
 
     def _targets(self, pack_ids: Iterable[str]) -> list[tuple[str, git_sources.UpdateSource]]:
         """The packs that come from a repository genericMud can update them from."""
@@ -229,9 +239,10 @@ class PackUpdates:
             return True
         return self._clock() - checked >= CHECK_INTERVAL_SECONDS
 
-    def _mark_checked(self, pack_id: str) -> None:
+    def _mark_checked(self, pack_id: str, *, at: float | None = None) -> None:
+        when = self._clock() if at is None else at
         try:
-            self._marker(pack_id).write_text(f"{self._clock():.0f}\n", encoding="utf-8")
+            self._marker(pack_id).write_text(f"{when:.0f}\n", encoding="utf-8")
         except OSError:
             pass  # unwritable: it's checked again next connect, no harm done
 
