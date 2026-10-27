@@ -16,16 +16,21 @@ build-windows.yml because it needs MSBuild. Run: ``python tools/build_app.py``.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 APP_NAME = "genericMud"
 ENTRY = "run_genericmud.py"
+BASS_FOLDER = Path("build/bass")  # where tools/fetch_bass.py puts BASS for a build
+_LIBRARY_SUFFIXES = (".dll", ".so", ".dylib")
 
 
-def pyinstaller_args(platform: str) -> list[str]:
+def pyinstaller_args(platform: str, bass_folder: Path | None = None) -> list[str]:
     """The PyInstaller argv for ``platform`` (``sys.platform`` value).
 
     Pure so the freeze contract (windowed, bundled data, right separator, right hidden
-    imports) can be asserted without actually running a multi-minute build.
+    imports) can be asserted without actually running a multi-minute build. ``bass_folder``
+    holds the BASS audio library the app plays through; its files go in the app's "bass"
+    folder, where genericmud/sound/bass_library.py looks.
     """
     separator = ";" if platform == "win32" else ":"  # PyInstaller --add-data host convention
     args = [
@@ -61,6 +66,10 @@ def pyinstaller_args(platform: str) -> list[str]:
         args += ["--osx-bundle-identifier", "space.thealvernaz.genericmud"]
     # The Linux fallback is speech-dispatcher's `spd-say` (a runtime command, not a bundled
     # module), so there's nothing extra to collect there.
+    if bass_folder is not None:
+        for path in sorted(bass_folder.iterdir()):
+            kind = "--add-binary" if path.suffix in _LIBRARY_SUFFIXES else "--add-data"
+            args += [kind, f"{path}{separator}bass"]
     args.append(ENTRY)
     return args
 
@@ -68,7 +77,11 @@ def pyinstaller_args(platform: str) -> list[str]:
 def main() -> None:
     import PyInstaller.__main__
 
-    PyInstaller.__main__.run(pyinstaller_args(sys.platform))
+    bass_folder = BASS_FOLDER if BASS_FOLDER.is_dir() else None
+    if bass_folder is None:
+        # The app still runs, through pygame, but packs lose what BASS gives them.
+        print(f"Building without BASS: run tools/fetch_bass.py {BASS_FOLDER} first.")
+    PyInstaller.__main__.run(pyinstaller_args(sys.platform, bass_folder))
 
 
 if __name__ == "__main__":

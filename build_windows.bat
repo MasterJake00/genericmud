@@ -10,6 +10,8 @@ where uv >nul 2>nul || (
   exit /b 1
 )
 uv sync --no-dev --extra gui --extra voice --extra audio --extra package || exit /b 1
+REM BASS, the audio library the app plays through, checked against pinned checksums.
+uv run --no-dev python tools\fetch_bass.py build\bass || exit /b 1
 REM Build from genericMud.spec, never from run_genericmud.py + flags: passing the
 REM script makes PyInstaller regenerate (overwrite) the spec, which silently drops
 REM the hand-written bits collect_all can't express -- notably prism's

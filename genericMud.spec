@@ -18,6 +18,16 @@ tmp_ret = collect_all('pygame')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('lupa')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# BASS, the audio library the app plays through, into the app's "bass" folder where
+# genericmud/sound/bass_library.py looks. tools/fetch_bass.py build/bass puts it here.
+bass_folder = os.path.join(SPECPATH, 'build', 'bass')
+if os.path.isdir(bass_folder):
+    for name in sorted(os.listdir(bass_folder)):
+        path = os.path.join(bass_folder, name)
+        if name.endswith(('.dll', '.so', '.dylib')):
+            binaries.append((path, 'bass'))
+        else:
+            datas.append((path, 'bass'))
 
 
 a = Analysis(

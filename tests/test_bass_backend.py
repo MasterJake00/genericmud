@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -249,3 +250,23 @@ def test_real_bass_repeats_a_cue_the_number_of_times_asked(real_bass, tmp_path):
         total += got
     core.BASS_StreamFree(stream)
     assert total == length * 3
+
+
+_SOUNDS = Path(__file__).parent / "data" / "sounds"
+# One of each kind of sound the Soundpack Vault's packs ship (tiny tones made with ffmpeg).
+# AAC is Chatpack's .m4a: Windows and macOS decode it themselves; Linux needs an add-on
+# genericMud doesn't carry.
+_KINDS = sorted(path.name for path in _SOUNDS.iterdir())
+
+
+@needs_bass
+@pytest.mark.parametrize("name", _KINDS)
+def test_real_bass_decodes_every_kind_of_sound_packs_ship(real_bass, name):
+    if name.endswith(".m4a") and sys.platform.startswith("linux"):
+        pytest.skip("AAC needs BASS's GPL add-on on Linux")
+    core = real_bass.core
+    path, flags = bass_library.path_argument(str(_SOUNDS / name))
+    stream = core.BASS_StreamCreateFile(False, path, 0, 0, flags | bass_library.STREAM_DECODE)
+    assert stream, f"{name}: BASS error {core.BASS_ErrorGetCode()}"
+    assert core.BASS_ChannelGetLength(stream, 0) > 0
+    core.BASS_StreamFree(stream)

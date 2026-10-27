@@ -29,7 +29,13 @@ jobs:
           node-version: '22'
       - name: Install
         run: uv sync --all-extras --locked
+      # BASS, the audio library the app plays through, pinned by checksum in the script.
+      # The tests below run against it too.
+      - name: Fetch BASS
+        run: uv run python tools/fetch_bass.py build/bass
       - name: Test Python
+        env:
+          GENERICMUD_BASS_DIR: build/bass
         run: uv run pytest -q
       - name: Test web input
         run: |
@@ -78,22 +84,12 @@ jobs:
           Copy-Item zipextractor_src/AutoUpdater.NET/Resources/ZipExtractor.exe zipextractor_bin/
           Get-ChildItem zipextractor_bin/
 
-      # --copy-metadata genericmud bundles the dist-info so importlib.metadata.version()
-      # resolves in the frozen build -- the self-updater needs the real installed version to
-      # compare against releases (and it fixes the diagnostic banner's "version=unknown").
+      # The same freeze flags as macOS and Linux (tools/build_app.py), which also bundles
+      # build/bass. --copy-metadata genericmud bundles the dist-info so
+      # importlib.metadata.version() resolves in the frozen build: the self-updater needs the
+      # real installed version to compare against releases.
       - name: Build
-        run: >
-          uv run pyinstaller --onedir --name genericMud --windowed
-          --copy-metadata genericmud
-          --add-data "frontend;frontend"
-          --add-data "genericmud/config/keymaps;genericmud/config/keymaps"
-          --collect-all webview
-          --collect-all prism
-          --additional-hooks-dir hooks
-          --collect-all pygame
-          --collect-all lupa --hidden-import websockets
-          --hidden-import win32com.client --hidden-import pythoncom
-          run_genericmud.py
+        run: uv run python tools/build_app.py
       # Drop the helper beside genericMud.exe so self_update.py can copy it to %TEMP% and
       # spawn it. Must land before Zip so it's inside the release archive the updater fetches.
       - name: Bundle ZipExtractor.exe

@@ -29,7 +29,13 @@ jobs:
           node-version: '22'
       - name: Install
         run: uv sync --all-extras --locked
+      # BASS, the audio library the app plays through, pinned by checksum in the script.
+      # The tests below run against it too.
+      - name: Fetch BASS
+        run: uv run python tools/fetch_bass.py build/bass
       - name: Test Python
+        env:
+          GENERICMUD_BASS_DIR: build/bass
         run: uv run pytest -q
       - name: Test web input
         run: |

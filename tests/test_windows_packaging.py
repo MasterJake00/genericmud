@@ -15,11 +15,14 @@ def test_windows_builds_use_the_windowed_subsystem():
     workflow = (root / ".github/workflows/build-windows.yml").read_text(encoding="utf-8").lower()
 
     # build_windows.bat freezes from the spec, so its GUI-subsystem choice lives there as
-    # console=False; the workflow still spells the flags out itself.
+    # console=False; the workflow freezes through tools/build_app.py, like macOS and Linux.
+    from tools.build_app import pyinstaller_args
+
     assert "genericMud.spec" in build_script
     assert "console=False" in spec
-    assert "--windowed" in workflow
-    assert "--console" not in workflow
+    assert "tools/build_app.py" in workflow
+    assert "--windowed" in pyinstaller_args("win32")
+    assert "--console" not in pyinstaller_args("win32")
 
 
 def _load_prism_hook():
@@ -67,12 +70,26 @@ def test_the_prism_hook_collects_the_cffi_bridge_and_its_backend():
 
 
 def test_every_windows_freeze_path_registers_the_prism_hook():
-    # build_windows.bat goes through the spec, the workflow spells its flags out; each has to
-    # register the hook on its own, so they are the pair that can drift.
+    # build_windows.bat goes through the spec, the workflow through tools/build_app.py; each
+    # has to register the hook on its own, so they are the pair that can drift.
+    from tools.build_app import pyinstaller_args
+
     root = Path(__file__).resolve().parents[1]
     spec = (root / "genericMud.spec").read_text(encoding="utf-8")
     workflow = (root / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+    args = " ".join(pyinstaller_args("win32"))
 
     assert "hookspath" in spec and "hooks" in spec
-    assert "--additional-hooks-dir hooks" in workflow
-    assert "--collect-all prism" in workflow
+    assert "tools/build_app.py" in workflow
+    assert "--additional-hooks-dir hooks" in args
+    assert "--collect-all prism" in args
+
+
+def test_every_windows_freeze_path_bundles_bass():
+    root = Path(__file__).resolve().parents[1]
+    spec = (root / "genericMud.spec").read_text(encoding="utf-8")
+    build_script = (root / "build_windows.bat").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+
+    assert "fetch_bass.py" in build_script and "fetch_bass.py" in workflow
+    assert "'build', 'bass'" in spec

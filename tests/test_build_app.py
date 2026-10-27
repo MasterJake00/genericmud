@@ -53,3 +53,16 @@ def test_every_platform_registers_the_prism_hook(platform):
 def test_macos_build_sets_a_bundle_identifier():
     args = pyinstaller_args("darwin")
     assert "--osx-bundle-identifier" in args
+
+
+def test_bass_goes_in_the_apps_bass_folder(tmp_path):
+    folder = tmp_path / "bass"
+    folder.mkdir()
+    for name in ("bass.dll", "bass_fx.dll", "bass.txt"):
+        (folder / name).write_bytes(b"x")
+    win = pyinstaller_args("win32", folder)
+    assert win[win.index(f"{folder / 'bass.dll'};bass") - 1] == "--add-binary"
+    assert win[win.index(f"{folder / 'bass.txt'};bass") - 1] == "--add-data"
+    assert win[-1] == "run_genericmud.py"
+    assert f"{folder / 'bass_fx.dll'}:bass" in pyinstaller_args("linux", folder)
+    assert not any("bass" in arg for arg in pyinstaller_args("linux"))

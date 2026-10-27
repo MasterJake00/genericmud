@@ -45,6 +45,10 @@ jobs:
 
       - name: Install
         run: uv sync --all-extras --locked
+      # BASS, the audio library the app plays through, pinned by checksum in the script.
+      # The tests below run against it too.
+      - name: Fetch BASS
+        run: uv run python tools/fetch_bass.py build/bass
 
       # ruff is configured in pyproject.toml and, until now, was never run anywhere but by hand.
       # `ruff check` only: the tree is not `ruff format` clean, so adding that would fail every
@@ -54,6 +58,8 @@ jobs:
 
       # xvfb because importing wx needs a display even though no test opens a window.
       - name: Test Python
+        env:
+          GENERICMUD_BASS_DIR: build/bass
         run: xvfb-run -a uv run pytest -q
 
       - name: Test web input
