@@ -359,6 +359,7 @@ class SessionPanel(wx.Panel):
             suppress_reconnect=self._connection.suppress_reconnect,
             withdraw_option=self._connection.withdraw_remote,
             encoding=self.world.encoding,
+            mxp=self.world.mxp,
             other_worlds=lambda: [world.name for world in load_worlds()],
         )
         self.app.asker = self._ask_from_pack
@@ -1431,6 +1432,10 @@ class WorldDialog(wx.Dialog):
         self._download_sounds.SetName("Download sounds the MUD offers")
         self._download_sounds.SetValue(True)
         grid.Add(self._download_sounds, 1, wx.EXPAND)
+        self._mxp = wx.CheckBox(self, label="Understand M&XP markup")
+        self._mxp.SetName("Understand MXP markup")
+        self._mxp.SetValue(True)
+        grid.Add(self._mxp, 1, wx.EXPAND)
 
         grid.Add((0, 0))
         self._tls = wx.CheckBox(self, label="Use &TLS")
@@ -1519,6 +1524,7 @@ class WorldDialog(wx.Dialog):
             self._log_files.SetSelection(LOG_FILES.index(initial.log_files))
             self._log_commands.SetValue(initial.log_commands)
             self._download_sounds.SetValue(initial.download_sounds)
+            self._mxp.SetValue(initial.mxp)
         if lock_name:
             self._name.Enable(False)
             self._host.SetFocus()
@@ -1569,6 +1575,7 @@ class WorldDialog(wx.Dialog):
             log_files=LOG_FILES[self._log_files.GetSelection()],
             log_commands=self._log_commands.GetValue(),
             download_sounds=self._download_sounds.GetValue(),
+            mxp=self._mxp.GetValue(),
         )
         self.EndModal(wx.ID_OK)
 
@@ -4439,3 +4446,5 @@ def run(args, recovery=None) -> None:
 def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
+
