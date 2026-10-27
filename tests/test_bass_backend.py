@@ -15,14 +15,22 @@ from genericmud.sound.bass_backend import BassSoundBackend
 from genericmud.sound.bass_library import (
     ACTIVE_PLAYING,
     ACTIVE_STOPPED,
+    ATTRIB_FREQ,
     ATTRIB_PAN,
     ATTRIB_VOL,
+    POS_BYTE,
+    POS_END,
+    POS_LOOP,
     SAMPLE_LOOP,
     STREAM_AUTOFREE,
     SYNC_END,
+    SYNC_MIXTIME,
 )
-from genericmud.sound.bus import SoundBus
+from genericmud.sound.bus import CueTiming, SoundBus
 from tests.helpers import RecordingDiag
+
+_BYTES_PER_SECOND = 1000  # the stand-in's files: a thousand bytes a second, ten seconds long
+_LENGTH = 10 * _BYTES_PER_SECOND
 
 
 class _FakeBass:
@@ -42,8 +50,31 @@ class _FakeBass:
         self.next_handle += 1
         self.streams[self.next_handle] = {
             "file": name, "flags": flags, "playing": False, "attributes": {}, "syncs": [],
+            "positions": {}, "slides": [], "position": 0,
         }
         return self.next_handle
+
+    def BASS_ChannelGetLength(self, _stream, _mode):  # noqa: N802
+        return _LENGTH
+
+    def BASS_ChannelGetPosition(self, stream, _mode):  # noqa: N802
+        return self.streams[stream]["position"]
+
+    def BASS_ChannelSetPosition(self, stream, position, mode):  # noqa: N802
+        self.streams[stream]["positions"][mode] = position
+        if mode == POS_BYTE:
+            self.streams[stream]["position"] = position
+        return 1
+
+    def BASS_ChannelSeconds2Bytes(self, _stream, seconds):  # noqa: N802
+        return round(seconds * _BYTES_PER_SECOND)
+
+    def BASS_ChannelBytes2Seconds(self, _stream, count):  # noqa: N802
+        return count / _BYTES_PER_SECOND
+
+    def BASS_ChannelSlideAttribute(self, stream, attribute, value, milliseconds):  # noqa: N802
+        self.streams[stream]["slides"].append((attribute, value, milliseconds))
+        return 1
 
     def BASS_ErrorGetCode(self):  # noqa: N802
         return self.error
@@ -68,14 +99,20 @@ class _FakeBass:
         state["flags"] = (state["flags"] & ~mask) | (flags & mask)
         return state["flags"]
 
-    def BASS_ChannelSetSync(self, stream, kind, _parameter, callback, _user):  # noqa: N802
-        self.streams[stream]["syncs"].append((kind, callback))
+    def BASS_ChannelSetSync(self, stream, kind, parameter, callback, _user):  # noqa: N802
+        self.streams[stream]["syncs"].append((kind, parameter, callback))
         return 1
+
+    def reach(self, stream: int, position: int) -> None:
+        """The stream plays past ``position``: its position syncs there run."""
+        for kind, parameter, callback in self.streams[stream]["syncs"]:
+            if kind & ~SYNC_MIXTIME == 0 and parameter == position:
+                callback(1, stream, 0, None)
 
     def end_pass(self, stream: int) -> None:
         """The stream reaches its end: its end syncs run, and it stops unless it loops."""
         state = self.streams[stream]
-        for kind, callback in state["syncs"]:
+        for kind, _parameter, callback in state["syncs"]:
             if kind & SYNC_END:
                 callback(1, stream, 0, None)
         if not state["flags"] & SAMPLE_LOOP:
@@ -186,6 +223,105 @@ def test_without_bass_the_session_falls_back_to_pygame(monkeypatch):
     assert diag.fields("backend.select")["reason"].startswith("no BASS")
 
 
+def _only_stream(fake: _FakeBass) -> tuple[int, dict]:
+    [(stream, state)] = fake.streams.items()
+    return stream, state
+
+
+def test_a_cue_starts_and_finishes_where_the_mud_says_each_time_round():
+    # Client.Media's start and finish: the loop goes back to the start, not the file's top.
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/song.ogg", "media:song", 1.0, 0.0, True, timing=CueTiming(2.0, 6.0))
+    _stream, state = _only_stream(fake)
+    assert state["positions"] == {POS_BYTE: 2000, POS_LOOP: 2000, POS_END: 6000}
+
+
+def test_a_start_past_the_end_or_a_finish_before_the_start_is_ignored():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/a.ogg", "a", 1.0, 0.0, False, timing=CueTiming(start=12.0))
+    backend.play("/sounds/b.ogg", "b", 1.0, 0.0, False, timing=CueTiming(start=5.0, finish=3.0))
+    positions = [state["positions"] for state in fake.streams.values()]
+    assert positions == [{}, {POS_BYTE: 5000}]
+
+
+def test_a_cue_fades_in_from_silence_to_its_volume():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/rain.ogg", "rain", 0.8, 0.0, False, timing=CueTiming(fade_in=1.5))
+    _stream, state = _only_stream(fake)
+    assert state["attributes"][ATTRIB_VOL] == 0.0
+    assert state["slides"] == [(ATTRIB_VOL, 0.8, 1500)]
+
+
+def test_a_cue_fades_out_ahead_of_its_finish():
+    # Mudlet measures the fade out back from the finish when there is one.
+    fake, backend, _errors = _backend()
+    backend.play(
+        "/sounds/rain.ogg", "rain", 0.8, 0.0, False, timing=CueTiming(finish=8.0, fade_out=2.0)
+    )
+    stream, state = _only_stream(fake)
+    fake.reach(stream, 6000)
+    assert state["slides"] == [(ATTRIB_VOL, 0.0, 2000)]
+
+
+def test_each_time_round_fades_again():
+    fake, backend, _errors = _backend()
+    backend.play(
+        "/sounds/wind.ogg", "wind", 0.6, 0.0, True, timing=CueTiming(fade_in=1.0, fade_out=1.0)
+    )
+    stream, state = _only_stream(fake)
+    fake.reach(stream, 9000)
+    fake.end_pass(stream)
+    assert state["slides"] == [
+        (ATTRIB_VOL, 0.6, 1000), (ATTRIB_VOL, 0.0, 1000), (ATTRIB_VOL, 0.6, 1000),
+    ]
+    assert state["playing"]
+
+
+def test_a_cue_that_only_fades_out_comes_back_up_when_it_goes_round_again():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/wind.ogg", "wind", 0.6, 0.0, True, timing=CueTiming(fade_out=1.0))
+    stream, state = _only_stream(fake)
+    fake.reach(stream, 9000)
+    state["attributes"][ATTRIB_VOL] = 0.0  # where the fade out left it
+    fake.end_pass(stream)
+    assert state["attributes"][ATTRIB_VOL] == 0.6
+
+
+def test_fading_away_slides_to_silence_over_what_is_left_and_stops_going_round():
+    # Client.Media.Stop with fadeaway: the lesser of the fade and what's left of the cue.
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/wind.ogg", "wind", 0.6, 0.0, True, timing=CueTiming(fade_out=1.0))
+    stream, state = _only_stream(fake)
+    state["position"] = 8000
+    backend.fade_away("wind", 5.0)
+    assert state["slides"][-1] == (ATTRIB_VOL, -1.0, 2000)
+    assert not state["flags"] & SAMPLE_LOOP
+    backend.adjust("wind", gain=1.0)  # a change of volume mid fade doesn't undo it
+    fake.reach(stream, 9000)  # nor does the cue's own fade out, starting under it
+    assert state["slides"][-1] == (ATTRIB_VOL, -1.0, 2000)
+    assert state["attributes"][ATTRIB_VOL] == 0.6
+
+
+def test_fading_away_a_cue_with_nothing_left_stops_it():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)
+    _stream, state = _only_stream(fake)
+    state["position"] = _LENGTH
+    backend.fade_away("hit", 5.0)
+    assert fake.streams == {}
+
+
+def test_frequency_changes_how_fast_a_cue_plays():
+    # VIPMud's #PC Frequency, in Hz; 0 puts back the file's own rate.
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/engine.ogg", "engine", 1.0, 0.0, True)
+    backend.adjust("engine", frequency=22050)
+    _stream, state = _only_stream(fake)
+    assert state["attributes"][ATTRIB_FREQ] == 22050
+    backend.adjust("engine", frequency=-5)  # no such rate: left as it was
+    assert state["attributes"][ATTRIB_FREQ] == 22050
+
+
 # Real BASS, when this machine has it.
 
 _FOLDER = os.environ.get(bass_library.ENVIRONMENT_FOLDER)
@@ -270,3 +406,52 @@ def test_real_bass_decodes_every_kind_of_sound_packs_ship(real_bass, name):
     assert stream, f"{name}: BASS error {core.BASS_ErrorGetCode()}"
     assert core.BASS_ChannelGetLength(stream, 0) > 0
     core.BASS_StreamFree(stream)
+
+
+def _volume(core, stream: int) -> float:
+    value = ctypes.c_float()
+    core.BASS_ChannelGetAttribute(stream, ATTRIB_VOL, ctypes.byref(value))
+    return value.value
+
+
+@needs_bass
+def test_real_bass_trims_and_repeats_a_cue_each_time_round(real_bass, tmp_path):
+    # Decoded rather than heard, so the count is exact: three times round the middle second.
+    tone = _tone(tmp_path / "tone.wav", seconds=2.0)
+    core = real_bass.core
+    backend = BassSoundBackend(core)
+    path, flags = bass_library.path_argument(str(tone))
+    stream = core.BASS_StreamCreateFile(
+        False, path, 0, 0, flags | bass_library.STREAM_DECODE | SAMPLE_LOOP
+    )
+    second = core.BASS_ChannelSeconds2Bytes(stream, 1.0)
+    cue = bass_backend._Cue(stream=stream, gain=1.0, pan=0.0)
+    cue.end = core.BASS_ChannelGetLength(stream, 0)
+    backend._repeat(stream, 3)
+    backend._time(cue, CueTiming(start=0.5, finish=1.5), looping=True)
+    buffer = ctypes.create_string_buffer(1 << 16)
+    total = 0
+    while total < second * 20:
+        got = core.BASS_ChannelGetData(stream, buffer, len(buffer))
+        if got in (0, 0xFFFFFFFF):
+            break
+        total += got
+    core.BASS_StreamFree(stream)
+    assert abs(total - 3 * second) <= 64  # to the nearest sample or so
+
+
+@needs_bass
+def test_real_bass_fades_a_cue_in_and_away(real_bass, tmp_path):
+    import time
+
+    tone = _tone(tmp_path / "tone.wav", seconds=2.0)
+    backend = BassSoundBackend(real_bass.core)
+    backend.play(str(tone), "fading", 0.8, 0.0, True, timing=CueTiming(fade_in=0.4))
+    stream = backend._cues["fading"].stream
+    assert _volume(real_bass.core, stream) < 0.3
+    time.sleep(0.6)
+    assert abs(_volume(real_bass.core, stream) - 0.8) < 0.05
+    backend.fade_away("fading", 0.2)
+    assert backend.is_playing("fading")
+    time.sleep(0.6)
+    assert not backend.is_playing("fading")

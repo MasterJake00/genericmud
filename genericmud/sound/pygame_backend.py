@@ -19,6 +19,8 @@ from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from genericmud.sound.bus import CueTiming
+
 if TYPE_CHECKING:
     from genericmud.session.diaglog import DiagnosticLog
 
@@ -66,7 +68,8 @@ class PygameSoundBackend:
         self._music_channel: str | None = None  # logical channel the streaming music cue is on
 
     def play(
-        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1
+        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1,
+        timing: CueTiming | None = None,
     ) -> None:
         sound = self._sound(file)
         if sound is None:  # missing/undecodable file: skip the cue, don't crash the line
@@ -74,8 +77,14 @@ class PygameSoundBackend:
             return
         try:
             mixer_channel = self._channel(channel, loop)
-            # pygame's loops counts the repeats after the first play.
-            mixer_channel.play(sound, loops=-1 if loop else max(0, times - 1))
+            # pygame's loops counts the repeats after the first play. Of a cue's timing it
+            # can only fade a sound in: starts, finishes and fade outs need BASS.
+            loops = -1 if loop else max(0, times - 1)
+            fade = _milliseconds(timing.fade_in) if timing is not None else 0
+            if fade:
+                mixer_channel.play(sound, loops=loops, fade_ms=fade)
+            else:
+                mixer_channel.play(sound, loops=loops)
             self._levels[channel] = (gain, pan)  # adjust() merges live changes over these
             mixer_channel.set_volume(*stereo_volume(gain, pan))
         except Exception as exc:  # noqa: BLE001 - a mixer fault must not crash the line; record it
@@ -83,12 +92,22 @@ class PygameSoundBackend:
             return
         self._trace(file, "OK", gain=gain)
 
-    def music(self, file: str, channel: str, gain: float, times: int = -1) -> None:
+    def music(
+        self, file: str, channel: str, gain: float, times: int = -1,
+        timing: CueTiming | None = None,
+    ) -> None:
         try:
             self._mixer.music.load(file)
             self._mixer.music.set_volume(_clamp(gain))
             # -1 loops until stopped (soundpacks' background music); a MUD may ask for a count.
-            self._mixer.music.play(loops=-1 if times < 0 else max(0, times - 1))
+            loops = -1 if times < 0 else max(0, times - 1)
+            if timing is not None and (timing.start > 0 or timing.fade_in > 0):
+                self._mixer.music.play(
+                    loops=loops, start=max(0.0, timing.start),
+                    fade_ms=_milliseconds(timing.fade_in),
+                )
+            else:
+                self._mixer.music.play(loops=loops)
         except Exception:  # noqa: BLE001 - a missing/bad file OR a mixer fault must not crash the line
             self._warn(file)
             self._trace(file, "SKIP", kind="music")
@@ -121,8 +140,24 @@ class PygameSoundBackend:
         if existing is not None:
             existing.stop()
 
-    def adjust(self, channel: str, gain: float | None = None, pan: float | None = None) -> None:
-        """Change a PLAYING cue's volume/pan in place (None leaves that axis alone).
+    def fade_away(self, channel: str, seconds: float) -> None:
+        """Fade a cue out over ``seconds`` and stop it, as pygame's own fadeout does."""
+        duration = _milliseconds(seconds)
+        try:
+            if channel == MUSIC_CATEGORY or channel == self._music_channel:
+                self._mixer.music.fadeout(duration)
+            existing = self._channels.get(channel)
+            if existing is not None:
+                existing.fadeout(duration)
+        except Exception:  # noqa: BLE001 - a mixer fault must not crash the caller
+            self.stop(channel)
+
+    def adjust(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None,
+    ) -> None:
+        """Change a PLAYING cue's volume/pan in place (None leaves that axis alone). pygame
+        can't change a playing sound's pitch, so ``frequency`` is ignored.
 
         Soundpacks position and re-level running cues -- Cosmic Rage pans a cue right
         after starting it (directional audio) and re-volumes named cues on server
@@ -256,6 +291,10 @@ class PygameSoundBackend:
         while len(self._sounds) > _MAX_CACHED_SOUNDS:
             self._sounds.popitem(last=False)  # evict least-recently-used
         return sound
+
+
+def _milliseconds(seconds: float) -> int:
+    return max(0, round(seconds * 1000))
 
 
 def make_pygame_backend(

@@ -36,8 +36,12 @@ ACTIVE_STOPPED = 0
 ACTIVE_PLAYING = 1
 ACTIVE_STALLED = 2
 ACTIVE_PAUSED = 3
+SYNC_POS = 0
 SYNC_END = 2
 SYNC_MIXTIME = 0x40000000
+POS_BYTE = 0
+POS_END = 0x10  # where a stream ends (each time round, when it loops)
+POS_LOOP = 0x11  # where a looping stream starts again
 CONFIG_DEV_DEFAULT = 36
 ERROR_ALREADY = 14
 DEVICE_DEFAULT = -1
@@ -75,10 +79,16 @@ _SIGNATURES = (
     ("BASS_ChannelStop", _BOOL, (_DWORD,)),
     ("BASS_ChannelIsActive", _DWORD, (_DWORD,)),
     ("BASS_ChannelSetAttribute", _BOOL, (_DWORD, _DWORD, ctypes.c_float)),
+    ("BASS_ChannelGetAttribute", _BOOL, (_DWORD, _DWORD, ctypes.POINTER(ctypes.c_float))),
     ("BASS_ChannelFlags", _DWORD, (_DWORD, _DWORD, _DWORD)),
     ("BASS_ChannelSetSync", _DWORD, (_DWORD, _DWORD, _QWORD, SyncProc, ctypes.c_void_p)),
     ("BASS_ChannelGetData", _DWORD, (_DWORD, ctypes.c_void_p, _DWORD)),
     ("BASS_ChannelGetLength", _QWORD, (_DWORD, _DWORD)),
+    ("BASS_ChannelGetPosition", _QWORD, (_DWORD, _DWORD)),
+    ("BASS_ChannelSetPosition", _BOOL, (_DWORD, _QWORD, _DWORD)),
+    ("BASS_ChannelSeconds2Bytes", _QWORD, (_DWORD, ctypes.c_double)),
+    ("BASS_ChannelBytes2Seconds", ctypes.c_double, (_DWORD, _QWORD)),
+    ("BASS_ChannelSlideAttribute", _BOOL, (_DWORD, _DWORD, ctypes.c_float, _DWORD)),
 )
 
 

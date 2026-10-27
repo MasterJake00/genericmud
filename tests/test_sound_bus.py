@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from genericmud.app import EngineApp
 from genericmud.bridge import protocol
 from genericmud.config.keymap import load_keymap
-from genericmud.sound.bus import SoundBackend, SoundBus
+from genericmud.sound.bus import CueTiming, SoundBackend, SoundBus
 from genericmud.voice.router import VoiceRouter
 from tests.helpers import RecordingBackend
 
@@ -97,3 +97,36 @@ def test_app_play_routes_through_bus_with_gain():
     app.sink.play("clang.wav", "sound")  # the path a pack's mud.play() takes in-app
     sound_msgs = [m for m in posted if m["type"] == protocol.SOUND]
     assert sound_msgs[-1]["gain"] == 0.25
+
+
+def test_timing_and_pitch_reach_a_backend_that_takes_them_and_spare_one_that_doesnt():
+    # A backend written before cue timing (like the renderer's, or a test double) still plays.
+    timings: list = []
+    pitches: list = []
+
+    class _Timed(SoundBackend):
+        def play(self, file, channel, gain, pan, loop, times=1, timing=None):
+            timings.append(timing)
+
+        def adjust(self, channel, gain=None, pan=None, frequency=None):
+            pitches.append(frequency)
+
+    timing = CueTiming(start=1.0, fade_in=0.5)
+    bus = SoundBus(_Timed())
+    bus.play("a.wav", "sound", timing=timing)
+    bus.adjust("sound", frequency=22050)
+    assert timings == [timing] and pitches == [22050]
+    old = _RecordingSound()
+    SoundBus(old).play("b.wav", "sound")
+    assert old.played[0]["file"] == "b.wav"
+
+
+def test_fading_away_falls_back_to_stopping_on_a_backend_that_cant_fade():
+    old = _RecordingSound()
+    bus = SoundBus(old)
+    bus.play("rain.wav", "rain", loop=True)
+    bus.fade_away("rain", 2.0)
+    assert old.stopped == ["rain"]
+    bus.flush()
+    assert old.stopped == ["rain"]  # no longer counted as playing
+

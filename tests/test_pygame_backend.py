@@ -25,8 +25,11 @@ class _FakeChannel:
         # Mirrors pygame.Channel.get_busy; tests flip it to simulate a finished cue.
         self.busy = True
 
-    def play(self, sound, loops):
-        self.played.append((sound, loops))
+    def play(self, sound, loops, fade_ms=0):
+        self.played.append((sound, loops) if not fade_ms else (sound, loops, fade_ms))
+
+    def fadeout(self, milliseconds):
+        self.faded_out = milliseconds
 
     def set_volume(self, *volume):
         self.volume = volume
@@ -322,3 +325,18 @@ def test_music_plays_once_when_a_mud_asks_and_loops_by_default():
     backend.music("/abs/town.ogg", "music", 0.5, times=1)
     backend.music("/abs/theme.ogg", "music", 0.5)  # a soundpack's background music
     assert mixer.music.played == [0, -1]
+
+
+def test_pygame_fades_a_cue_in_and_away_as_far_as_it_can():
+    # pygame can't trim or fade out a sound, but it can fade one in and fade one away.
+    from genericmud.sound.bus import CueTiming
+
+    mixer = _FakeMixer()
+    backend = PygameSoundBackend(mixer)
+    backend.play("rain.wav", "rain", 1.0, 0.0, True, timing=CueTiming(start=3.0, fade_in=1.5))
+    channel = backend._channels["rain"]
+    assert channel.played == [(("sound", "rain.wav"), -1, 1500)]
+    backend.fade_away("rain", 2.0)
+    assert channel.faded_out == 2000
+    backend.adjust("rain", frequency=22050)  # no pitch in pygame: nothing happens, nothing breaks
+

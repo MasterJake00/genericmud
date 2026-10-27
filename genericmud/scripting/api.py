@@ -371,9 +371,16 @@ class ScriptApi:
             )
         self._engine.sink.music(self._resolve(file)[0], channel)
 
-    def adjust(self, channel: str, gain: float | None = None, pan: float | None = None) -> None:
-        """Live volume/pan change on a playing cue (VIPMud #pc, bass setVol/slideVol)."""
-        self._engine.sound.adjust(channel, gain, pan)
+    def adjust(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None,
+    ) -> None:
+        """Live volume/pan/pitch change on a playing cue (VIPMud #pc, bass setVol/slideVol).
+        ``frequency`` is the rate it plays at in Hz; 0 puts back the file's own."""
+        if frequency is None:
+            self._engine.sound.adjust(channel, gain, pan)
+        else:
+            self._engine.sound.adjust(channel, gain, pan, frequency=frequency)
 
     # --- variables ---
 

@@ -26,24 +26,51 @@ class BusPolicy:
     muted: bool = False
 
 
+@dataclass(frozen=True)
+class CueTiming:
+    """How a cue plays within its file, as Client.Media asks: where each time round starts and
+    finishes (seconds into the file, 0 for the file's own start and end), and how long its volume
+    takes to rise from silence at the start and fall to silence at the end (seconds, 0 for no
+    fade). Fades are linear and happen every time round, as in Mudlet."""
+
+    start: float = 0.0
+    finish: float = 0.0
+    fade_in: float = 0.0
+    fade_out: float = 0.0
+
+
 class SoundBackend:
     """Playback surface the bus drives; real wiring (renderer/native) overrides."""
 
     def play(
-        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1
+        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1,
+        timing: CueTiming | None = None,
     ) -> None:
-        """Play ``file``; ``loop`` repeats it until stopped, else it plays ``times`` times."""
-    def music(self, file: str, channel: str, gain: float, times: int = -1) -> None:
+        """Play ``file``; ``loop`` repeats it until stopped, else it plays ``times`` times.
+        A backend that can't follow ``timing`` plays the file whole."""
+    def music(
+        self, file: str, channel: str, gain: float, times: int = -1,
+        timing: CueTiming | None = None,
+    ) -> None:
         """Play ``file`` as the music; ``times`` -1 loops it until stopped."""
     def stop(self, channel: str) -> None: ...
+
+    def fade_away(self, channel: str, seconds: float) -> None:
+        """Fade a playing cue to silence over ``seconds``, then stop it; a backend that can't
+        fade stops it at once."""
+        self.stop(channel)
 
     def is_playing(self, channel: str) -> bool:
         """Whether a cue is still audible on this channel; backends that can't know
         (the renderer post path) answer False, matching the pre-query behaviour."""
         return False
 
-    def adjust(self, channel: str, gain: float | None = None, pan: float | None = None) -> None:
-        """Re-level/re-pan a playing cue; backends without live control ignore it."""
+    def adjust(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None,
+    ) -> None:
+        """Re-level, re-pan or re-pitch a playing cue (``frequency`` is the rate it plays at, in
+        Hz, 0 for its own); backends without live control ignore it."""
 
 
 class SoundBus:
@@ -96,36 +123,61 @@ class SoundBus:
         pan: float = 0.0,
         loop: bool = False,
         times: int = 1,
+        timing: CueTiming | None = None,
     ) -> None:
         """Play a cue; ``loop`` repeats it until stopped, otherwise it plays ``times`` times
-        (a MUD's MSP L= or Client.Media loops)."""
+        (a MUD's MSP L= or Client.Media loops). ``timing`` trims and fades it."""
         self._playing.add(channel)
-        self._backend.play(
-            file, channel, self.effective_gain(channel, gain), pan, loop, times=max(1, times)
-        )
+        effective = self.effective_gain(channel, gain)
+        if timing is None:  # backends written before timing existed still play cues
+            self._backend.play(file, channel, effective, pan, loop, times=max(1, times))
+        else:
+            self._backend.play(
+                file, channel, effective, pan, loop, times=max(1, times), timing=timing
+            )
 
     def music(
-        self, file: str, channel: str = MUSIC_CATEGORY, gain: float = 1.0, times: int = -1
+        self, file: str, channel: str = MUSIC_CATEGORY, gain: float = 1.0, times: int = -1,
+        timing: CueTiming | None = None,
     ) -> None:
         """Play music: until stopped (-1, what soundpacks' background music wants), or the
         number of times a MUD asked for."""
         self._playing.add(channel)
-        self._backend.music(file, channel, self.effective_gain(channel, gain), times=times)
+        effective = self.effective_gain(channel, gain)
+        if timing is None:
+            self._backend.music(file, channel, effective, times=times)
+        else:
+            self._backend.music(file, channel, effective, times=times, timing=timing)
 
     def stop(self, channel: str) -> None:
         self._playing.discard(channel)
         self._backend.stop(channel)
+
+    def fade_away(self, channel: str, seconds: float) -> None:
+        """Fade a playing cue out over ``seconds`` and stop it (Client.Media's fadeaway)."""
+        self._playing.discard(channel)
+        fade = getattr(self._backend, "fade_away", None)
+        if fade is None:
+            self._backend.stop(channel)
+        else:
+            fade(channel, seconds)
 
     def is_playing(self, channel: str) -> bool:
         # The backend is the truth (a one-shot ends on its own); `_playing` only
         # records what was started, so it can't answer this.
         return self._backend.is_playing(channel)
 
-    def adjust(self, channel: str, gain: float | None = None, pan: float | None = None) -> None:
-        """Live volume/pan change on a playing cue. ``gain`` is the CUE gain; the
+    def adjust(
+        self, channel: str, gain: float | None = None, pan: float | None = None,
+        frequency: float | None = None,
+    ) -> None:
+        """Live volume/pan/pitch change on a playing cue. ``gain`` is the CUE gain; the
         master and category gains scale it exactly as at play time."""
         effective = self.effective_gain(channel, gain) if gain is not None else None
-        self._backend.adjust(channel, effective, pan)
+        if frequency is None:
+            self._backend.adjust(channel, effective, pan)
+        else:
+            self._backend.adjust(channel, effective, pan, frequency=frequency)
 
     def flush(self) -> None:
         """Stop every playing category (the sound panic key, e.g. Shift+F11)."""

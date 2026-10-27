@@ -901,12 +901,14 @@ def _stays_inside(path: Path, root: Path) -> bool:
 
 @dataclass
 class _PendingCue:
-    """A cue waiting for its sound to download; #pc volume and pan land here until it plays."""
+    """A cue waiting for its sound to download; #pc volume, pan and frequency land here until
+    it plays."""
 
     file: str
     gain: float
     loop: bool
     pan: float = 0.0
+    frequency: float | None = None
 
 
 @dataclass
@@ -2130,6 +2132,8 @@ class VipMudPack:
             if cue is None:
                 continue  # stopped while it was downloading
             self._api.play(cue.file, channel=channel, gain=cue.gain, pan=cue.pan, loop=cue.loop)
+            if cue.frequency is not None:
+                self._api.adjust(channel, frequency=cue.frequency)
 
     def _execute_if(self, args: list[_Tok], scope: _Scope) -> None:
         branch = 1 if self._condition(args[0].text, scope) else 2  # then : else
@@ -2323,7 +2327,16 @@ class VipMudPack:
                 self._pending_cues[channel].pan = pan
             else:
                 self._api.adjust(channel, pan=pan)
-        # frequency: no live pitch control in the bus — accepted, ignored.
+        elif action == "frequency":
+            # The rate the sound plays at, in Hz (VIPMud's examples run 5000 to 44100): higher
+            # is higher and faster. 0 puts back the file's own.
+            frequency = _number(value)
+            if frequency is None or frequency < 0:
+                return
+            if channel in self._pending_cues:
+                self._pending_cues[channel].frequency = frequency
+            else:
+                self._api.adjust(channel, frequency=frequency)
 
     # --- substitution ---
 

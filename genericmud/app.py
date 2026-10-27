@@ -60,7 +60,13 @@ from genericmud.session.credentials import CredentialStore
 from genericmud.session.hub import SessionHub
 from genericmud.session.log import SessionLogger
 from genericmud.session.login import AutoLogin
-from genericmud.sound.bus import DEFAULT_CATEGORY, MUSIC_CATEGORY, SoundBackend, SoundBus
+from genericmud.sound.bus import (
+    DEFAULT_CATEGORY,
+    MUSIC_CATEGORY,
+    CueTiming,
+    SoundBackend,
+    SoundBus,
+)
 from genericmud.sound.media import MediaLibrary, media_url
 from genericmud.voice.router import REVIEW_CHANNEL, SYSTEM_CHANNEL, VoiceRouter
 
@@ -94,6 +100,8 @@ _SOCKET_CHANGES = (
     "reconnected",
 )
 _MEDIA_DEFAULT_VOLUME = 50  # Client.Media.Play's volume when the server leaves it out (spec)
+_MEDIA_FADEAWAY_MS = 5000  # Client.Media.Stop's fadeaway when neither Play nor Stop says (spec)
+_MEDIA_LONGEST_MS = 24 * 60 * 60 * 1000  # positions and fades past a day are a server's mistake
 _MEDIA_TRACKED = 64  # Client.Media cues remembered for Stop before finished ones are dropped
 # MSDP variables that mean the player's location changed; both the table and flat forms.
 _MSDP_ROOM_VARS = frozenset(
@@ -158,6 +166,28 @@ def _media_continues(value: object) -> bool:
     return value is not False
 
 
+def _media_true(value: object) -> bool:
+    """A Client.Media yes-or-no that's off unless the server sent true, as a JSON boolean or
+    as the text "true" (servers that can't send JSON types quote every value)."""
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return value is True
+
+
+def _media_timing(body: dict) -> CueTiming | None:
+    """Client.Media.Play's start, finish, fadein and fadeout (milliseconds), or None when it
+    gave none of them."""
+    start, finish, fade_in, fade_out = (
+        _media_int(body.get(key), 0, 0, _MEDIA_LONGEST_MS)
+        for key in ("start", "finish", "fadein", "fadeout")
+    )
+    if not (start or finish or fade_in or fade_out):
+        return None
+    return CueTiming(
+        start=start / 1000, finish=finish / 1000, fade_in=fade_in / 1000, fade_out=fade_out / 1000
+    )
+
+
 def _default_schedule(delay: float, callback: Callable[[], None]) -> object | None:
     try:
         loop = asyncio.get_running_loop()
@@ -173,11 +203,16 @@ class _PostSoundBackend(SoundBackend):
         self._post = post
 
     def play(
-        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1
+        self, file: str, channel: str, gain: float, pan: float, loop: bool, times: int = 1,
+        timing: CueTiming | None = None,
     ) -> None:
-        self._post(protocol.sound(file, channel, gain, pan, loop))  # the renderer can't count
+        # The renderer can't count, trim or fade: it plays the file whole.
+        self._post(protocol.sound(file, channel, gain, pan, loop))
 
-    def music(self, file: str, channel: str, gain: float, times: int = -1) -> None:
+    def music(
+        self, file: str, channel: str, gain: float, times: int = -1,
+        timing: CueTiming | None = None,
+    ) -> None:
         self._post(protocol.music(file, channel, gain))
 
     def stop(self, channel: str) -> None:
@@ -1293,6 +1328,11 @@ class EngineApp:
         self._media_cues.pop(channel, None)
         self.sound.stop(channel)
 
+    def _fade_away_media(self, channel: str, seconds: float) -> None:
+        self._media_gen[channel] = self._media_gen.get(channel, 0) + 1  # still downloading: never
+        self._media_cues.pop(channel, None)
+        self.sound.fade_away(channel, seconds)
+
     def _media_failed(self, url: str, reason: str) -> None:
         if self._diag is not None:
             self._diag.event("media.download", url=url, failed=reason)
@@ -1345,12 +1385,14 @@ class EngineApp:
             self._media_seq += 1
             channel = f"media-{self._media_seq}"
         self._forget_finished_media()
+        timing = _media_timing(body)
         self._media_cues[channel] = {
             "name": name,
             "type": kind,
             "key": key,
             "tag": str(body.get("tag") or ""),
             "priority": _media_int(body.get("priority"), 0, 0, 100),
+            "fadeout": timing.fade_out if timing is not None else 0.0,  # a fadeaway's length
         }
         url = self._media_source(body)
         if self._diag is not None:
@@ -1364,12 +1406,16 @@ class EngineApp:
         if kind == "music":
             self._start_media(
                 name, url, channel,
-                lambda path: self.sound.music(path, channel, gain, times=-1 if loop else times),
+                lambda path: self.sound.music(
+                    path, channel, gain, times=-1 if loop else times, timing=timing
+                ),
             )
         else:
             self._start_media(
                 name, url, channel,
-                lambda path: self.sound.play(path, channel, gain=gain, loop=loop, times=times),
+                lambda path: self.sound.play(
+                    path, channel, gain=gain, loop=loop, times=times, timing=timing
+                ),
             )
 
     def _media_preload(self, name: str, url: str) -> None:
@@ -1390,19 +1436,26 @@ class EngineApp:
 
     def _media_stop(self, body: dict) -> None:
         """Stop the Client.Media cues matching every field given; an empty body stops them all.
-        ``priority`` matches cues at or below it, as the spec defines."""
+        ``priority`` matches cues at or below it, as the spec defines. With ``fadeaway`` they
+        fade out first, over the fadeout their Play gave, else this Stop's, else five seconds."""
         wanted = {
             field: str(body[field])
             for field in ("name", "type", "key", "tag")
             if body.get(field) not in (None, "")
         }
         ceiling = _media_int(body.get("priority"), None, 0, 100)
+        fade_away = _media_true(body.get("fadeaway"))
+        stop_fade = _media_int(body.get("fadeout"), _MEDIA_FADEAWAY_MS, 0, _MEDIA_LONGEST_MS)
         for channel, cue in list(self._media_cues.items()):
             if any(str(cue[field]) != value for field, value in wanted.items()):
                 continue
             if ceiling is not None and int(cue["priority"]) > ceiling:  # type: ignore[call-overload]
                 continue
-            self._stop_media(channel)
+            if fade_away:
+                seconds = float(cue.get("fadeout") or 0.0) or stop_fade / 1000  # type: ignore[arg-type]
+                self._fade_away_media(channel, seconds)
+            else:
+                self._stop_media(channel)
 
     def _forget_finished_media(self) -> None:
         """Drop finished one-shots so a long session's keyless cues don't pile up forever."""

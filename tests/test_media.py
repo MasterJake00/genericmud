@@ -19,7 +19,7 @@ from genericmud.packs.vault import BlockedUrl
 from genericmud.protocol.msp import parse_msp_line
 from genericmud.protocol.telnet import OPT_GMCP, DataReceived, Subnegotiation
 from genericmud.sound import media
-from genericmud.sound.bus import SoundBackend
+from genericmud.sound.bus import CueTiming, SoundBackend
 from genericmud.sound.media import MediaLibrary, http_fetch, is_downloadable, media_url
 from genericmud.transport.connection import GMCP_SUPPORTS, MudConnection
 from genericmud.voice.router import VoiceRouter
@@ -32,17 +32,24 @@ class _Backend(SoundBackend):
         self.musics: list[tuple[str, float]] = []
         self.stopped: list[str] = []
         self.times: list[int] = []  # how many times each play or music cue was to play
+        self.timings: list[CueTiming | None] = []  # each play or music cue's timing
+        self.faded: list[tuple[str, float]] = []  # (channel, seconds) of each fade away
 
-    def play(self, file, channel, gain, pan, loop, times=1):
+    def play(self, file, channel, gain, pan, loop, times=1, timing=None):
         self.played.append((file, channel, gain, loop))
         self.times.append(times)
+        self.timings.append(timing)
 
-    def music(self, file, channel, gain, times=-1):
+    def music(self, file, channel, gain, times=-1, timing=None):
         self.musics.append((file, gain))
         self.times.append(times)
+        self.timings.append(timing)
 
     def stop(self, channel):
         self.stopped.append(channel)
+
+    def fade_away(self, channel, seconds):
+        self.faded.append((channel, seconds))
 
 
 class _Net:
@@ -664,6 +671,37 @@ def test_client_media_stop_by_priority_stops_at_or_below_it(tmp_path):
     _gmcp(app, "Client.Media.Play", {"name": "hi.wav", "key": "hi", "priority": 90, "url": url})
     _gmcp(app, "Client.Media.Stop", {"priority": 50})
     assert backend.stopped == ["media:lo"]
+
+
+def test_client_media_play_starts_finishes_and_fades_where_the_mud_says(tmp_path):
+    # Mudlet's start, finish, fadein and fadeout, all in milliseconds. genericMud played the
+    # whole file at full volume from the top.
+    net = _Net()
+    app, backend, _posted = _app(tmp_path, net)
+    url = "https://x.example/"
+    timing = {"start": 1500, "finish": "9000", "fadein": 2000, "fadeout": 1000}
+    _gmcp(app, "Client.Media.Play", {"name": "a.wav", "url": url, **timing})
+    _gmcp(app, "Client.Media.Play", {"name": "m.ogg", "type": "music", "url": url, **timing})
+    _gmcp(app, "Client.Media.Play", {"name": "b.wav", "url": url})
+    expected = CueTiming(start=1.5, finish=9.0, fade_in=2.0, fade_out=1.0)
+    assert backend.timings == [expected, expected, None]
+
+
+def test_client_media_stop_fades_away_over_the_plays_fadeout_else_its_own_else_five_seconds(
+    tmp_path,
+):
+    net = _Net()
+    app, backend, _posted = _app(tmp_path, net)
+    url = "https://x.example/"
+    _gmcp(app, "Client.Media.Play", {"name": "a.wav", "key": "a", "fadeout": 3000, "url": url})
+    for key in ("b", "c", "d"):
+        _gmcp(app, "Client.Media.Play", {"name": f"{key}.wav", "key": key, "url": url})
+    _gmcp(app, "Client.Media.Stop", {"key": "a", "fadeaway": True, "fadeout": 1000})
+    _gmcp(app, "Client.Media.Stop", {"key": "b", "fadeaway": "true", "fadeout": 2000})
+    _gmcp(app, "Client.Media.Stop", {"key": "c", "fadeaway": True})
+    _gmcp(app, "Client.Media.Stop", {"key": "d", "fadeaway": "false"})
+    assert backend.faded == [("media:a", 3.0), ("media:b", 2.0), ("media:c", 5.0)]
+    assert backend.stopped == ["media:d"]
 
 
 def test_client_media_url_from_a_load_or_play_is_where_later_cues_download_from(tmp_path):

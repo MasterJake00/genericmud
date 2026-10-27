@@ -23,7 +23,7 @@ from genericmud.scripting.vipmud_dialect import (
     tokenize_statements,
     vip_pattern_to_regex,
 )
-from genericmud.sound.bus import SoundBus
+from genericmud.sound.bus import SoundBackend, SoundBus
 from tests.helpers import RecordingSink
 
 
@@ -634,6 +634,7 @@ def _remote_pack(tmp_path):
     pack = VipMudPack(ScriptApi(engine, source="vip", base_dir=str(tmp_path)))
     pack.load_source(
         SPHOOK + "\n#alias {quiet} {#pc 1 stop}\n#alias {place} {#pc 1 volume 30;#pc 1 pan -2500}"
+        "\n#alias {pitch} {#pc 1 frequency 11025}"
     )
     return sink, engine
 
@@ -845,3 +846,45 @@ async def test_pack_sound_downloads_keep_off_the_loops_shared_threads(tmp_path, 
     release.set()
     await _until(lambda: sink.played)
     assert used == []
+
+
+def test_pc_frequency_changes_how_fast_a_playing_sound_plays():
+    # VIPMud's #PC Frequency: the rate a sound plays at, in Hz. genericMud ignored it, so
+    # every sound a pack pitched up or down played at its own pitch.
+    adjusted: list[tuple[str, float | None]] = []
+
+    class _Backend(SoundBackend):
+        def adjust(self, channel, gain=None, pan=None, frequency=None):
+            adjusted.append((channel, frequency))
+
+    sink = RecordingSink()
+    engine = AutomationEngine(sink, sound=SoundBus(_Backend()))
+    VipMudPack(ScriptApi(engine, source="vipmud")).load_source(
+        "#alias {go} {#playloop {engine.wav}}\n"
+        "#alias {faster} {#pc 1 frequency 30000}\n"
+        "#alias {nonsense} {#pc 1 frequency lots;#pc 1 frequency -10}"
+    )
+    engine.process_input("go")
+    engine.process_input("faster")
+    engine.process_input("nonsense")
+    assert adjusted == [("vip-1", 30000)]
+
+
+async def test_a_frequency_set_while_a_sound_downloads_is_kept(tmp_path, monkeypatch):
+    release = threading.Event()
+
+    def download(url, destination, **_kwargs):
+        release.wait(5)
+        destination.write_bytes(b"RIFF")
+
+    monkeypatch.setattr("genericmud.packs.vault.download", download)
+    sink, engine = _remote_pack(tmp_path)
+    adjusted: list[tuple[str, float | None]] = []
+    engine.sound.adjust = lambda channel, gain=None, pan=None, frequency=None: adjusted.append(
+        (channel, frequency)
+    )
+    engine.process_line(Line("$sphook play:a:80:0:0:1"))
+    engine.process_input("pitch")  # #pc 1 frequency 11025, before it lands
+    release.set()
+    await _until(lambda: sink.played)
+    assert adjusted == [(sink.played[0]["channel"], 11025)]
