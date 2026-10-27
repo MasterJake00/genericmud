@@ -105,6 +105,7 @@ class Plan:
     # How each file the plan writes over, deletes or vouches for looked when it was planned:
     # (size, modification time), or None when it wasn't there. Checked again just before.
     seen: dict[str, tuple[int, int] | None] = field(default_factory=dict)
+    previous: dict[str, BaselineEntry] = field(default_factory=dict)  # the baseline it began from
 
     @property
     def up_to_date(self) -> bool:
@@ -279,7 +280,7 @@ def make_plan(
     """
     pack_dir = Path(pack_dir)
     entries = baseline.entries if baseline is not None else {}
-    plan = Plan()
+    plan = Plan(previous=dict(entries))
 
     # Every file the repository has: right already, missing, out of date, or the player's.
     for repo_path, sha in remote.items():
@@ -365,9 +366,13 @@ def apply_plan(
 
     Each file is written to a temporary name and moved into place, so an interrupted update
     leaves every file either old or new, never half-written. A file that changed since the plan
-    was made is the player's: it stays, and the pack's version goes beside it as .new. The
-    baseline is saved only when every blob arrived and everything that can be retried was
-    written, so an update that stopped short simply runs again.
+    was made is the player's: it stays, and the pack's version goes beside it as .new.
+
+    The baseline is saved even when the update stops short (a blob that never arrived, a file
+    in use), so the retry still knows which files are the player's. A first update has nothing
+    else to go on: without it, the retry would take a file kept as the player's for an old copy
+    and replace it. Until everything is written the baseline is saved without the commit, so
+    it's never taken for a finished update.
     """
     pack_dir = Path(pack_dir)
     applied = Applied()
@@ -405,24 +410,35 @@ def apply_plan(
             continue
         applied.removed.append(repo_path)
 
-    if not applied.complete:
-        return applied
-
-    # The rest of the baseline: the player's files, and the pack's that were right already.
-    baseline = Baseline(repo=repo, commit=commit, prefix=prefix)
+    # The rest of the baseline: the player's files, the pack's that were right already, and
+    # the pack's old copies still to be replaced.
+    unfinished = set(applied.missing) | set(applied.in_use) | set(applied.failed)
+    baseline = Baseline(repo=repo, commit=commit if applied.complete else "", prefix=prefix)
     for repo_path, sha in remote.items():
         target = _inside(pack_dir, prefix + repo_path)
         if target is None or _snapshot(target) is None:
             continue
+        unchanged_since_plan = _snapshot(target) == plan.seen.get(repo_path)
+        previous = plan.previous.get(repo_path)
         if repo_path in entries:
             baseline.entries[repo_path] = entries[repo_path]
         elif repo_path in players:
             baseline.entries[repo_path] = entry_for(target, sha, _KEPT)
-        elif _snapshot(target) == plan.seen.get(repo_path) or matches_blob(target, sha):
+        elif repo_path in unfinished and unchanged_since_plan:
+            if previous is not None and not previous.kept:
+                baseline.entries[repo_path] = previous  # the pack's old copy, as recorded
+            else:
+                # A first update took it for an old copy of the pack's: still to be replaced.
+                baseline.entries[repo_path] = entry_for(target, file_blob_sha(target))
+        elif repo_path not in unfinished and (unchanged_since_plan or matches_blob(target, sha)):
             baseline.entries[repo_path] = entry_for(target, sha)
         else:
-            # Checked when the plan was made, changed since: the player's, not the pack's.
+            # Changed since the plan was made: the player's, not the pack's.
             baseline.entries[repo_path] = entry_for(target, sha, _KEPT)
+    # Dropped files that couldn't be deleted this time are deleted next time.
+    for repo_path in plan.remove:
+        if repo_path in unfinished and repo_path in plan.previous:
+            baseline.entries[repo_path] = plan.previous[repo_path]
     write_baseline(pack_dir, baseline)
     return applied
 

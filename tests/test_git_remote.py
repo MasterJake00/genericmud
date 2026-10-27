@@ -259,6 +259,22 @@ def test_a_file_that_would_inflate_past_the_limit_is_refused_before_inflating(
         git_remote.fetch_blobs(REPO_URL, [git_sync.blob_sha(zeros)], tmp_path, limits=limits)
 
 
+def test_the_whole_commit_fallback_is_held_to_the_same_limits(serve, tmp_path, monkeypatch):
+    # A server can force the fallback by refusing files by hash; it fetches every file in the
+    # latest commit, so it mustn't skip the check.
+    zeros = b"\0" * (3 * 1024 * 1024)
+    requests = serve(_repository({"big.ogg": zeros, "small.lua": b"s"}))  # refuses by hash
+
+    def never(*_args, **_kwargs):
+        raise AssertionError("the pack was inflated before its sizes were checked")
+
+    monkeypatch.setattr(git_remote.PackData, "from_file", never)
+    limits = git_remote._Limits(object_bytes=1024 * 1024, total_bytes=1 << 30, objects=1000)
+    with pytest.raises(git_remote.RemoteError, match="bigger than"):
+        git_remote.fetch_blobs(REPO_URL, [git_sync.blob_sha(b"s")], tmp_path, limits=limits)
+    assert len([url for url in requests if url.endswith("/git-upload-pack")]) == 2  # fell back
+
+
 def _pack_object(kind: int, payload: bytes, base: bytes = b"") -> bytes:
     """One object of a git pack: its type and size header, a delta's base, zlib data."""
     size = len(payload)

@@ -187,7 +187,7 @@ def test_an_update_writes_the_packs_files_and_leaves_the_players_beside_them(tmp
     assert later.modified == {"worlds/w.mcl": remote["worlds/w.mcl"]}
 
 
-def test_an_update_that_stops_short_leaves_the_old_baseline(tmp_path):
+def test_an_update_that_stops_short_records_what_it_did_but_not_the_commit(tmp_path):
     pack = tmp_path / "pack"
     _write(pack / "a.lua", b"a")
     remote = {"a.lua": blob_sha(b"a2"), "b.lua": blob_sha(b"b")}
@@ -195,7 +195,36 @@ def test_an_update_that_stops_short_leaves_the_old_baseline(tmp_path):
     blobs = _blobs(tmp_path, b"a2")  # b.lua's blob never arrived
     applied = git_sync.apply_plan(pack, "", plan, blobs, repo="r", commit="c", remote=remote)
     assert applied.missing == ["b.lua"]
-    assert git_sync.read_baseline(pack) is None  # so the next update runs the whole way again
+    stopped = git_sync.read_baseline(pack)
+    assert stopped.commit == ""  # not finished, so never taken for up to date
+    assert set(stopped.entries) == {"a.lua"}
+    retry = make_plan(remote, pack, "", stopped)
+    assert retry.download == {"b.lua": remote["b.lua"]} and retry.unchanged == ["a.lua"]
+    git_sync.apply_plan(
+        pack, "", retry, _blobs(tmp_path, b"b"), repo="r", commit="c", remote=remote,
+    )
+    assert git_sync.read_baseline(pack).commit == "c"
+
+
+def test_a_first_update_that_stops_short_still_remembers_the_players_edit(tmp_path):
+    # With no baseline the retry would be a first update again, which replaces differing
+    # files: the edit kept the first time round has to be remembered as the player's.
+    pack = tmp_path / "pack"
+    path = _write(pack / "a.lua", b"old")
+    remote = {"a.lua": blob_sha(b"new"), "b.lua": blob_sha(b"b")}
+    plan = make_plan(remote, pack, "", None)
+    _edit(path, b"player edit during download")
+    applied = git_sync.apply_plan(
+        pack, "", plan, _blobs(tmp_path, b"new"), repo="r", commit="c", remote=remote,
+    )
+    assert applied.missing == ["b.lua"]
+    assert path.read_bytes() == b"player edit during download"
+    retry = make_plan(remote, pack, "", git_sync.read_baseline(pack))
+    git_sync.apply_plan(
+        pack, "", retry, _blobs(tmp_path, b"new", b"b"), repo="r", commit="c", remote=remote,
+    )
+    assert path.read_bytes() == b"player edit during download"
+    assert (pack / "b.lua").read_bytes() == b"b"
 
 
 def test_a_file_in_use_is_left_for_next_time(tmp_path, monkeypatch):
@@ -218,7 +247,9 @@ def test_a_file_in_use_is_left_for_next_time(tmp_path, monkeypatch):
     assert applied.in_use == ["music.ogg"] and applied.written == ["a.lua"]
     assert (pack / "music.ogg").read_bytes() == b"old tune"
     assert not list(pack.glob("*.part"))
-    assert git_sync.read_baseline(pack) is None  # the next update tries it again
+    # Recorded as the pack's old copy, so the next update replaces it, not as the player's.
+    retry = make_plan(remote, pack, "", git_sync.read_baseline(pack))
+    assert retry.download == {"music.ogg": remote["music.ogg"]}
 
 
 
