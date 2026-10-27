@@ -7,6 +7,16 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.20.3 — 2026-10-27
+
+**Also**
+
+* genericMud comes with the licences of Python and every library it runs on, in
+  THIRD-PARTY-NOTICES.txt, as those licences ask. BASS's terms are in its bass
+  folder.
+* Toastush's index command, a tool for the pack's maintainers, no longer goes to
+  the MUD.
+
 ## 0.20.2 — 2026-10-27
 
 **Soundpacks**
