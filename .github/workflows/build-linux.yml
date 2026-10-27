@@ -80,6 +80,7 @@ jobs:
           grep -q "^wxPython " "$notices"
           grep -q "^dulwich " "$notices"
           grep -q "^prismatoid " "$notices"
+          grep -q "GNU LESSER GENERAL PUBLIC LICENSE" "$notices"  # pygame's LGPL, in full
 
       - name: Package
         run: |

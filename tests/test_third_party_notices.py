@@ -39,3 +39,43 @@ def test_the_notices_are_written_where_asked(tmp_path):
     written = notices.write(tmp_path / "notices" / "THIRD-PARTY-NOTICES.txt")
     assert written.is_file()
     assert "lupa" in written.read_text(encoding="utf-8")
+
+
+def test_a_licence_file_named_for_its_licence_is_found_wherever_it_is():
+    # pygame's wheel carries its LGPL as pygame/docs/generated/LGPL.txt and nothing else.
+    try:
+        pygame = notices.metadata.distribution("pygame")
+    except notices.metadata.PackageNotFoundError:
+        import pytest
+
+        pytest.skip("pygame isn't installed here")
+    names = [name for name, _text in notices.licence_texts(pygame)]
+    assert "LGPL.txt" in names
+
+
+class _BareDistribution:
+    """A library that installed no licence file, declaring MIT, as proxy_tools does."""
+
+    version = "0.1.0"
+    files: list = []
+
+    class metadata:  # noqa: N801 - the attribute importlib.metadata gives a distribution
+        _fields = {"Name": "bare_tools", "License": "MIT", "Author": "A. Author"}
+
+        @classmethod
+        def get(cls, key, default=None):
+            return cls._fields.get(key, default)
+
+        @classmethod
+        def get_all(cls, _key):
+            return []
+
+        def __class_getitem__(cls, key):
+            return cls._fields[key]
+
+
+def test_an_mit_library_without_its_own_text_gets_mits_with_its_author():
+    text = notices.render([_BareDistribution()])
+    assert "bare_tools 0.1.0" in text
+    assert "Copyright (c) A. Author" in text
+    assert "Permission is hereby granted, free of charge" in text

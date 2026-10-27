@@ -25,7 +25,29 @@ from packaging.utils import canonicalize_name
 
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 RUNTIME_EXTRAS = ("gui", "voice", "audio")  # "package" is PyInstaller, which builds the app
-_LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|notice|copyright|authors)", re.IGNORECASE)
+# A licence file by name, wherever the library put it (pygame keeps its LGPL as
+# pygame/docs/generated/LGPL.txt).
+_LICENCE_FILE = re.compile(
+    r"^(licen[cs]e|copying|notice|copyright|authors|lgpl|gpl)", re.IGNORECASE
+)
+# The MIT licence, for a library that declares it but installed no text of its own.
+_MIT = (
+    "Copyright (c) {holder}\n\n"
+    "Permission is hereby granted, free of charge, to any person obtaining a copy of this "
+    "software and associated documentation files (the \"Software\"), to deal in the Software "
+    "without restriction, including without limitation the rights to use, copy, modify, "
+    "merge, publish, distribute, sublicense, and/or sell copies of the Software, and to "
+    "permit persons to whom the Software is furnished to do so, subject to the following "
+    "conditions:\n\n"
+    "The above copyright notice and this permission notice shall be included in all copies "
+    "or substantial portions of the Software.\n\n"
+    "THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, "
+    "INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A "
+    "PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT "
+    "HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF "
+    "CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE "
+    "OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n"
+)
 _RULE = "=" * 78
 
 
@@ -134,7 +156,14 @@ def render(distributions: Iterable[metadata.Distribution]) -> str:
         texts = licence_texts(distribution)
         for name, text in texts:
             lines.append(f"\n--- {name} ---\n\n{text.rstrip()}")
-        if not texts:
+        mit = "MIT" in (declared or "").split() or "MIT License" in classifiers
+        if not texts and mit:
+            holder = info.get("Author") or info.get("Maintainer") or f"the {info['Name']} authors"
+            lines.append(
+                "\n(It installed no licence text of its own; this is the MIT licence it "
+                "declares, with its author from its metadata.)\n\n" + _MIT.format(holder=holder)
+            )
+        elif not texts:
             lines.append("\n(This library installed no licence file of its own.)")
         sections.append("\n".join(lines) + "\n")
     return "\n\n".join(sections)
