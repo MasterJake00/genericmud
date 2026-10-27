@@ -21,16 +21,20 @@ from pathlib import Path
 APP_NAME = "genericMud"
 ENTRY = "run_genericmud.py"
 BASS_FOLDER = Path("build/bass")  # where tools/fetch_bass.py puts BASS for a build
+NOTICES_FILE = Path("build/notices/THIRD-PARTY-NOTICES.txt")  # tools/third_party_notices.py
 _LIBRARY_SUFFIXES = (".dll", ".so", ".dylib")
 
 
-def pyinstaller_args(platform: str, bass_folder: Path | None = None) -> list[str]:
+def pyinstaller_args(
+    platform: str, bass_folder: Path | None = None, notices: Path | None = None
+) -> list[str]:
     """The PyInstaller argv for ``platform`` (``sys.platform`` value).
 
     Pure so the freeze contract (windowed, bundled data, right separator, right hidden
     imports) can be asserted without actually running a multi-minute build. ``bass_folder``
     holds the BASS audio library the app plays through; its files go in the app's "bass"
-    folder, where genericmud/sound/bass_library.py looks.
+    folder, where genericmud/sound/bass_library.py looks. ``notices`` is the licence notices
+    file for Python and the libraries the app runs on, which goes in with the app.
     """
     separator = ";" if platform == "win32" else ":"  # PyInstaller --add-data host convention
     args = [
@@ -70,18 +74,23 @@ def pyinstaller_args(platform: str, bass_folder: Path | None = None) -> list[str
         for path in sorted(bass_folder.iterdir()):
             kind = "--add-binary" if path.suffix in _LIBRARY_SUFFIXES else "--add-data"
             args += [kind, f"{path}{separator}bass"]
+    if notices is not None:
+        args += ["--add-data", f"{notices}{separator}."]
     args.append(ENTRY)
     return args
 
 
 def main() -> None:
     import PyInstaller.__main__
+    import third_party_notices
 
     bass_folder = BASS_FOLDER if BASS_FOLDER.is_dir() else None
     if bass_folder is None:
         # The app still runs, through pygame, but packs lose what BASS gives them.
         print(f"Building without BASS: run tools/fetch_bass.py {BASS_FOLDER} first.")
-    PyInstaller.__main__.run(pyinstaller_args(sys.platform, bass_folder))
+    # The libraries' licences, read from this environment: the one the build freezes.
+    notices = third_party_notices.write(NOTICES_FILE)
+    PyInstaller.__main__.run(pyinstaller_args(sys.platform, bass_folder, notices))
 
 
 if __name__ == "__main__":

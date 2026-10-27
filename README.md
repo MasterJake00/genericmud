@@ -525,6 +525,10 @@ the real library. Without it, a source checkout plays through pygame.
 BASS is by Un4seen Developments and BASS_FX by JOBnik! (Arthur Aminov). BASS is
 free for non-commercial use, which genericMud is; selling genericMud, or anything
 built from it, needs a BASS licence from un4seen.com. BASS_FX may be passed on
-free of charge.
+free of charge. Their readmes, with their terms, are in the app's bass folder.
+
+The build also carries THIRD-PARTY-NOTICES.txt: the licences of Python and every
+library genericMud runs on, written from the build's own environment by
+`tools/third_party_notices.py`.
 
 Windows packaging and running from source: `WINDOWS.md`.

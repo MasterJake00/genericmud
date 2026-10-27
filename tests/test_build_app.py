@@ -66,3 +66,12 @@ def test_bass_goes_in_the_apps_bass_folder(tmp_path):
     assert win[-1] == "run_genericmud.py"
     assert f"{folder / 'bass_fx.dll'}:bass" in pyinstaller_args("linux", folder)
     assert not any("bass" in arg for arg in pyinstaller_args("linux"))
+
+
+def test_the_licence_notices_go_in_the_app(tmp_path):
+    notices = tmp_path / "THIRD-PARTY-NOTICES.txt"
+    notices.write_text("x", encoding="utf-8")
+    win = pyinstaller_args("win32", notices=notices)
+    assert win[win.index(f"{notices};.") - 1] == "--add-data"
+    assert f"{notices}:." in pyinstaller_args("darwin", notices=notices)
+    assert win[-1] == "run_genericmud.py"

@@ -52,6 +52,16 @@ jobs:
       # console. Self-voice uses the built-in `say`; screen-reader review uses VoiceOver.
       - name: Build .app
         run: uv run python tools/build_app.py
+      # The licences of Python and the libraries the app runs on, which they ask to have
+      # passed on with it (tools/third_party_notices.py, written by the build).
+      - name: Check the licence notices went in
+        shell: bash
+        run: |
+          notices=$(find dist/genericMud.app -name THIRD-PARTY-NOTICES.txt | head -1)
+          test -n "$notices"
+          grep -q "^wxPython " "$notices"
+          grep -q "^dulwich " "$notices"
+          grep -q "^prismatoid " "$notices"
 
       # Ship the .app inside a zip so GitHub keeps the bundle's exec bits and structure.
       # ditto is the macOS-native archiver that preserves resource forks/symlinks.
