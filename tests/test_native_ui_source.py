@@ -225,3 +225,13 @@ def test_a_deliberate_disconnect_reports_through_the_transport_path():
     # the wording, the sound flush and the timer cancel all get a second copy that drifts.
     source = _wx_source()
     assert 'self.app.on_connection_status("disconnected")' in source
+
+
+def test_the_window_tells_the_session_when_the_socket_opens():
+    # on_connect runs before the transport connects, so the login waits in a queue; only the
+    # window knows when the socket is really up. Without this call a MUSH/MOO or Diku world
+    # has its login typed into a socket that does not exist, and the MUD never sees it.
+    source = _wx_source()
+    connected_at = source.index("await self._connection.connect(self.world.host")
+    opened_at = source.index("self.app.after_connect()")
+    assert opened_at > connected_at
