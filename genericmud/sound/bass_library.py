@@ -38,6 +38,7 @@ ACTIVE_STALLED = 2
 ACTIVE_PAUSED = 3
 SYNC_POS = 0
 SYNC_END = 2
+SYNC_FREE = 8  # the stream has been freed (it ended, stopped or was freed)
 SYNC_MIXTIME = 0x40000000
 POS_BYTE = 0
 POS_END = 0x10  # where a stream ends (each time round, when it loops)

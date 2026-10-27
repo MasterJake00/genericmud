@@ -17,6 +17,8 @@ device opens, and pygame otherwise.
 from __future__ import annotations
 
 import ctypes
+import itertools
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -33,6 +35,7 @@ from genericmud.sound.bass_library import (
     SAMPLE_LOOP,
     STREAM_AUTOFREE,
     SYNC_END,
+    SYNC_FREE,
     SYNC_MIXTIME,
     SYNC_POS,
 )
@@ -44,10 +47,14 @@ if TYPE_CHECKING:
 MUSIC_CATEGORY = "music"
 _SLIDE_TO_STOP = -1.0  # sliding BASS's volume to -1 fades to silence and stops the stream
 
-# Callbacks BASS holds for streams that are still playing, by stream handle. ctypes frees a
-# callback nothing refers to, and BASS calling a freed one would crash genericMud, so they're
-# kept here (one table for every session) until their stream has stopped.
-_callbacks: dict[int, list[object]] = {}
+# Every cue BASS may still call back about, by its serial number, holding its callbacks. ctypes
+# frees a callback nothing refers to, and BASS calling a freed one would crash genericMud, so a
+# cue stays here (one table for every session) until BASS has freed its stream and a grace
+# period has passed, by when none of its callbacks can still be running on BASS's thread.
+_kept: dict[int, _Cue] = {}
+_serials = itertools.count(1)
+_GRACE_SECONDS = 10.0
+_clock = time.monotonic
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -75,6 +82,10 @@ class _Cue:
     end: int = 0  # byte position it ends at each time round
     fading_away: bool = False
     effects: dict[int, _Effect] = field(default_factory=dict)  # by BASS's handle for each
+    serial: int = 0  # its own number: BASS's handles are only numbers, never reused, measured
+    callbacks: list[object] = field(default_factory=list)  # the ones BASS holds for it
+    freed: bool = False  # BASS has freed the stream, so its handle mustn't be used again
+    freed_seen_at: float | None = None  # when genericMud noticed, for the grace period
 
 
 class BassSoundBackend(SoundBackend):
@@ -361,9 +372,12 @@ class BassSoundBackend(SoundBackend):
         return True
 
     def _cue_for(self, channel: str) -> _Cue | None:
+        """The cue playing (or paused) on ``channel``; None once BASS has freed it."""
         cue = self._cues.get(channel)
         if cue is None and (channel == MUSIC_CATEGORY or channel == self._music_channel):
             cue = self._music
+        if cue is None or cue.freed:
+            return None
         return cue
 
     def _open(
@@ -375,23 +389,30 @@ class BassSoundBackend(SoundBackend):
         looping = loop or repeats > 1
         if looping:
             flags |= SAMPLE_LOOP
-        if not loop:
-            flags |= STREAM_AUTOFREE  # a cue that ends frees itself
+        # Every cue frees itself once it stops: at its end, at the end of the pass where its
+        # loop was turned off, or when a fade away stops it. Nothing plays a stopped cue again.
+        flags |= STREAM_AUTOFREE
         stream = self._bass.BASS_StreamCreateFile(False, path, 0, 0, flags)
         if not stream:
             self._trace(file, "OPEN", error=self._bass.BASS_ErrorGetCode())
             self._warn(file)
             return None
         self._forget_finished()
-        cue = _Cue(stream=stream, gain=gain, pan=pan)
+        cue = _Cue(stream=stream, gain=gain, pan=pan, serial=next(_serials))
+        _kept[cue.serial] = cue
+
+        def freed(_channel: int) -> None:
+            cue.freed = True
+
+        self._sync(cue, SYNC_FREE | SYNC_MIXTIME, 0, freed)
         cue.end = self._bass.BASS_ChannelGetLength(stream, POS_BYTE)
         if repeats > 1:
-            self._repeat(stream, repeats)
+            self._repeat(cue, repeats)
         if timing is not None:
             self._time(cue, timing, looping)
         return cue
 
-    def _repeat(self, stream: int, repeats: int) -> None:
+    def _repeat(self, cue: _Cue, repeats: int) -> None:
         """Play ``stream`` ``repeats`` times: it loops, and the loop is switched off as it ends
         for the last time (a MUD's MSP L= or Client.Media loops)."""
         bass = self._bass
@@ -402,7 +423,7 @@ class BassSoundBackend(SoundBackend):
             if endings[0] >= repeats:
                 bass.BASS_ChannelFlags(channel, 0, SAMPLE_LOOP)
 
-        self._sync(stream, SYNC_END | SYNC_MIXTIME, 0, at_end)
+        self._sync(cue, SYNC_END | SYNC_MIXTIME, 0, at_end)
 
     def _time(self, cue: _Cue, timing: CueTiming, looping: bool) -> None:
         """Start, finish and fade the cue each time round, the way Mudlet does: a start at or
@@ -433,7 +454,7 @@ class BassSoundBackend(SoundBackend):
                         channel, ATTRIB_VOL, 0.0, _milliseconds(fade_seconds)
                     )
 
-            self._sync(stream, SYNC_POS | SYNC_MIXTIME, cue.end - fade_length, fade_out)
+            self._sync(cue, SYNC_POS | SYNC_MIXTIME, cue.end - fade_length, fade_out)
         if looping and (timing.fade_in > 0 or timing.fade_out > 0):
 
             def round_again(channel: int) -> None:
@@ -442,23 +463,35 @@ class BassSoundBackend(SoundBackend):
                 if not cue.fading_away:
                     self._level(channel, cue)
 
-            self._sync(stream, SYNC_END | SYNC_MIXTIME, 0, round_again)
+            self._sync(cue, SYNC_END | SYNC_MIXTIME, 0, round_again)
 
-    def _sync(self, stream: int, kind: int, position: int, action: Callable[[int], None]) -> None:
-        """Have BASS call ``action`` with the stream when ``kind`` happens to it."""
+    def _sync(self, cue: _Cue, kind: int, position: int, action: Callable[[int], None]) -> None:
+        """Have BASS call ``action`` with the cue's stream when ``kind`` happens to it."""
 
         def call(_sync: int, channel: int, _data: int, _user: object) -> None:
             action(channel)
 
         callback = bass_library.SyncProc(call)
-        _callbacks.setdefault(stream, []).append(callback)
-        self._bass.BASS_ChannelSetSync(stream, kind, position, callback, None)
+        cue.callbacks.append(callback)
+        self._bass.BASS_ChannelSetSync(cue.stream, kind, position, callback, None)
 
     def _forget_finished(self) -> None:
-        """Let go of the callbacks of streams that have stopped: BASS won't call them again."""
-        for stream in list(_callbacks):
-            if self._bass.BASS_ChannelIsActive(stream) == ACTIVE_STOPPED:
-                del _callbacks[stream]
+        """Let go of cues BASS has freed: this backend's record of them at once, and their
+        callbacks once the grace period has passed."""
+        for channel, cue in list(self._cues.items()):
+            if cue.freed:
+                del self._cues[channel]
+        if self._music is not None and self._music.freed:
+            self._music = None
+            self._music_channel = None
+        now = _clock()
+        for serial, cue in list(_kept.items()):
+            if not cue.freed:
+                continue
+            if cue.freed_seen_at is None:
+                cue.freed_seen_at = now
+            elif now - cue.freed_seen_at >= _GRACE_SECONDS:
+                del _kept[serial]
 
     def _bytes(self, stream: int, seconds: float) -> int:
         if seconds <= 0:
@@ -486,8 +519,9 @@ class BassSoundBackend(SoundBackend):
             self._trace(file, "EXC", error=bass.BASS_ErrorGetCode(), **fields)
 
     def _free(self, cue: _Cue | None) -> None:
-        if cue is not None:
-            self._bass.BASS_StreamFree(cue.stream)  # stops it too; one that ended is gone already
+        """Stop and free a cue's stream, unless BASS has already (its handle is dead then)."""
+        if cue is not None and not cue.freed:
+            self._bass.BASS_StreamFree(cue.stream)  # its free callback marks the cue freed
 
     def _trace_effect(self, kind: int, result: str, **fields: object) -> None:
         if self._diag is not None:

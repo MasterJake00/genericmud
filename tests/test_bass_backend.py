@@ -35,6 +35,7 @@ from genericmud.sound.bass_library import (
     SAMPLE_LOOP,
     STREAM_AUTOFREE,
     SYNC_END,
+    SYNC_FREE,
     SYNC_MIXTIME,
 )
 from genericmud.sound.bus import CueTiming, SoundBus
@@ -48,10 +49,13 @@ class _FakeBass:
     """BASS's functions as the backend calls them, keeping track of every stream."""
 
     def __init__(
-        self, missing: tuple[str, ...] = (), missing_effects: tuple[int, ...] = ()
+        self, missing: tuple[str, ...] = (), missing_effects: tuple[int, ...] = (),
+        reuse_handles: bool = False,
     ) -> None:
         self.missing = missing  # files that "don't exist"
         self.missing_effects = missing_effects  # effects BASS lacks on this "platform"
+        self.reuse_handles = reuse_handles  # hand a freed stream's number to the next one
+        self.freed_handles: list[int] = []
         self.streams: dict[int, dict] = {}
         self.effects: dict[int, dict] = {}  # by effect handle
         self.next_handle = 100
@@ -62,12 +66,16 @@ class _FakeBass:
         if name in self.missing:
             self.error = 2  # BASS_ERROR_FILEOPEN
             return 0
-        self.next_handle += 1
-        self.streams[self.next_handle] = {
+        if self.reuse_handles and self.freed_handles:
+            handle = self.freed_handles.pop(0)
+        else:
+            self.next_handle += 1
+            handle = self.next_handle
+        self.streams[handle] = {
             "file": name, "flags": flags, "playing": False, "attributes": {}, "syncs": [],
             "positions": {}, "slides": [], "position": 0,
         }
-        return self.next_handle
+        return handle
 
     def BASS_ChannelGetLength(self, _stream, _mode):  # noqa: N802
         return _LENGTH
@@ -111,10 +119,22 @@ class _FakeBass:
         return 1
 
     def BASS_StreamFree(self, stream):  # noqa: N802
-        for effect, state in list(self.effects.items()):
-            if state["stream"] == stream:
+        return 1 if self._free_stream(stream) else 0
+
+    def _free_stream(self, stream: int) -> bool:
+        """BASS frees a stream: its free syncs run, then it's gone, with its effects."""
+        state = self.streams.get(stream)
+        if state is None:
+            return False
+        for kind, _parameter, callback in state["syncs"]:
+            if kind & ~SYNC_MIXTIME == SYNC_FREE:
+                callback(1, stream, 0, None)
+        del self.streams[stream]
+        for effect, effect_state in list(self.effects.items()):
+            if effect_state["stream"] == stream:
                 del self.effects[effect]
-        return 1 if self.streams.pop(stream, None) is not None else 0
+        self.freed_handles.append(stream)
+        return True
 
     def BASS_ChannelSetFX(self, stream, kind, _priority):  # noqa: N802
         if stream not in self.streams:
@@ -194,7 +214,17 @@ class _FakeBass:
         if not state["flags"] & SAMPLE_LOOP:
             state["playing"] = False
             if state["flags"] & STREAM_AUTOFREE:
-                del self.streams[stream]
+                self._free_stream(stream)
+
+    def finish_slides(self, stream: int) -> None:
+        """The stream's slides end: one of the volume to -1 stops it, which frees it when
+        it's AUTOFREE."""
+        state = self.streams[stream]
+        stopping = [value for attribute, value, _ms in state["slides"] if attribute == ATTRIB_VOL]
+        if stopping and stopping[-1] < 0:
+            state["playing"] = False
+            if state["flags"] & STREAM_AUTOFREE:
+                self._free_stream(stream)
 
     def playing_files(self) -> list[str]:
         return [state["file"] for state in self.streams.values() if state["playing"]]
@@ -226,7 +256,8 @@ def test_a_new_cue_on_a_channel_replaces_the_one_playing_there_and_no_other():
     backend.play("/sounds/wind.ogg", "ambience", 1.0, 0.0, True)
     assert sorted(fake.playing_files()) == ["/sounds/step.ogg", "/sounds/wind.ogg"]
     looping = [state for state in fake.streams.values() if state["file"] == "/sounds/wind.ogg"]
-    assert looping[0]["flags"] & SAMPLE_LOOP and not looping[0]["flags"] & STREAM_AUTOFREE
+    # It goes round until told not to, and frees itself once it stops.
+    assert looping[0]["flags"] & SAMPLE_LOOP and looping[0]["flags"] & STREAM_AUTOFREE
 
 
 def test_a_cue_asked_to_play_three_times_plays_three_times():
@@ -445,6 +476,88 @@ def test_the_bus_scales_a_slide_and_takes_a_slide_below_zero_as_a_fade_away():
     assert state["slides"][-1] == (ATTRIB_VOL, -1.0, 1000)
 
 
+def test_a_loop_frees_itself_once_it_stops_going_round():
+    # A loop told to stop going round plays to its end and stops. BASS must free it then, or
+    # every ambience a pack fades out stays allocated for the rest of the session.
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    stream, _state = _only_stream(fake)
+    backend.set_looping("rain", False)
+    fake.end_pass(stream)
+    assert fake.streams == {}
+    assert not backend.is_playing("rain")
+
+
+def test_a_loop_faded_away_is_freed_when_the_fade_ends():
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    stream, _state = _only_stream(fake)
+    backend.fade_away("rain", 1.0)
+    fake.finish_slides(stream)
+    assert fake.streams == {}
+
+
+def test_a_cue_that_has_ended_is_forgotten():
+    # Packs give each sound a channel of its own (erion-audio-1, -2 and on), so a record
+    # kept of each one that ended would grow all session.
+    fake, backend, _errors = _backend()
+    for number in range(1, 4):
+        backend.play("/sounds/hit.ogg", f"hit-{number}", 1.0, 0.0, False)
+        fake.end_pass(backend._cues[f"hit-{number}"].stream)
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    assert list(backend._cues) == ["rain"]
+
+
+def test_a_freed_cues_handle_is_never_used_again():
+    # This stand-in hands a freed stream's number to the next stream (real BASS, measured,
+    # doesn't). A channel whose cue has ended must never reach the new stream through it.
+    fake, backend, _errors = _backend(reuse_handles=True)
+    backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)
+    old = backend._cues["hit"].stream
+    fake.end_pass(old)
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
+    assert backend._cues["rain"].stream == old  # the same number, another stream
+    assert not backend.is_playing("hit")
+    backend.adjust("hit", gain=0.1)
+    backend.stop("hit")
+    state = fake.streams[old]
+    assert state["playing"] and state["attributes"][ATTRIB_VOL] == 1.0
+
+
+def test_callbacks_stay_alive_until_bass_has_freed_their_stream_and_a_while_after(
+    monkeypatch,
+):
+    # BASS calls a cue's callbacks from its own thread, and one freed while BASS might still
+    # call it would crash genericMud. They go only once BASS has freed the stream and a grace
+    # period has passed, by when none of them can still be running.
+    now = [100.0]
+    monkeypatch.setattr(bass_backend, "_clock", lambda: now[0])
+    fake, backend, _errors = _backend()
+    backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True, timing=CueTiming(fade_in=1.0))
+    rain = backend._cues["rain"]
+    assert len(rain.callbacks) >= 2  # BASS holds its free and its fade-in callbacks
+    backend.set_looping("rain", False)
+    backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)  # a new cue tidies up
+    assert rain.serial in bass_backend._kept  # still playing out
+    fake.end_pass(rain.stream)
+    backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)
+    assert rain.serial in bass_backend._kept  # freed, but within the grace period
+    now[0] += 60
+    backend.play("/sounds/hit.ogg", "hit", 1.0, 0.0, False)
+    assert rain.serial not in bass_backend._kept
+
+
+def test_the_panic_key_stops_a_cue_while_it_fades_away():
+    # A fade away can take seconds; the stop-all key and closing the session must end it.
+    fake, backend, _errors = _backend()
+    bus = SoundBus(backend)
+    bus.play("/sounds/rain.ogg", "rain", loop=True)
+    bus.fade_away("rain", 5.0)
+    assert fake.streams  # fading
+    bus.flush()
+    assert fake.streams == {}
+
+
 def test_an_effect_goes_on_the_playing_cue_with_the_settings_given():
     fake, backend, _errors = _backend()
     backend.play("/sounds/rain.ogg", "rain", 1.0, 0.0, True)
@@ -553,7 +666,8 @@ def test_real_bass_repeats_a_cue_the_number_of_times_asked(real_bass, tmp_path):
         False, path, 0, 0, flags | bass_library.STREAM_DECODE | SAMPLE_LOOP
     )
     length = core.BASS_ChannelGetLength(stream, 0)
-    backend._repeat(stream, 3)
+    cue = bass_backend._Cue(stream=stream, gain=1.0, pan=0.0)  # holds the callback alive
+    backend._repeat(cue, 3)
     buffer = ctypes.create_string_buffer(1 << 16)
     total = 0
     while total < length * 10:
@@ -604,7 +718,7 @@ def test_real_bass_trims_and_repeats_a_cue_each_time_round(real_bass, tmp_path):
     second = core.BASS_ChannelSeconds2Bytes(stream, 1.0)
     cue = bass_backend._Cue(stream=stream, gain=1.0, pan=0.0)
     cue.end = core.BASS_ChannelGetLength(stream, 0)
-    backend._repeat(stream, 3)
+    backend._repeat(cue, 3)
     backend._time(cue, CueTiming(start=0.5, finish=1.5), looping=True)
     buffer = ctypes.create_string_buffer(1 << 16)
     total = 0
@@ -679,3 +793,25 @@ def test_real_bass_puts_its_effects_on_a_cue(real_bass, tmp_path):
     backend.remove_effect("fx", echo)
     assert backend.effect_settings("fx", echo) is None
     backend.stop("fx")
+
+
+@needs_bass
+def test_real_bass_frees_a_loop_once_it_stops_and_forgets_it(real_bass, tmp_path):
+    import time
+
+    tone = _tone(tmp_path / "tone.wav", seconds=0.2)
+    backend = BassSoundBackend(real_bass.core)
+    details = bass_library.ChannelInfo()
+    backend.play(str(tone), "loop", 1.0, 0.0, True)
+    looped = backend._cues["loop"].stream
+    backend.set_looping("loop", False)
+    backend.play(str(tone), "faded", 1.0, 0.0, True)
+    faded = backend._cues["faded"].stream
+    backend.fade_away("faded", 0.1)
+    time.sleep(0.7)
+    for stream in (looped, faded):
+        assert not real_bass.core.BASS_ChannelGetInfo(stream, ctypes.byref(details))  # freed
+    assert not backend.is_playing("loop")
+    backend.play(str(tone), "other", 1.0, 0.0, False)
+    assert sorted(backend._cues) == ["other"]
+    backend.stop("other")

@@ -221,13 +221,14 @@ class SoundBus:
         self._backend.stop(channel)
 
     def fade_away(self, channel: str, seconds: float) -> None:
-        """Fade a playing cue out over ``seconds`` and stop it (Client.Media's fadeaway)."""
-        self._playing.discard(channel)
-        fade = getattr(self._backend, "fade_away", None)
-        if fade is None:
-            self._backend.stop(channel)
+        """Fade a playing cue out over ``seconds`` and stop it (Client.Media's fadeaway). It
+        stays among the channels flush() stops: a fade can take seconds, and the stop-all key
+        must end it too."""
+        own_fade = getattr(type(self._backend), "fade_away", None)
+        if own_fade is None or own_fade is SoundBackend.fade_away:
+            self.stop(channel)  # a backend that can't fade stops the cue at once
         else:
-            fade(channel, seconds)
+            self._backend.fade_away(channel, seconds)
 
     def is_playing(self, channel: str) -> bool:
         # The backend is the truth (a one-shot ends on its own); `_playing` only
