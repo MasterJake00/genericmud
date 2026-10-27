@@ -130,6 +130,68 @@ def _select_asset(assets: list[dict]) -> dict | None:
     return None
 
 
+# A version's heading in the release notes (tools/extract_changelog.py): "## 0.20.3 — 2026-10-27".
+# Whatever follows the version, a date or not, goes after it in the window.
+_NOTES_HEADING = re.compile(r"^##\s+(\d+\.\d+\.\d+)(?=\s|$)\s*(?:[—–-]\s*)?(.*)$")
+_SECTION_LABEL = re.compile(r"^\*\*(.+)\*\*$")
+
+
+def notes_since(body: str, tag: str, installed: tuple[int, int, int]) -> str:
+    """What the update window says is new. A release's notes are its own section, then each
+    earlier version's under its heading, newest first (tools/extract_changelog.py); this keeps
+    the versions newer than the one installed, each under "New in X", as plain text a screen
+    reader reads without stars, hashes or lines broken mid-sentence."""
+    if not body.strip():
+        return ""
+    blocks: list[tuple[str, list[str]]] = [(f"New in {tag.lstrip('v')}", [])]
+    for line in body.splitlines():
+        heading = _NOTES_HEADING.match(line.strip())
+        if heading is None:
+            blocks[-1][1].append(line)
+            continue
+        version = _parse_version(heading.group(1))
+        if version is not None and version <= installed:
+            break  # this one and everything older is already installed
+        date = heading.group(2).strip()
+        title = f"New in {heading.group(1)}" + (f", {date}" if date else "")
+        blocks.append((title, []))
+    rendered = []
+    for title, lines in blocks:
+        paragraphs = _plain_paragraphs(lines)
+        if paragraphs:
+            rendered.append("\n\n".join([title, *paragraphs]))
+    return "\n\n".join(rendered)
+
+
+def _plain_paragraphs(lines: list[str]) -> list[str]:
+    """Markdown notes as plain paragraphs: a bold label on its own, each bullet its own
+    paragraph, wrapped lines joined, and no formatting marks."""
+    paragraphs: list[str] = []
+    current: list[str] = []
+
+    def finish() -> None:
+        if current:
+            paragraphs.append(" ".join(current))
+            current.clear()
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            finish()
+            continue
+        label = _SECTION_LABEL.match(line)
+        if label is not None:
+            finish()
+            paragraphs.append(label.group(1))
+            continue
+        if line.startswith(("* ", "- ")):
+            finish()
+            line = line[2:]
+        current.append(line.replace("**", "").replace("`", ""))
+    finish()
+    return paragraphs
+
+
 def check_for_update() -> dict | None:
     """Return update info for the newest release above the installed version, else ``None``.
 
@@ -172,8 +234,21 @@ def check_for_update() -> dict | None:
         "size": asset.get("size", 0),
         "digest": asset.get("digest"),
         "release_url": release.get("html_url"),
-        "notes": release.get("body") or "",
+        "notes": _update_notes(release, current),
     }
+
+
+def _update_notes(release: dict, installed: tuple[int, int, int]) -> str:
+    """The release's notes for the update window. Tidying them never stands in the way of the
+    update: if it fails, the notes come as the release has them."""
+    body = release.get("body") or ""
+    try:
+        return notes_since(body, release["tag_name"], installed)
+    except Exception:  # noqa: BLE001 - a notes bug must not block updating to its fix
+        logger.exception(
+            "Couldn't tidy release %s's notes; showing them as they are.", release["tag_name"]
+        )
+        return body
 
 
 def is_frozen() -> bool:

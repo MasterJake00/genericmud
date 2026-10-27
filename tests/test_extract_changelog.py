@@ -17,6 +17,7 @@ _spec = importlib.util.spec_from_file_location("extract_changelog", _MOD_PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 extract_section = _mod.extract_section
+extract_notes = _mod.extract_notes
 main = _mod.main
 
 
@@ -95,6 +96,30 @@ def test_main_writes_the_section_to_the_output_file(tmp_path):
     out = tmp_path / "release_notes.md"
     assert main([str(changelog), "v0.7.1", str(out)]) == 0
     assert "Channel triggers match again." in out.read_text(encoding="utf-8")
+
+
+def test_release_notes_carry_the_earlier_versions_too():
+    # The update window of genericMud 0.20.3 and older reads only the newest release's notes,
+    # so someone several versions behind heard about the newest change alone. Each release's
+    # notes now carry the earlier versions under their own headings, newest first.
+    out = extract_notes(_SAMPLE, "v0.8.0")
+    assert out.startswith("**New features**")  # its own section first, its heading dropped
+    assert "## 0.7.1 — 2026-07-27" in out
+    assert out.index("Channel triggers match again.") < out.index("Menu access keys.")
+    assert "Preamble" not in out
+
+
+def test_release_notes_stop_at_the_size_limit_and_say_where_the_rest_is():
+    out = extract_notes(_SAMPLE, "0.8.0", limit=120)
+    assert "Channel triggers match again." in out
+    assert "Menu access keys." not in out  # the next whole section won't fit
+    assert out.rstrip().endswith(_mod.OLDER_NOTES)
+    assert len(extract_notes(_SAMPLE, "0.8.0", limit=1)) > 0  # its own section always goes in
+
+
+def test_the_oldest_versions_notes_stand_alone():
+    assert extract_notes(_SAMPLE, "0.7.0") == "Menu access keys."
+    assert extract_notes(_SAMPLE, "9.9.9") is None
 
 
 def test_the_real_changelog_has_a_section_for_the_current_version():
