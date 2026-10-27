@@ -331,6 +331,33 @@ def test_packs_never_hear_connected_when_the_connection_fails(tmp_path):
     assert backend.spoken.count("connected") == 1
 
 
+def test_packs_hear_their_world_in_front_once_installed_and_then_each_change(tmp_path):
+    # Miriani-Next plays room ambience only while its window has focus, which it learns
+    # from OnPluginGetFocus: genericMud never sent it, so the ambience never played. Packs
+    # installed while their world is in front hear so at once, before they hear it connect,
+    # as in MUSHclient; after that, only changes.
+    store = PackStore(tmp_path / "store")
+    _install_mush(
+        store, tmp_path,
+        "<muclient><plugin id='focus' name='focus'/><script><![CDATA[\n"
+        "function OnPluginGetFocus() Note('front') end\n"
+        "function OnPluginLoseFocus() Note('behind') end\n"
+        "function OnPluginConnect() Note('connected') end\n"
+        "]]></script></muclient>",
+    )
+    backend = RecordingBackend()
+    app = EngineApp(VoiceRouter(backend, clock=lambda: 0.0), packs=store, name="mud")
+    app.on_focus_changed(True)  # the window was in front before the packs loaded
+    app.on_connect("mud", socket_open=False)
+    app.on_socket_open()
+    app.on_focus_changed(True)
+    app.on_focus_changed(False)
+    app.on_focus_changed(False)
+    app.on_focus_changed(True)
+    heard = [text for text in backend.spoken if text in ("front", "behind", "connected")]
+    assert heard == ["front", "connected", "behind", "front"]
+
+
 def test_simulate_sends_text_through_triggers_the_output_and_speech(tmp_path):
     # Mush-Z strips its zchn: channel prefix and simulates the rest, so its other triggers
     # catch the line as if the MUD had sent it without one.

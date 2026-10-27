@@ -463,7 +463,7 @@ _XML_TRUE = frozenset({"y", "yes", "1", "-1", "true", "t"})
 _PLUGIN_SEQUENCE = 5000  # MUSHclient's default plugin sequence
 # World file event handlers genericMud runs (on_world_<event>). MUSHclient's get_focus and
 # lose_focus, for the window, have no equivalent here yet.
-_WORLD_EVENTS = ("open", "connect", "disconnect", "close")
+_WORLD_EVENTS = ("open", "connect", "disconnect", "close", "get_focus", "lose_focus")
 _PLUGIN_DATE = re.compile(r"^(\d+)-(\d+)-(\d+)(?:\s+(\d+)(?::(\d+))?(?::(\d+))?)?$")
 
 
@@ -4361,6 +4361,13 @@ class MushclientPack:
         function = self._lua_function(handler, "world")
         if function is not None:
             self._in_plugin("world", self._guard.run, function)
+
+    def dispatch_focus(self, focused: bool) -> None:
+        """The world's window came to the front or went behind: the world file's handler,
+        then each plugin's OnPluginGetFocus or OnPluginLoseFocus, as MUSHclient tells them
+        (Miriani-Next plays its room ambience only while in front)."""
+        self._world_event("get_focus" if focused else "lose_focus")
+        self.dispatch("OnPluginGetFocus" if focused else "OnPluginLoseFocus")
 
     def dispatch_connect(self) -> None:
         self._connected_at = time.time()

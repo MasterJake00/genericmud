@@ -1347,3 +1347,78 @@ def test_the_window_tells_packs_the_mud_connected_only_once_it_has(frame, monkey
         panel.Destroy()
         loop.run_until_complete(asyncio.sleep(0.01))
         loop.close()
+
+
+def test_the_world_in_front_is_the_selected_tab_while_genericmud_is(frame, tmp_path, monkeypatch):
+    # Packs hear their world come to the front or go behind, as MUSHclient tells them: the
+    # world in front is the selected tab, while genericMud's window, or a dialog of its own,
+    # is the active one.
+    import asyncio
+
+    from genericmud.ui import wx_app
+    from tests.helpers import RecordingBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(wx_app, "make_voice_backend", RecordingBackend)
+    monkeypatch.setattr(wx_app, "make_diagnostic_log", lambda: None)
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+    told: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        wx_app.SessionPanel, "set_focused",
+        lambda panel, focused: told.append((panel.world.name, focused)),
+    )
+    in_front = [True]
+    loop = asyncio.new_event_loop()
+    main = wx_app.GenericMudFrame(loop, {})
+    monkeypatch.setattr(main, "_world_in_front", lambda: in_front[0])
+    try:
+        main.open_session(World("One", "one.example", 4000))
+        main.open_session(World("Two", "two.example", 4000))
+        assert told[-2:] == [("One", False), ("Two", True)]
+        told.clear()
+        main._switch_session(0)
+        assert told == [("One", True), ("Two", False)]
+        told.clear()
+        in_front[0] = False  # another program came to the front
+        main._update_focus()
+        assert told == [("One", False), ("Two", False)]
+    finally:
+        main.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()
+
+
+def test_a_session_tells_its_packs_each_change_in_front_once(frame, monkeypatch):
+    import asyncio
+
+    from genericmud.ui import wx_app
+
+    async def no_session(_panel):
+        return None
+
+    monkeypatch.setattr(wx_app.SessionPanel, "_start", no_session)
+    loop = asyncio.new_event_loop()
+    panel = wx_app.SessionPanel(frame, loop, {}, World("Test", "mud.example", 4000))
+
+    class _App:
+        heard: list[bool] = []
+
+        def on_focus_changed(self, focused: bool) -> None:
+            _App.heard.append(focused)
+
+    try:
+        panel.app = _App()
+        for focused in (True, True, False, True):
+            panel.set_focused(focused)
+        loop.run_until_complete(asyncio.sleep(0))
+        assert _App.heard == [True, False, True]
+    finally:
+        panel.app = None
+        panel.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()

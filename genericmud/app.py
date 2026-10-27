@@ -471,6 +471,7 @@ class EngineApp:
         self._mush_packs: list[MushclientPack] = []  # loaded MUSHclient packs (hook dispatch)
         self._vip_packs: list[VipMudPack] = []  # loaded VIPMud packs (OnConnect/OnDisconnect)
         self._vip_connected = False  # which of the two the VIPMud packs last heard
+        self._focused = False  # this world is the one in front (see on_focus_changed)
         self._mush_connected = False  # the same for the MUSHclient packs' hooks
         self._pack_timers_cancelled = False  # a dropped connection cancelled the packs' timers
         self._simulate_depth = 0  # Simulate inside a line that was itself simulated
@@ -610,6 +611,16 @@ class EngineApp:
         self.begin_login(world)
         self._check_pack_updates(result)
         return result
+
+    def on_focus_changed(self, focused: bool) -> None:
+        """This world came to the front (the selected tab, while genericMud's window is the
+        active one) or went behind. MUSHclient packs hear each change, as MUSHclient tells
+        a world's handlers and plugins; packs installed later hear it as they arrive."""
+        if focused == self._focused:
+            return
+        self._focused = focused
+        for pack in self._mush_packs:
+            pack.dispatch_focus(focused)
 
     def on_socket_open(self) -> None:
         """The connection to the MUD is open: packs hear it, as MUSHclient's
@@ -755,6 +766,9 @@ class EngineApp:
                              packs=len(self._mush_packs))
         for pack in self._mush_packs:
             pack.dispatch_install()
+        if self._focused:  # the world is in front as its packs arrive, as in MUSHclient
+            for pack in self._mush_packs:
+                pack.dispatch_focus(True)
         if self._msdp_offered:  # negotiation happened before packs were ready: replay it
             self._dispatch_msdp_start()
         self._arm_plugin_ticks()

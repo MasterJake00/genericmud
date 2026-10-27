@@ -254,6 +254,29 @@ def test_the_world_files_handlers_run_around_the_plugins_hooks():
     assert sink.sent == ["say bye"]
 
 
+def test_the_world_and_its_plugins_hear_it_come_to_the_front_and_go_behind():
+    # MUSHclient tells the world file's focus handlers, then each plugin, when the world's
+    # window comes to the front or goes behind. Miriani-Next plays its room ambience only
+    # while in front, and the Yu-Gi-Oh pack pauses its music behind.
+    sink, engine = _engine()
+    pack = MushclientPack(ScriptApi(engine, source="m"))
+    pack.load_source(
+        "<muclient><world name='w' on_world_get_focus='Front' on_world_lose_focus='Behind'/>"
+        "<script><![CDATA[\n"
+        "function Front() Note('world front') end\n"
+        "function Behind() Note('world behind') end\n"
+        "]]></script></muclient>"
+    )
+    pack.load_source(_plugin(A, "p", (
+        "function OnPluginGetFocus() Note('plugin front') end\n"
+        "function OnPluginLoseFocus() Note('plugin behind') end"
+    )))
+    pack.dispatch_install()
+    pack.dispatch_focus(True)
+    pack.dispatch_focus(False)
+    assert _notes(sink) == ["world front", "plugin front", "world behind", "plugin behind"]
+
+
 def test_a_disabled_plugins_alias_lets_the_command_through():
     sink, engine = _engine()
     pack = MushclientPack(ScriptApi(engine, source="m"))

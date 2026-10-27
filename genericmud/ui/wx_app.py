@@ -293,6 +293,7 @@ class SessionPanel(wx.Panel):
         # The output put the reader back at the bottom since a search last found something,
         # so the next one searches from there, not on from the line it found.
         self._find_from_bottom = False
+        self._focused = False  # this world is the one in front (GenericMudFrame._update_focus)
         self._keep_caret_on_focus = False  # one-shot: don't jump to the bottom this time
         self._questions: list[_PackQuestion] = []  # pack dialogs the loop thread waits on
         self._notepad_windows: dict[str, PackNotepadFrame] = {}  # packs' notepads, by title
@@ -367,6 +368,7 @@ class SessionPanel(wx.Panel):
             encoding=self.world.encoding,
             other_worlds=lambda: [world.name for world in load_worlds()],
         )
+        self.app.on_focus_changed(self._focused)  # what the window said before this existed
         self.app.asker = self._ask_from_pack
         self.app.pack_window = self  # packs' clipboard, command box, notepads and links
         # The address this session reaches may serve its media even on localhost or the LAN.
@@ -1010,6 +1012,17 @@ class SessionPanel(wx.Panel):
 
     def set_active(self, active: bool) -> None:
         self._loop.call_soon_threadsafe(self._apply_active, active)
+
+    def set_focused(self, focused: bool) -> None:  # UI thread
+        """Whether this world is the one in front; its packs hear each change."""
+        if focused == self._focused:
+            return
+        self._focused = focused
+        self._loop.call_soon_threadsafe(self._apply_focus, focused)
+
+    def _apply_focus(self, focused: bool) -> None:  # loop thread
+        if self.app is not None:
+            self.app.on_focus_changed(focused)
 
     def apply_world_settings(self, world: World) -> None:  # UI thread
         """Take a world's edited command stacking, logging and sound downloads now. How the
@@ -3787,6 +3800,7 @@ class GenericMudFrame(wx.Frame):
     def _switch_session(self, index: int) -> None:
         self.book.ChangeSelection(index)  # ChangeSelection: no page-changed event to handle
         self._update_active()
+        self._update_focus()
         # Focus the new page's command box; NVDA reads its name, announcing the session.
         self.book.GetPage(index).input.SetFocus()
 
@@ -3799,6 +3813,7 @@ class GenericMudFrame(wx.Frame):
         self.book.AddPage(panel, world.name, select=True)
         panel.input.SetFocus()
         self._update_active()
+        self._update_focus()
         # Opening any menu with no tab open greys the File item out, and a greyed item's
         # Ctrl+D never fires. Bring it back with the tab, not at the next menu opening.
         self._refresh_connection_item()
@@ -3815,7 +3830,27 @@ class GenericMudFrame(wx.Frame):
         self._app_focused = event.GetActive()
         if self._prefs.background_silence:
             self._update_active()
+        # Which world is in front once the activation has settled: one of our own dialogs
+        # coming up leaves it in front, another program doesn't (see _world_in_front).
+        wx.CallAfter(self._update_focus)
         event.Skip()
+
+    def _world_in_front(self) -> bool:
+        """Whether the player is in genericMud's main window: it's the active window, or a
+        dialog of ours is, as MUSHclient's Find and settings dialogs leave a world in front.
+        Switching to another program, or to a pack's notepad window, puts it behind."""
+        active = wx.GetActiveWindow()
+        return active is self or isinstance(active, wx.Dialog)
+
+    def _update_focus(self) -> None:
+        """Tell each session whether its world is the one in front: the selected tab, while
+        _world_in_front. Packs hear it as MUSHclient's focus events."""
+        if not self._alive:
+            return
+        in_front = self._world_in_front()
+        selected = self.book.GetSelection()
+        for index in range(self.book.GetPageCount()):
+            self.book.GetPage(index).set_focused(in_front and index == selected)
 
     def _on_toggle_bg_silence(self, _event: wx.CommandEvent) -> None:
         self._save_pref("background_silence", self._bg_silence_item.IsChecked())
@@ -3936,6 +3971,7 @@ class GenericMudFrame(wx.Frame):
             self.book.GetPage(index).close()  # cancel connection, stop speech
             self.book.DeletePage(index)
             self._update_active()
+            self._update_focus()
             self._refresh_connection_item()  # greys out again once the last tab is gone
             if self.book.GetPageCount():  # no tab strip to fall back on; place focus
                 self.book.GetPage(self.book.GetSelection()).input.SetFocus()
