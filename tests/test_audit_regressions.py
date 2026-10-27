@@ -248,12 +248,15 @@ def _mush(tmp_path, script, *, full_stdlib=True):
 
 def test_playsound_forwards_volume_and_pan(tmp_path):
     """M4: PlaySound(buffer, file, loop, volume, pan) dropped volume+pan before -- every cue
-    played full-volume and centered (pan is directional info for a blind user)."""
-    sink, _engine = _mush(tmp_path, 'PlaySound(0, "hit.wav", false, 50, -100)')
+    played full-volume and centered (pan is directional info for a blind user). Both are in
+    MUSHclient's units: decibels below full, and decibels taken off the other side."""
+    (tmp_path / "sounds").mkdir()
+    (tmp_path / "sounds" / "hit.wav").write_bytes(b"RIFF")
+    sink, _engine = _mush(tmp_path, 'PlaySound(0, "hit.wav", false, -6, -100)')
     assert sink.played, "PlaySound must reach the sound sink"
     cue = sink.played[-1]
-    assert cue["gain"] == pytest.approx(0.5)  # 50 / 100
-    assert cue["pan"] == pytest.approx(-1.0)  # -100 / 100 (hard left)
+    assert cue["gain"] == pytest.approx(10 ** (-6 / 20))  # 6 dB down: about half
+    assert cue["pan"] == pytest.approx(-1.0, abs=1e-4)  # right side 100 dB down: hard left
 
 
 def test_sound_volume_directive_leaves_category_master_untouched(tmp_path):

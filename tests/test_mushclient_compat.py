@@ -1420,10 +1420,10 @@ def test_onplugintick_reaches_plugin_and_isconnected_is_real(tmp_path):
 
 _SOUND_WORLD = (
     "<muclient><script><![CDATA[\n"
-    'function amb() PlaySound(1, "amb.wav", true, 50, 0) end\n'
-    'function hit() PlaySound(2, "hit.wav", false, 100, 25) end\n'
-    'function auto() PlaySound(0, "auto.wav", false, 100, 0) end\n'
-    'function tweak() PlaySound(1, "", false, 25, -100) end\n'
+    'function amb() PlaySound(1, "amb.wav", true, -6, 0) end\n'
+    'function hit() PlaySound(2, "hit.wav", false, 0, 6) end\n'
+    'function auto() PlaySound(0, "auto.wav", false, 0, 0) end\n'
+    'function tweak() PlaySound(1, "", false, -12, -100) end\n'
     'function halt1() StopSound(1) end\n'
     'function haltall() StopSound() end\n'
     'function panit() Sound("pan=-100") end\n'
@@ -1456,6 +1456,9 @@ class _SpyBus(SoundBus):
 
 
 def _sound_pack(tmp_path) -> tuple[RecordingSink, AutomationEngine, _SpyBus]:
+    (tmp_path / "sounds").mkdir()
+    for name in ("amb.wav", "hit.wav", "auto.wav"):
+        (tmp_path / "sounds" / name).write_bytes(b"RIFF")
     world = tmp_path / "World.mcl"
     world.write_text(_SOUND_WORLD, encoding="latin-1")
     sink = RecordingSink()
@@ -1475,15 +1478,17 @@ def test_playsound_buffers_map_to_distinct_channels(tmp_path):
     engine.process_line(Line("amb"))
     engine.process_line(Line("hit"))
     assert [p["channel"] for p in sink.played] == ["mush-1", "mush-2"]
-    assert sink.played[0]["loop"] is True and abs(sink.played[0]["gain"] - 0.5) < 1e-9
-    assert abs(sink.played[1]["pan"] - 0.25) < 1e-9
+    assert sink.played[0]["loop"] is True
+    assert sink.played[0]["gain"] == pytest.approx(10 ** (-6 / 20))  # 6 dB down
+    assert sink.played[1]["pan"] == pytest.approx(1 - 10 ** (-6 / 20))  # left 6 dB down
 
 
 def test_playsound_buffer_zero_picks_the_first_free_buffer(tmp_path):
     sink, engine, bus = _sound_pack(tmp_path)
-    bus.busy = {"mush-1"}  # buffer 1 occupied -> 0 must select buffer 2
+    engine.process_line(Line("amb"))
+    bus.busy = {"mush-1"}  # buffer 1 still playing -> 0 must select buffer 2
     engine.process_line(Line("auto"))
-    assert [p["channel"] for p in sink.played] == ["mush-2"]
+    assert [p["channel"] for p in sink.played] == ["mush-1", "mush-2"]
 
 
 def test_playsound_empty_filename_adjusts_the_playing_buffer(tmp_path):
@@ -1491,9 +1496,13 @@ def test_playsound_empty_filename_adjusts_the_playing_buffer(tmp_path):
     # that buffer; it used to be forwarded as a (failing) play of "".
     sink, engine, bus = _sound_pack(tmp_path)
     engine.process_line(Line("amb"))
+    bus.busy = {"mush-1"}  # the loop is still playing
     engine.process_line(Line("tweak"))
     assert len(sink.played) == 1  # no phantom play of ""
-    assert bus.adjusted == [("mush-1", 0.25, -1.0)]
+    [(channel, gain, pan)] = bus.adjusted
+    assert channel == "mush-1"
+    assert gain == pytest.approx(10 ** (-12 / 20))  # 12 dB down
+    assert pan == pytest.approx(-1.0, abs=1e-4)  # the right side 100 dB down: hard left
 
 
 def test_stopsound_stops_one_buffer_or_all(tmp_path):

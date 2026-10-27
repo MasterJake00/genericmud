@@ -25,6 +25,7 @@ import binascii
 import datetime
 import hashlib
 import json
+import math
 import random
 import re
 import time
@@ -38,6 +39,7 @@ from uuid import uuid4
 from genericmud.automation.engine import MatchContext, compile_pattern
 from genericmud.navigation import expand_speedwalk
 from genericmud.render.ansi import strip_ansi
+from genericmud.safepath import is_absolute
 from genericmud.scripting.api import MESSAGE_BUTTONS, ScriptApi
 from genericmud.scripting.guard import ScriptGuard
 from genericmud.scripting.lua_runtime import install_pack_require, make_sandboxed_runtime
@@ -149,8 +151,10 @@ _TIMER_ERROR = 1
 
 _SOUND_CHANNEL = "sound"  # MUSHclient Sound() is a single-voice channel
 _SOUND_BUFFERS = 10  # MUSHclient PlaySound offers buffers 1..10; 0 = first free
-_VOLUME_MAX = 100.0  # MUSHclient volume is 0..100
-_PAN_MAX = 100.0  # bass/MUSHclient pan is -100..100; the SoundBus wants -1..1
+_FREE_BUFFER_CHOICES = 5  # PlaySound's buffer 0 takes a free one among the first five
+_QUIETEST_DECIBELS = 100.0  # PlaySound's volume runs 0 to -100 dB, its pan -100 to 100
+_VOLUME_MAX = 100.0  # Sound("volume=x") is a percentage, as the LuaAudio packs send it
+_PAN_MAX = 100.0  # and Sound("pan=x") one from -100 to 100; the SoundBus wants -1..1
 _HTTP_CHUNK_BYTES = 16 * 1024
 _HTTP_MAX_BYTES = 32 * 1024 * 1024
 _HTTP_TIMEOUT_SECONDS = 20
@@ -168,6 +172,28 @@ def _open_http(url: str):
 def _buffer_channel(number: int) -> str:
     """The logical sound-bus channel for a MUSHclient PlaySound buffer."""
     return f"mush-{number}"
+
+
+def _decibel_gain(volume: object) -> float:
+    """PlaySound's volume as the amplitude the sound bus takes: decibels, 0 full and -100
+    silent. Anything outside that plays at full, as MUSHclient forces it to 0."""
+    decibels = _to_float(volume)
+    if decibels is None or not -_QUIETEST_DECIBELS <= decibels <= 0:
+        decibels = 0.0
+    return 10 ** (decibels / 20)
+
+
+def _decibel_pan(pan: object) -> float:
+    """PlaySound's pan as the sound bus takes it. MUSHclient's is DirectSound's: the decibels
+    taken off the other side, -100 hard left and 100 hard right, and anything outside that
+    centred. The bus pans by balance, keeping the near side full and lowering the other in
+    proportion (measured on BASS, and so does the pygame backend), so lowering the other side
+    by d decibels is a balance of 1 - 10^(-d/20) toward the near side."""
+    decibels = _to_float(pan)
+    if decibels is None or not -_QUIETEST_DECIBELS <= decibels <= _QUIETEST_DECIBELS:
+        return 0.0
+    other_side = 10 ** (-abs(decibels) / 20)
+    return math.copysign(1 - other_side, decibels)
 
 # Lifecycle entry points MUSHclient calls on each plugin. All plugins share one _G here,
 # so each plugin's hooks are captured (and the globals cleared) right after its script
@@ -603,6 +629,7 @@ class MushclientPack:
         self._connected_at: float | None = None  # GetInfo(301) and GetConnectDuration
         self._saving_state = False  # SaveState can't run inside OnPluginSaveState
         self._in_sound_hook = False  # a plugin's OnPluginPlaySound is running
+        self._held_buffers: set[int] = set()  # PlaySound buffers not freed yet
         self._notepads: dict[str, str] = {}  # MUSHclient notepads by title
         self._loading_plugins: dict[str, int] = {}  # plugins whose files are loading now
         self._plugin_files: dict[str, set[Path]] = {}  # plain includes each plugin loaded
@@ -1849,6 +1876,7 @@ class MushclientPack:
             "GetSoundKeyword": lambda *_a: "",
             "PlaySound": self._play_sound,
             "StopSound": self._stop_sound,
+            "GetSoundStatus": self._get_sound_status,
             "Sound": self._sound,
             "GetInfo": self._get_info,
             "DoAfter": self._do_after,
@@ -2764,52 +2792,95 @@ class MushclientPack:
     def _play_sound(
         self,
         buffer: object = 0,
-        file: str = "",
+        file: object = "",
         loop: object = False,
-        volume: object = 100,
+        volume: object = 0,
         pan: object = 0,
-    ) -> None:
-        # MUSHclient PlaySound(buffer, file, loop, volume, pan): volume 0..100, pan -100..100.
-        # Both were dropped before, so every cue played full-volume and centered -- pan carries
-        # directional information for a blind user, so that's a real accessibility loss.
-        #
-        # The buffer selects one of 10 concurrent slots; ignoring it collapsed every cue
-        # onto one channel, so a one-shot on buffer 2 cut off a loop started on buffer 1.
-        # Buffer 0 means "the first free buffer, or buffer 1 if none are free" (gammon.com.au
-        # PlaySound docs). An empty filename modifies the sound already playing in that
-        # buffer (volume/pan) rather than starting one; stopping is StopSound's job.
-        vol = _to_float(volume)
-        pan_value = _to_float(pan)
-        gain = vol / _VOLUME_MAX if vol is not None else 1.0
-        pan_out = max(-1.0, min(1.0, pan_value / _PAN_MAX)) if pan_value is not None else 0.0
-        number = int(_to_float(buffer) or 0)
-        file_text = str(file or "")
-        if not file_text:
-            if 1 <= number <= _SOUND_BUFFERS:
-                self._api.adjust(_buffer_channel(number), gain=gain, pan=pan_out)
-            return  # buffer 0 selects a FREE slot: nothing is playing there to modify
-        if number == 0:
-            number = next(
-                (
-                    n
-                    for n in range(1, _SOUND_BUFFERS + 1)
-                    if not self._api.is_playing(_buffer_channel(n))
-                ),
-                1,
-            )
-        number = min(max(number, 1), _SOUND_BUFFERS)
-        self._api.play(
-            file_text, channel=_buffer_channel(number), gain=gain, pan=pan_out, loop=bool(loop)
-        )
+        *_rest: object,
+    ) -> int:
+        """MUSHclient ``PlaySound(buffer, file, loop, volume, pan)``, by the rules in its source.
 
-    def _stop_sound(self, buffer: object = 0) -> None:
-        """MUSHclient ``StopSound(buffer)``: stop one of the 10 sound buffers, 0 = all."""
+        Ten buffers play at once, one sound each. The volume is in decibels, 0 full and -100
+        silent, and the pan is the decibels taken off the other side, -100 hard left and 100
+        hard right; anything outside those plays at full and centred, as MUSHclient forces it.
+        An empty file name re-sets the volume, pan and looping of the sound playing in that
+        buffer. Buffer 0 takes a free buffer among the first five, or buffer 1. A file that
+        isn't there leaves the buffer playing what it was, and answers eFileNotFound.
+        """
+        self._let_go_of_ended_buffers()  # as MUSHclient does first, every time
+        number = int(_to_float(buffer) or 0)
+        name = "" if file is None else str(file)
+        gain = _decibel_gain(volume)
+        balance = _decibel_pan(pan)
+        looping = _lua_flag(loop, default=False)
+        if not name and 1 <= number <= _SOUND_BUFFERS:
+            if number not in self._held_buffers:
+                return ERROR_CODES["eBadParameter"]  # nothing there to change
+            channel = _buffer_channel(number)
+            self._api.adjust(channel, gain=gain, pan=balance)
+            self._api.set_looping(channel, looping)
+            return E_OK
+        if len(name) < 2:
+            return ERROR_CODES["eBadParameter"]
+        if number == 0:
+            free = (
+                each for each in range(1, _FREE_BUFFER_CHOICES + 1)
+                if each not in self._held_buffers
+            )
+            number = next(free, 1)
+        if not 1 <= number <= _SOUND_BUFFERS:
+            return ERROR_CODES["eBadParameter"]
+        target = self._sound_buffer_file(name)
+        if not self._api.sound_exists(target):
+            return ERROR_CODES["eFileNotFound"]
+        self._held_buffers.add(number)
+        self._api.play(
+            target, channel=_buffer_channel(number), gain=gain, pan=balance, loop=looping
+        )
+        return E_OK
+
+    def _sound_buffer_file(self, name: str) -> str:
+        """Where PlaySound finds ``name``: a name that isn't a full path is in the sounds folder
+        beside MUSHclient, as MUSHclient looks for it, or failing that wherever genericMud finds
+        a pack's sounds."""
+        if self._client_dir is None or is_absolute(name):
+            return name
+        beside = (self._client_dir / "sounds" / name.replace("\\", "/")).as_posix()
+        return beside if self._api.sound_exists(beside) else name
+
+    def _let_go_of_ended_buffers(self) -> None:
+        """Free the buffers whose sounds have ended, as each PlaySound does before anything
+        else: buffer 0 can take them again, and GetSoundStatus says they're free."""
+        for number in list(self._held_buffers):
+            if not self._api.is_playing(_buffer_channel(number)):
+                self._held_buffers.discard(number)
+
+    def _stop_sound(self, buffer: object = 0, *_rest: object) -> int:
+        """MUSHclient ``StopSound(buffer)``: stop one of the ten buffers and free it, or all of
+        them for 0. The stop is sent whether or not anything plays there, since genericMud's
+        web page plays sounds where nothing here can tell whether they're still going."""
         number = int(_to_float(buffer) or 0)
         if number == 0:
-            for n in range(1, _SOUND_BUFFERS + 1):
-                self._api.stop(_buffer_channel(n))
-        elif 1 <= number <= _SOUND_BUFFERS:
-            self._api.stop(_buffer_channel(number))
+            for each in range(1, _SOUND_BUFFERS + 1):
+                self._api.stop(_buffer_channel(each))
+            self._held_buffers.clear()
+            return E_OK
+        if not 1 <= number <= _SOUND_BUFFERS:
+            return ERROR_CODES["eBadParameter"]
+        self._api.stop(_buffer_channel(number))
+        self._held_buffers.discard(number)
+        return E_OK
+
+    def _get_sound_status(self, buffer: object = 0, *_rest: object) -> int:
+        """MUSHclient ``GetSoundStatus(buffer)``: -1 for no such buffer, -2 for a free one, 1
+        while its sound plays (a looping one too, as MUSHclient answers), and 0 once the sound
+        has ended but the buffer hasn't been freed yet."""
+        number = int(_to_float(buffer) or 0)
+        if not 1 <= number <= _SOUND_BUFFERS:
+            return -1
+        if number not in self._held_buffers:
+            return -2
+        return 1 if self._api.is_playing(_buffer_channel(number)) else 0
 
     def _sound(self, arg: object = "", *_rest: object) -> int:
         """MUSHclient ``Sound``: a plugin that plays sounds its own way gets it first (see
