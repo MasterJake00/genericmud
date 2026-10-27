@@ -3836,11 +3836,15 @@ class GenericMudFrame(wx.Frame):
         event.Skip()
 
     def _world_in_front(self) -> bool:
-        """Whether the player is in genericMud's main window: it's the active window, or a
-        dialog of ours is, as MUSHclient's Find and settings dialogs leave a world in front.
-        Switching to another program, or to a pack's notepad window, puts it behind."""
-        active = wx.GetActiveWindow()
-        return active is self or isinstance(active, wx.Dialog)
+        """Whether the player is in genericMud's main window: genericMud is the program in
+        front, with the main window or a dialog over it active, as MUSHclient's own dialogs
+        leave a world in front. A native message box is no window of ours to wx, so it's
+        asked of the app rather than the active window. Another program, or a pack's notepad
+        window, puts the world behind, as a notepad does in MUSHclient."""
+        app = wx.GetApp()
+        if app is None or not app.IsActive():
+            return False
+        return not isinstance(wx.GetActiveWindow(), PackNotepadFrame)
 
     def _update_focus(self) -> None:
         """Tell each session whether its world is the one in front: the selected tab, while

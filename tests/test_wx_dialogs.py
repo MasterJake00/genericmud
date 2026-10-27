@@ -1422,3 +1422,41 @@ def test_a_session_tells_its_packs_each_change_in_front_once(frame, monkeypatch)
         panel.Destroy()
         loop.run_until_complete(asyncio.sleep(0.01))
         loop.close()
+
+
+def test_genericmud_is_in_front_while_it_is_the_active_program(frame, tmp_path, monkeypatch):
+    # A native message box is no window of ours to wx, but genericMud is still the program in
+    # front, as MUSHclient's own dialogs leave its world in front. A pack's notepad window
+    # puts the world behind, as a notepad does in MUSHclient.
+    import asyncio
+
+    from genericmud.ui import wx_app
+    from tests.helpers import RecordingBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(wx_app, "make_voice_backend", RecordingBackend)
+    monkeypatch.setattr(wx_app, "make_diagnostic_log", lambda: None)
+
+    class _Notepad:
+        pass
+
+    monkeypatch.setattr(wx_app, "PackNotepadFrame", _Notepad)
+    active_program = [True]
+    monkeypatch.setattr(wx.GetApp(), "IsActive", lambda: active_program[0])
+    loop = asyncio.new_event_loop()
+    main = wx_app.GenericMudFrame(loop, {})
+    try:
+        monkeypatch.setattr(wx_app.wx, "GetActiveWindow", lambda: None)  # a native message box
+        assert main._world_in_front()
+        monkeypatch.setattr(wx_app.wx, "GetActiveWindow", lambda: main)
+        assert main._world_in_front()
+        monkeypatch.setattr(wx_app.wx, "GetActiveWindow", lambda: _Notepad())
+        assert not main._world_in_front()
+        monkeypatch.setattr(wx_app.wx, "GetActiveWindow", lambda: main)
+        active_program[0] = False  # another program is in front
+        assert not main._world_in_front()
+    finally:
+        main.Destroy()
+        loop.run_until_complete(asyncio.sleep(0.01))
+        loop.close()
