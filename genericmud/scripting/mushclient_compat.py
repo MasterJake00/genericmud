@@ -41,6 +41,7 @@ from genericmud.render.ansi import strip_ansi
 from genericmud.scripting.api import MESSAGE_BUTTONS, ScriptApi
 from genericmud.scripting.guard import ScriptGuard
 from genericmud.scripting.lua_runtime import install_pack_require, make_sandboxed_runtime
+from genericmud.scripting.mushclient_audio import AudioDll
 from genericmud.scripting.mushclient_bass import BassWrapper
 from genericmud.scripting.mushclient_rules import (
     ALIAS,
@@ -167,7 +168,6 @@ def _open_http(url: str):
 def _buffer_channel(number: int) -> str:
     """The logical sound-bus channel for a MUSHclient PlaySound buffer."""
     return f"mush-{number}"
-_AUDIO_CHANNEL_PREFIX = "erion-audio-"  # one bus channel per cue, so stop(id) can target it
 
 # Lifecycle entry points MUSHclient calls on each plugin. All plugins share one _G here,
 # so each plugin's hooks are captured (and the globals cleared) right after its script
@@ -1905,120 +1905,11 @@ class MushclientPack:
         g.custom_colour = custom_colour
 
     def _install_audio(self) -> None:
-        """Provide the ``audio`` global that bass.dll-backed packs (Erion) play every cue through.
-
-        Erion's sound engine (LuaAudio.xml) routes all game audio through ``audio.play`` /
-        ``audio.playDelay`` -- and MSDP dispatch reaches it via ppi -- NOT through ``Sound()``.
-        Without ``audio`` those calls hit the compat black-hole and no cue is ever heard, even
-        though the pack loads its triggers. Map the sound-producing methods onto the ScriptApi
-        (one bus channel per cue id, so ``stop(id)`` works); the DSP-only rest (pan/pitch/fades)
-        no-op via the table's ``__index``. ``play``'s loop flag is honoured only for an explicit
-        ``1`` (LuaAudio's music case) -- a stuck looping combat cue is worse than one that doesn't.
-        """
-        api = self._api
-        channels: dict[int, str] = {}
-        next_id = [1]
-
-        def _alloc() -> tuple[int, str]:
-            if len(channels) > 512:
-                # Opportunistically forget finished cues so a marathon session doesn't grow
-                # the id map forever. Only finished ones: a live loop must stay stoppable by id.
-                for cid, ch in list(channels.items()):
-                    if not api.is_playing(ch):
-                        del channels[cid]
-            cue_id = next_id[0]
-            next_id[0] += 1
-            channel = f"{_AUDIO_CHANNEL_PREFIX}{cue_id}"
-            channels[cue_id] = channel
-            return cue_id, channel
-
-        def _gain(vol: object) -> float:
-            value = _to_float(vol)
-            return value / _VOLUME_MAX if value is not None else 1.0
-
-        def _pan(pan: object) -> float:
-            value = _to_float(pan)
-            return max(-1.0, min(1.0, value / _PAN_MAX)) if value is not None else 0.0
-
-        def _start(file: object, loop: object, pan: object, vol: object, delay: float) -> int:
-            if not str(file or ""):
-                return 0
-            cue_id, channel = _alloc()
-            gain, pan_value, looped = _gain(vol), _pan(pan), _to_float(loop) == 1
-
-            def fire() -> None:
-                api.play(str(file), channel=channel, gain=gain, pan=pan_value, loop=looped)
-
-            if delay > 0:
-                api.add_timer(delay, fire)
-            else:
-                fire()
-            return cue_id
-
-        def play(file: object = "", loop: object = 0, pan: object = None, vol: object = None,
-                 *_rest: object) -> int:
-            return _start(file, loop, pan, vol, 0.0)
-
-        def play_delay(file: object = "", delay: object = 0, pan: object = None, vol: object = None,
-                       *_rest: object) -> int:
-            return _start(file, 0, pan, vol, max(_to_float(delay) or 0.0, 0.0))
-
-        def play_delay_looped(file: object = "", delay: object = 0, pan: object = None,
-                              vol: object = None, *_rest: object) -> int:
-            return _start(file, 1, pan, vol, max(_to_float(delay) or 0.0, 0.0))
-
-        def stop(cue_id: object = 0, *_rest: object) -> None:
-            if _to_float(cue_id) == 0:  # bass convention: id 0 stops every cue
-                api.flush()
-                return
-            channel = channels.pop(int(_to_float(cue_id) or 0), None)
-            if channel is not None:
-                api.stop(channel)
-
-        def is_playing(cue_id: object = 0, *_rest: object) -> int:
-            # Truthful per-cue status. Erion's ambience/music switching is gated on
-            # ppi.isPlaying(old): a hardcoded 0 told it the old cue was already done,
-            # so it started the new one WITHOUT stopping the old -- ambiences stacking
-            # on every room change, area music piling up copy on copy.
-            channel = channels.get(int(_to_float(cue_id) or 0))
-            return 1 if channel is not None and api.is_playing(channel) else 0
-
-        def fadeout(cue_id: object = 0, *_rest: object) -> None:
-            # No DSP fade in the bus; an immediate stop is the correct end state
-            # (this is how the pack retires the outgoing ambience/music).
-            stop(cue_id)
-
-        def slide_vol(cue_id: object = 0, vol: object = None, *_rest: object) -> None:
-            # bass slides the cue's volume over time; the end state is what matters:
-            # 0 is a fade-to-stop, anything else lands the cue at that level (no ramp).
-            target = _to_float(vol)
-            if target == 0:
-                stop(cue_id)
-                return
-            channel = channels.get(int(_to_float(cue_id) or 0))
-            if channel is not None and target is not None:
-                api.adjust(channel, gain=target / _VOLUME_MAX)
-
-        # A table backed by a no-op __index, so any bass method we don't implement
-        # (pan/freq/pitch/slidePan/slidePitch/dll) is safely callable and just does nothing.
-        audio = self._lua.eval("setmetatable({}, {__index = function() return function() end end})")
-        audio.play = play
-        audio.playLooped = lambda file="", *_a: _start(file, 1, None, None, 0.0)
-        audio.playDelay = play_delay
-        audio.playDelayLooped = play_delay_looped
-        audio.stop = stop
-        audio.fadeout = fadeout
-        audio.slideVol = slide_vol
-        audio.free = lambda *_a: api.flush()
-        audio.getVolume = lambda *_a: _VOLUME_MAX
-        audio.isPlaying = is_playing
-        const = self._lua.table()
-        device = self._lua.table()
-        device.stereo = 0x8000
-        const.device = device
-        audio.const = const
-        audio.Init = lambda *_a: _SCRIPT_ERROR_OK
-        self._lua.globals().audio = audio
+        """Provide the ``audio`` global that the LuaAudio packs (Erion, Empire, Mystavaria,
+        Cosmic Rage and others) play every sound through: audio.dll's functions, played on the
+        sound bus (see mushclient_audio)."""
+        audio = AudioDll(lua=self._lua, api=self._api, to_number=_to_float)
+        self._lua.globals().audio = audio.build()
 
     def _install_nvda(self) -> None:
         """Provide the ``nvda`` object MushReader.dll would have installed.

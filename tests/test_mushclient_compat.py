@@ -1161,20 +1161,28 @@ def test_execute_runs_aliases_before_the_wire(tmp_path):
     assert sink.sent == ["look"]  # only the unmatched command reached the wire
 
 
-def test_audio_isplaying_is_truthful_and_fadeout_stops(tmp_path):
+def test_audio_isplaying_is_truthful_and_fadeout_lets_the_cue_play_out(tmp_path):
     """Erion's ambience/music switching is gated on ppi.isPlaying(old): the old
     hardcoded 0 told it the outgoing cue was already done, so it started the new one
     without stopping the old -- ambiences stacking on every room change. isPlaying
-    must reflect the backend, and fadeout must actually retire the cue."""
+    must reflect the backend. fadeout fades the cue to silence and stops its loop, and
+    the cue plays out silently to its end, as audio.dll's does."""
+    from genericmud.sound.bus import SoundBackend, SoundBus
 
-    class _Backend:
+    class _Backend(SoundBackend):
         def __init__(self):
             self.busy: set[str] = set()
+            self.slides: list[tuple] = []
+            self.looping: dict[str, bool] = {}
 
         def is_playing(self, channel):
             return channel in self.busy
 
-    from genericmud.sound.bus import SoundBus
+        def slide(self, channel, gain=None, pan=None, frequency=None, seconds=0.0):
+            self.slides.append((channel, gain, seconds))
+
+        def set_looping(self, channel, loop):
+            self.looping[channel] = loop
 
     backend = _Backend()
     sink = RecordingSink()
@@ -1194,11 +1202,13 @@ def test_audio_isplaying_is_truthful_and_fadeout_stops(tmp_path):
     backend.busy.discard("erion-audio-1")
     assert pack._lua.eval("audio.isPlaying(1)") == 0  # finished cue reads as done
     assert pack._lua.eval("audio.isPlaying(999)") == 0  # unknown id: never an error
-    # fadeout retires the cue: the channel is stopped and the id forgotten.
+    # fadeout: down to silence over its 5 ms, no more going round, and audible till its end.
     backend.busy.add("erion-audio-1")
     pack._lua.execute("audio.fadeout(1, 5)")
-    assert sink.stopped == ["erion-audio-1"]
-    assert pack._lua.eval("audio.isPlaying(1)") == 0  # even though the backend still says busy
+    assert backend.slides == [("erion-audio-1", 0.0, 0.005)]
+    assert backend.looping == {"erion-audio-1": False}
+    assert sink.stopped == []
+    assert pack._lua.eval("audio.isPlaying(1)") == 1
 
 
 def test_accelerator_binds_pack_hotkeys(tmp_path):
