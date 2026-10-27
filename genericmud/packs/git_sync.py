@@ -50,6 +50,9 @@ _WRITTEN = "w"  # the updater wrote or confirmed this file
 _UPDATER_FILES = (".gm_git", ".gm-update-")  # its baseline, check marker and scratch folder
 _KEPT = "k"  # the player's own copy, kept over the pack's
 _SCRATCH_PREFIX = ".gm-update-"  # a file being written, before it's moved into place
+# A kept entry's hash is the pack's version last put beside the player's copy as .new; this one
+# means none has been yet, so the next update offers it again.
+_NOTHING_OFFERED = "0" * 40
 # Characters that end a line somewhere (str.splitlines splits on all of them): a path with one
 # can't be a line of the baseline.
 _LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
@@ -413,6 +416,7 @@ def apply_plan(
     # The rest of the baseline: the player's files, the pack's that were right already, and
     # the pack's old copies still to be replaced.
     unfinished = set(applied.missing) | set(applied.in_use) | set(applied.failed)
+    delivered = set(applied.new_versions) | set(plan.held)  # their .new is the latest
     baseline = Baseline(repo=repo, commit=commit if applied.complete else "", prefix=prefix)
     for repo_path, sha in remote.items():
         target = _inside(pack_dir, prefix + repo_path)
@@ -423,7 +427,13 @@ def apply_plan(
         if repo_path in entries:
             baseline.entries[repo_path] = entries[repo_path]
         elif repo_path in players:
-            baseline.entries[repo_path] = entry_for(target, sha, _KEPT)
+            # Until the .new lands, the version offered is the one before, so it's offered
+            # again next time.
+            offered = sha
+            if repo_path not in delivered:
+                kept_before = previous is not None and previous.kept
+                offered = previous.sha if kept_before else _NOTHING_OFFERED
+            baseline.entries[repo_path] = entry_for(target, offered, _KEPT)
         elif repo_path in unfinished and unchanged_since_plan:
             if previous is not None and not previous.kept:
                 baseline.entries[repo_path] = previous  # the pack's old copy, as recorded

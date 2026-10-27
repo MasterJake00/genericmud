@@ -227,6 +227,67 @@ def test_a_first_update_that_stops_short_still_remembers_the_players_edit(tmp_pa
     assert (pack / "b.lua").read_bytes() == b"b"
 
 
+def test_a_new_version_that_never_arrived_is_delivered_on_the_retry(tmp_path):
+    # The player's settings stay, and the pack's new version goes beside them as .new; a
+    # stopped update mustn't record that version as delivered when it never arrived.
+    pack = tmp_path / "pack"
+    path = _write(pack / "settings.ini", b"player settings")
+    remote = {"settings.ini": blob_sha(b"upstream settings")}
+    plan = make_plan(remote, pack, "", None)
+    applied = git_sync.apply_plan(pack, "", plan, {}, repo="r", commit="c", remote=remote)
+    assert applied.missing == ["settings.ini"]
+    retry = make_plan(remote, pack, "", git_sync.read_baseline(pack))
+    assert retry.modified == remote
+    applied = git_sync.apply_plan(
+        pack, "", retry, _blobs(tmp_path, b"upstream settings"),
+        repo="r", commit="c", remote=remote,
+    )
+    assert applied.complete
+    assert path.read_bytes() == b"player settings"
+    assert (pack / "settings.ini.new").read_bytes() == b"upstream settings"
+    assert git_sync.read_baseline(pack).commit == "c"
+
+
+def test_a_new_version_that_couldnt_be_written_is_delivered_on_the_retry(tmp_path, monkeypatch):
+    pack = tmp_path / "pack"
+    path = _write(pack / "w.mcl", b"<world v1/>")
+    baseline = Baseline(entries={"w.mcl": git_sync.entry_for(path, blob_sha(b"<world v1/>"))})
+    _edit(path, b"<world mine/>")
+    remote = {"w.mcl": blob_sha(b"<world v2/>")}
+    plan = make_plan(remote, pack, "", baseline)
+    real_replace = os.replace
+
+    def locked(source, target):
+        if Path(target).name == "w.mcl.new":
+            raise PermissionError("in use by another process")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(git_sync.os, "replace", locked)
+    applied = git_sync.apply_plan(
+        pack, "", plan, _blobs(tmp_path, b"<world v2/>"), repo="r", commit="c", remote=remote,
+    )
+    assert applied.in_use == ["w.mcl"]
+    monkeypatch.setattr(git_sync.os, "replace", real_replace)
+    retry = make_plan(remote, pack, "", git_sync.read_baseline(pack))
+    assert retry.modified == remote
+
+
+def test_an_edit_between_a_stopped_first_update_and_its_retry_is_kept(tmp_path):
+    pack = tmp_path / "pack"
+    path = _write(pack / "a.lua", b"old")
+    remote = {"a.lua": blob_sha(b"new"), "b.lua": blob_sha(b"b")}
+    plan = make_plan(remote, pack, "", None)
+    git_sync.apply_plan(pack, "", plan, {}, repo="r", commit="c", remote=remote)  # nothing came
+    _edit(path, b"edited between the two tries")
+    retry = make_plan(remote, pack, "", git_sync.read_baseline(pack))
+    assert retry.modified == {"a.lua": remote["a.lua"]}
+    git_sync.apply_plan(
+        pack, "", retry, _blobs(tmp_path, b"new", b"b"), repo="r", commit="c", remote=remote,
+    )
+    assert path.read_bytes() == b"edited between the two tries"
+    assert (pack / "a.lua.new").read_bytes() == b"new"
+
+
 def test_a_file_in_use_is_left_for_next_time(tmp_path, monkeypatch):
     # On Windows the music playing from a file stops it being replaced.
     pack = tmp_path / "pack"
