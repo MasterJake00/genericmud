@@ -97,7 +97,7 @@ from genericmud.session.crashlog import install_loop_exception_handler
 from genericmud.session.credentials import PlaintextCredentialStore
 from genericmud.session.diaglog import DiagnosticLog, make_diagnostic_log
 from genericmud.session.hub import SessionHub
-from genericmud.sound.pygame_backend import make_pygame_backend
+from genericmud.sound.bass_backend import make_sound_backend
 from genericmud.transport.connection import MudConnection
 from genericmud.ui.scrollback import FindState, anchor_after_append, find_line
 from genericmud.update import self_update
@@ -354,7 +354,7 @@ class SessionPanel(wx.Panel):
             schedule=self._loop.call_later,
             keymap=self._keymap,
             packs=self._packs,
-            sound_backend=make_pygame_backend(on_error=self._sound_error, diag=self._diag),
+            sound_backend=make_sound_backend(on_error=self._sound_error, diag=self._diag),
             name=self.world.name,  # used for the session log filename
             credentials=self._credentials,
             hub=self._hub,
