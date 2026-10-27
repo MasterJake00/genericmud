@@ -457,6 +457,11 @@ _UPDATE_ELSEWHERE = (
     "switch or ask for its version. Type update to install what's new, or update check to "
     "hear whether there's anything new."
 )
+_UPDATE_INDEX = (
+    "Making an update index is for the pack's maintainers, who publish one for MUSHclient's "
+    "updater. genericMud updates this soundpack from its repository, so there's no index to "
+    "make here."
+)
 
 
 _XML_TRUE = frozenset({"y", "yes", "1", "-1", "true", "t"})
@@ -4040,6 +4045,13 @@ class MushclientPack:
         if plugin_id == _MIRIANI_NEXT_UPDATER:
             # Its OnPluginInstall binds this, and the pack's setup tells players about it.
             self._api.add_key(_normalize_key_spec("ctrl+u"), lambda _ctx: self._api.update_packs())
+        elif plugin_id == _TOASTUSH_UPDATER:
+            # Its maintainers' "index <file>" makes the index they publish; MUSHclient caught
+            # it, so it never went to the MUD.
+            self._api.add_alias(
+                r"(?i)^index (.+?)$", lambda _ctx: self._note(_UPDATE_INDEX), regex=True,
+                priority=_SPEECH_COMMAND_PRIORITY, fallback=True,
+            )
 
     def _update_command(self, ctx: MatchContext) -> None:
         words = set((ctx.wildcards[1] if len(ctx.wildcards) > 1 else "").split())

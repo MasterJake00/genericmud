@@ -110,6 +110,20 @@ def test_the_launchers_own_commands_get_a_word_instead(tmp_path, typed):
     assert any("genericMud updates this soundpack itself" in text for text, _ in sink.echoed)
 
 
+def test_toastushs_index_command_gets_a_word_instead_of_going_to_the_mud(tmp_path):
+    # Its updater makes the update index the maintainers publish with "index <file>". MUSHclient
+    # catches that, so it never reached the MUD; with the updater stood in for, it went out.
+    sink, engine, _pack = _world(tmp_path, updater_id=TOASTUSH_UPDATER)
+    assert engine.process_input("Index pack-v5.manifest") == []
+    assert sink.sent == []
+    assert any("index" in text.lower() for text, _ in sink.echoed)
+
+
+def test_index_is_left_alone_where_toastushs_updater_isnt(tmp_path):
+    _sink, engine, _pack = _world(tmp_path)  # Miriani-Next's updater has no index command
+    assert engine.process_input("index stars") == ["index stars"]
+
+
 def test_update_help_says_what_the_command_does_here(tmp_path):
     sink, engine, _pack = _world(tmp_path)
     engine.process_input("update help")
