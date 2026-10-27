@@ -721,7 +721,13 @@ def test_while_and_until_count_down():
     assert _said(sink) == ["4", "3", "2", "lift", "3", "2", "1", "blastoff"]
 
 
-def test_a_loop_that_never_ends_stops_instead_of_freezing_the_client():
+def test_a_loop_that_never_ends_stops_instead_of_freezing_the_client(monkeypatch):
+    # The loop's own limit, after which the script carries on. A whole script also stops after
+    # two seconds, which a busy machine reached first, stopping "#var after" too; that limit
+    # has tests of its own, so it's out of the way here.
+    from genericmud.scripting import vipmud_dialect
+
+    monkeypatch.setattr(vipmud_dialect, "_SCRIPT_SECONDS", 3600.0)
     _sink, engine, _pack = _load("#var n 0\n#while {1} {#math n {@n + 1}}\n#var after yes")
     assert 0 < int(engine.get_var("n")) <= 100_000
     assert engine.get_var("after") == "yes"
