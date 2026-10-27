@@ -1,19 +1,33 @@
 # Changelog
 
-Each release's section here becomes the body of its GitHub release, which is the
-text the in-app update dialog reads out. Write it for someone deciding whether to
+Each release's GitHub release carries its section here, followed by the earlier
+ones under their headings, and the in-app update window shows the versions a
+player doesn't have yet. Write each section for someone deciding whether to
 update, not for someone reading the diff. Tagging a version with no section here
 fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.20.4 — 2026-10-27
+
+**Updating genericMud**
+
+* When you've skipped some versions, the update window now tells you what's new
+  in each of them, newest first, not just in the newest. This time it shows
+  every version's notes, so read down until you reach the one you have. From
+  the next update on it stops there by itself, and leaves out the stars and
+  other formatting marks.
+
 ## 0.20.3 — 2026-10-27
 
-**Also**
+**Licences**
 
 * genericMud comes with the licences of Python and every library it runs on, in
   THIRD-PARTY-NOTICES.txt, as those licences ask. BASS's terms are in its bass
   folder.
+
+**Soundpacks**
+
 * Toastush's index command, a tool for the pack's maintainers, no longer goes to
   the MUD.
 
