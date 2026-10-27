@@ -142,7 +142,7 @@ class _SoundData:
     file: str
 
 
-@dataclass
+@dataclass(eq=False)  # each one is itself, whatever its settings
 class _StreamEffect:
     """An effect a pack put on a stream, kept so it goes on again each time the stream plays."""
 
@@ -152,7 +152,7 @@ class _StreamEffect:
     handle: int = 0  # the effect on the cue playing now, 0 before the stream has played
 
 
-@dataclass
+@dataclass(eq=False)  # each one is itself, whatever its settings
 class _Stream:
     """One stream a pack created, and the cue it plays as."""
 
@@ -379,6 +379,8 @@ class BassWrapper:
         if not stream.file:
             return _OK  # nothing has been put into it yet
         stream.started = True
+        if stream not in self.streams:
+            self.streams.append(stream)  # it left the list once it ended; BASS:Free() stops it
         self.api.play(
             stream.file, channel=stream.channel, gain=stream.gain, pan=stream.pan,
             loop=bool(stream.flags & _SAMPLE_LOOP), times=stream.repeats,

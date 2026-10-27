@@ -320,3 +320,18 @@ def test_bass_free_ends_streams_it_no_longer_lists(pack):
     pack.call(pack.bass, "Free")
     assert pack.call(first, "Play") == 5  # BASS_ERROR_HANDLE
     assert pack.call(first, "IsActive") == 0
+
+
+def test_bass_free_stops_a_stream_played_again_after_it_left_the_list(pack):
+    # A stream the pack keeps (not auto-free) ends, leaves the list as it grows, and is played
+    # again: BASS:Free() must still stop it.
+    kept = pack.stream()
+    pack.call(kept, "Play")
+    handle, _state = pack.playing()
+    pack.fake.end_pass(handle)
+    for _ in range(300):
+        pack.stream()
+    pack.call(kept, "Play")
+    assert pack.fake.playing_files()
+    pack.call(pack.bass, "Free")
+    assert pack.fake.playing_files() == []
