@@ -1452,6 +1452,12 @@ class WorldDialog(wx.Dialog):
         self._mxp.SetName("Understand MXP markup")
         self._mxp.SetValue(True)
         grid.Add(self._mxp, 1, wx.EXPAND)
+        # Where <IMAGE> looks for a file when the tag names no address of its own. Most MUDs
+        # expect the client to be told this; without it an image can't be found, so it's
+        # skipped -- which is also what MUSHclient does with an address-less image.
+        self._images_url = self._labeled_text(
+            grid, "&Images web address:", "Images web address", ""
+        )
 
         grid.Add((0, 0))
         self._tls = wx.CheckBox(self, label="Use &TLS")
@@ -1541,6 +1547,7 @@ class WorldDialog(wx.Dialog):
             self._log_commands.SetValue(initial.log_commands)
             self._download_sounds.SetValue(initial.download_sounds)
             self._mxp.SetValue(initial.mxp)
+            self._images_url.SetValue(initial.images_url)
         if lock_name:
             self._name.Enable(False)
             self._host.SetFocus()
@@ -1592,6 +1599,7 @@ class WorldDialog(wx.Dialog):
             log_commands=self._log_commands.GetValue(),
             download_sounds=self._download_sounds.GetValue(),
             mxp=self._mxp.GetValue(),
+            images_url=self._images_url.GetValue().strip(),
         )
         self.EndModal(wx.ID_OK)
 
