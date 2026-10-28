@@ -104,6 +104,8 @@ def test_launcher_uses_free_local_ports_and_cleans_up(tmp_path, monkeypatch):
     monkeypatch.setattr(web_launcher, "EngineApp", FakeApp)
     monkeypatch.setattr(web_launcher, "VoiceRouter", lambda _backend: object())
     monkeypatch.setattr(web_launcher, "make_voice_backend", lambda: object())
+    # The real one writes a log into the developer's own ~/.genericmud on every run.
+    monkeypatch.setattr(web_launcher, "make_diagnostic_log", lambda: None)
     monkeypatch.setattr(web_launcher, "resource_root", lambda: tmp_path)
     monkeypatch.setattr(web_launcher, "serve_static", serve_static)
 

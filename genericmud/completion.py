@@ -28,7 +28,11 @@ class OutputWordIndex:
     ) -> None:
         self._max = max_words
         self._min = min_length
-        self._words: list[str] = []  # newest first; no duplicates (case-insensitive)
+        # Lowercased word -> the word as last seen, oldest first; one entry per word. Every
+        # displayed line comes through here on the engine thread, so a word moves to the newest
+        # end in constant time: rebuilding a list of every indexed word, once per word of every
+        # line, was a third of the time a line took to process.
+        self._words: dict[str, str] = {}
         self._lock = threading.Lock()
 
     def add_line(self, text: str) -> None:
@@ -38,9 +42,10 @@ class OutputWordIndex:
         with self._lock:
             for word in words:
                 key = word.lower()
-                self._words = [w for w in self._words if w.lower() != key]
-                self._words.insert(0, word)
-            del self._words[self._max :]
+                self._words.pop(key, None)
+                self._words[key] = word  # in again at the newest end
+            while len(self._words) > self._max:
+                del self._words[next(iter(self._words))]  # the oldest ages out
 
     def complete(self, prefix: str) -> list[str]:
         """Words starting with ``prefix`` (case-insensitive), newest first."""
@@ -49,8 +54,8 @@ class OutputWordIndex:
         needle = prefix.lower()
         with self._lock:
             return [
-                w for w in self._words
-                if w.lower().startswith(needle) and w.lower() != needle
+                word for key, word in reversed(self._words.items())
+                if key.startswith(needle) and key != needle
             ]
 
 

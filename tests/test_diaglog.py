@@ -65,3 +65,54 @@ def test_write_banner_records_the_environment(tmp_path):
     assert line.startswith("2026-06-24 12:00:00.123 banner ")
     for key in ("version=", "frozen=", "platform=", "python=", "pygame="):
         assert key in line
+
+
+def _app_log(folder, name, *, days_old, first_line=None):
+    import os
+    import time
+
+    path = folder / name
+    path.write_text((first_line or "2026-01-01 00:00:00.000 banner version=1.0 x=y") + "\n",
+                    encoding="utf-8")
+    then = time.time() - days_old * 24 * 3600
+    os.utime(path, (then, then))
+    return path
+
+
+def test_old_app_logs_go_but_the_newest_twenty_of_each_stay(tmp_path):
+    from genericmud.session.diaglog import KEEP_NEWEST_LOGS, prune_old_logs
+
+    old = [_app_log(tmp_path, f"diagnostic-202601{day:02d}-120000.log", days_old=100 - day)
+           for day in range(1, 26)]
+    crash = [_app_log(tmp_path, f"crash-202601{day:02d}-120000.log", days_old=100 - day)
+             for day in range(1, 4)]
+    recent = _app_log(tmp_path, "diagnostic-20251231-120000.log", days_old=2)  # sorts oldest
+    removed = prune_old_logs(tmp_path)
+    assert sorted(removed) == sorted(p.name for p in old[: 25 - KEEP_NEWEST_LOGS])
+    assert all(p.exists() for p in old[25 - KEEP_NEWEST_LOGS:])
+    assert all(p.exists() for p in crash)  # only three: all of them are the newest
+    assert recent.exists()  # beyond the newest twenty, but not old enough
+
+
+def test_world_logs_are_never_pruned_even_under_an_app_logs_name(tmp_path):
+    # A world named "crash" files its transcripts as crash-<stamp>.log too.
+    from genericmud.session.diaglog import prune_old_logs
+
+    for day in range(1, 26):
+        _app_log(tmp_path, f"crash-202601{day:02d}-120000.log", days_old=200,
+                 first_line="Session started 2026-01-01 12:00:00")
+    transcript = _app_log(tmp_path, "Star_Conquest-20260101-120000.log", days_old=200,
+                          first_line="Session started 2026-01-01 12:00:00")
+    assert prune_old_logs(tmp_path) == []
+    assert transcript.exists()
+
+
+def test_startup_prunes_the_config_folders_logs(tmp_path, monkeypatch):
+    import genericmud.__main__ as entry
+    from genericmud.session import diaglog
+
+    looked_in: list = []
+    monkeypatch.setattr("genericmud.config.worlds.config_dir", lambda: tmp_path)
+    monkeypatch.setattr(diaglog, "prune_old_logs", lambda folder: looked_in.append(folder))
+    entry._prune_old_logs()
+    assert looked_in == [tmp_path / "logs"]

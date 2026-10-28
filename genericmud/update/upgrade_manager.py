@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import zipfile
 from dataclasses import dataclass, field
@@ -264,6 +265,98 @@ def _restore_from_backup(install_dir: Path) -> tuple[list[str], list[str]]:
 
 def _clear_state(install_dir: Path) -> None:
     shutil.rmtree(_state_dir(install_dir), ignore_errors=True)
+
+
+# --- files an earlier version left behind ---
+#
+# The helper lays the new build over the old one and deletes nothing, so every file a later
+# build stopped shipping stays in the install: old copies of genericMud's own metadata, a
+# speech library dropped months ago, an older wxPython's DLLs. Each build lists the files of
+# its contents folder (``_internal``), and the first start after an update deletes the rest.
+
+MANIFEST_NAME = "genericmud-files.txt"
+_MIN_MANIFEST_FILES = 50  # a real build ships far more; fewer means a list cut short
+
+
+def write_manifest(contents_dir: Path, version: str) -> Path:
+    """List every file in a freshly built contents folder, this list included. Run as the
+    build's last step, after anything else that goes in the folder."""
+    contents_dir = Path(contents_dir)
+    files = sorted(
+        path.relative_to(contents_dir).as_posix()
+        for path in contents_dir.rglob("*")
+        if path.is_file() and path.name != MANIFEST_NAME
+    )
+    lines = [f"# genericMud {version}: the files this build keeps here; startup removes others"]
+    lines += files + [MANIFEST_NAME]
+    manifest = contents_dir / MANIFEST_NAME
+    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return manifest
+
+
+def prune_leftovers(contents_dir: Path) -> list[str]:
+    """Delete the files in ``contents_dir`` that its build's manifest doesn't list; returns
+    what went, relative to the folder. Never raises.
+
+    Nothing is deleted unless the manifest is one a build wrote (it lists itself and a real
+    build's worth of files) and every file it lists is here: an install holding another
+    version's files, as after a rollback or a partly applied update, is left as it is. Only
+    this folder is looked at, never the install folder around it where genericMud keeps the
+    player's worlds and soundpacks, and links to other folders aren't followed. Names are
+    compared ignoring case, as Windows does.
+    """
+    contents_dir = Path(contents_dir)
+    try:
+        listed = (contents_dir / MANIFEST_NAME).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return []
+    shipped = {line.casefold() for line in listed if line and not line.startswith("#")}
+    if MANIFEST_NAME.casefold() not in shipped or len(shipped) < _MIN_MANIFEST_FILES:
+        return []
+    try:
+        found = _files_in(contents_dir)
+    except OSError:
+        return []
+    if not shipped <= {relative.casefold() for relative, _path in found}:
+        return []
+    removed: list[str] = []
+    emptied: set[Path] = set()
+    for relative, path in found:
+        if relative.casefold() in shipped:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue  # in use or read-only: the next start tries again
+        removed.append(relative)
+        emptied.add(path.parent)
+    for folder in sorted(emptied, key=lambda p: len(p.parts), reverse=True):
+        while folder != contents_dir and contents_dir in folder.parents:
+            try:
+                folder.rmdir()  # only succeeds once nothing is left in it
+            except OSError:
+                break
+            folder = folder.parent
+    if removed:
+        logger.info("Removed %d file(s) an earlier version left behind.", len(removed))
+    return removed
+
+
+def _files_in(contents_dir: Path) -> list[tuple[str, Path]]:
+    """Every file under ``contents_dir`` as (relative posix path, path), not going through
+    symlinked folders or junctions."""
+    found: list[tuple[str, Path]] = []
+    for root, folders, files in os.walk(contents_dir, followlinks=False):
+        here = Path(root)
+        folders[:] = [
+            name for name in folders
+            if not (os.path.islink(here / name) or os.path.isjunction(here / name))
+        ]
+        for name in files:
+            path = here / name
+            if not path.is_symlink():
+                found.append((path.relative_to(contents_dir).as_posix(), path))
+    return found
 
 
 def _sha256_file(path: Path) -> str:

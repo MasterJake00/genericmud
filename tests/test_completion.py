@@ -78,3 +78,41 @@ def test_words_in_any_alphabet_complete_whole():
     assert index.complete("caf") == ["Café"]
     assert index.complete("mül") == ["Müller's"]
     assert index.complete("12") == []  # digits still don't start a word
+
+
+def test_a_word_seen_again_keeps_its_newest_spelling_and_place():
+    index = OutputWordIndex()
+    index.add_line("goblin gnome GOBLIN")  # later in a line is newer
+    assert index.complete("g") == ["GOBLIN", "gnome"]
+
+
+def test_the_index_matches_the_plain_list_it_replaced():
+    # The index used to be a newest-first list, rebuilt for every word: obviously right, too
+    # slow for every line a MUD sends. Whatever the lines, the faster one must agree with it.
+    import random
+    import re
+
+    def reference(lines, max_words):
+        words: list[str] = []
+        for line in lines:
+            found = [w for w in re.findall(r"[^\W\d_](?:[^\W\d_]|['-])+", line) if len(w) >= 3]
+            for word in found:
+                words = [w for w in words if w.lower() != word.lower()]
+                words.insert(0, word)
+            del words[max_words:]
+        return words
+
+    rng = random.Random(7)
+    vocabulary = ["goblin", "Goblin", "gnome", "GNOME", "golem", "gold", "Gold", "grate",
+                  "drake", "Drake", "dragon", "door", "doors", "Dorn", "glimmer", "gloom"]
+    lines = [" ".join(rng.choice(vocabulary) for _ in range(rng.randint(0, 9)))
+             for _ in range(300)]
+    index = OutputWordIndex(max_words=7)
+    for line in lines:
+        index.add_line(line)
+    expected = reference(lines, 7)
+    for prefix in ("g", "go", "gol", "d", "dr", "do", "Gl", "x"):
+        needle = prefix.lower()
+        assert index.complete(prefix) == [
+            w for w in expected if w.lower().startswith(needle) and w.lower() != needle
+        ]

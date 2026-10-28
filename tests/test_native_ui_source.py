@@ -266,3 +266,22 @@ def test_the_window_tells_the_session_when_the_socket_opens():
     connected_at = source.index("await self._connection.connect(self.world.host")
     opened_at = source.index("self.app.after_connect()")
     assert opened_at > connected_at
+
+
+def test_no_button_label_doubles_an_ampersand():
+    # On Windows a button whose label has a shortcut letter keeps "&&" doubled in the name a
+    # screen reader gets, so "&Download && Set Up" was read "Download and and Set Up".
+    # Static text and checkboxes come through as one "&"; buttons have to say "and".
+    source = (
+        Path(__file__).resolve().parents[1] / "genericmud/ui/wx_app.py"
+    ).read_text(encoding="utf-8")
+    buttons = [
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "Button"
+    ]
+    labels = [
+        keyword.value.value for node in buttons for keyword in node.keywords
+        if keyword.arg == "label" and isinstance(keyword.value, ast.Constant)
+    ]
+    assert labels, "found no button labels: the check looks in the wrong place"
+    assert not [label for label in labels if "&&" in label]

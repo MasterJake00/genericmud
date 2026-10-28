@@ -94,6 +94,74 @@ def test_check_for_update_picks_newest_skipping_drafts(monkeypatch):
     assert info["size"] == 42
 
 
+_NOTES = """**Updating**
+
+* The update window tells you what's new in every
+  version since yours.
+
+## 0.20.3 — 2026-10-27
+
+**Soundpacks**
+
+* Toastush's index command no longer goes to
+  the MUD.
+
+## 0.20.2 — 2026-10-27
+
+**Soundpacks**
+
+* Miriani-Next's ambience plays.
+
+## 0.20.1 — 2026-10-27
+
+* Find carries on from the bottom.
+"""
+
+
+def test_the_notes_cover_every_version_since_yours_and_none_before(monkeypatch):
+    release = _release("v0.20.4")
+    release["body"] = _NOTES
+    monkeypatch.setattr(self_update, "_get_json", lambda _url: [release])
+    monkeypatch.setattr(self_update, "current_version", lambda: "0.20.2")
+    notes = self_update.check_for_update()["notes"]
+    assert notes.index("New in 0.20.4") < notes.index("New in 0.20.3")
+    assert "Toastush's index command no longer goes to the MUD." in notes  # one line each
+    assert "ambience" not in notes and "0.20.2" not in notes  # what you have already
+
+
+def test_the_notes_read_without_markdown_marks():
+    notes = self_update.notes_since(_NOTES, "v0.20.4", (0, 0, 0))
+    assert "*" not in notes and "#" not in notes and "—" not in notes
+    assert "\nSoundpacks\n" in notes
+    assert "New in 0.20.1, 2026-10-27" in notes
+
+
+def test_notes_without_version_headings_are_kept_whole():
+    notes = self_update.notes_since("**Fixes**\n\n* It works now.", "v1.0.0", (0, 9, 0))
+    assert notes == "New in 1.0.0\n\nFixes\n\nIt works now."
+
+
+def test_a_version_heading_written_another_way_still_ends_whats_new():
+    body = "* Newest.\n\n## 0.20.3 (27 October)\n\n* Middle.\n\n## 0.20.2\n\n* Installed."
+    notes = self_update.notes_since(body, "v0.20.4", (0, 20, 2))
+    assert notes == "New in 0.20.4\n\nNewest.\n\nNew in 0.20.3, (27 October)\n\nMiddle."
+
+
+def test_notes_that_cant_be_tidied_still_let_you_update(monkeypatch):
+    # A bug in tidying the notes must not block the update that would fix it.
+    def broken(*_args):
+        raise ValueError("a body the tidying never expected")
+
+    release = _release("v0.20.4")
+    release["body"] = _NOTES
+    monkeypatch.setattr(self_update, "_get_json", lambda _url: [release])
+    monkeypatch.setattr(self_update, "current_version", lambda: "0.20.2")
+    monkeypatch.setattr(self_update, "notes_since", broken)
+    info = self_update.check_for_update()
+    assert info is not None and info["tag"] == "v0.20.4"
+    assert info["notes"] == _NOTES  # as the release has them
+
+
 def test_check_for_update_none_when_up_to_date(monkeypatch):
     monkeypatch.setattr(self_update, "_get_json", lambda _url: [_release("v0.6.0")])
     monkeypatch.setattr(self_update, "current_version", lambda: "0.6.0")
@@ -208,6 +276,7 @@ def test_startup_clears_out_old_update_folders(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(entry, "_recover_pending_upgrade", lambda: None)
     monkeypatch.setattr("genericmud.session.crashlog.install_crash_handlers", lambda: None)
+    monkeypatch.setattr("genericmud.config.worlds.config_dir", lambda: tmp_path / "config")
     opened: list[bool] = []
     window = types.SimpleNamespace(run=lambda _args, recovery=None: opened.append(True))
     monkeypatch.setitem(sys.modules, "genericmud.ui.wx_app", window)

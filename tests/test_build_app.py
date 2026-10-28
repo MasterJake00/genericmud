@@ -75,3 +75,34 @@ def test_the_licence_notices_go_in_the_app(tmp_path):
     assert win[win.index(f"{notices};.") - 1] == "--add-data"
     assert f"{notices}:." in pyinstaller_args("darwin", notices=notices)
     assert win[-1] == "run_genericmud.py"
+
+
+def test_the_build_lists_its_contents_folder_last(tmp_path):
+    from genericmud.update.upgrade_manager import MANIFEST_NAME
+    from tools.build_app import list_contents
+
+    contents = tmp_path / "dist" / "genericMud" / "_internal"
+    (contents / "wx").mkdir(parents=True)
+    (contents / "wx" / "core.pyd").write_bytes(b"x")
+    list_contents(contents)
+    listed = (contents / MANIFEST_NAME).read_text(encoding="utf-8").splitlines()
+    assert listed[1:] == ["wx/core.pyd", MANIFEST_NAME]
+    list_contents(tmp_path / "nowhere")  # a build with no contents folder (the macOS .app)
+    assert not (tmp_path / "nowhere").exists()
+
+
+def test_the_windows_build_leaves_out_what_the_app_never_runs():
+    # pygame came in whole: its docs, tests and examples, and through its tests Python's
+    # test package and Tcl/Tk. Pythonwin's MFC windows came through win32com's makepy.
+    args = pyinstaller_args("win32")
+    assert "pygame" not in [args[i + 1] for i, a in enumerate(args) if a == "--collect-all"]
+    excluded = {args[i + 1] for i, a in enumerate(args) if a == "--exclude-module"}
+    assert {"pygame.tests", "pygame.examples", "tkinter", "test", "pywin", "win32ui"} <= excluded
+    assert "win32com.client" in args  # the SAPI voice itself stays
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_mac_and_linux_builds_still_take_pygame_whole(platform):
+    args = pyinstaller_args(platform)
+    assert args[args.index("pygame") - 1] == "--collect-all"
+    assert "--exclude-module" not in args

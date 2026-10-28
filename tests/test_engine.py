@@ -152,7 +152,7 @@ def test_structured_mud_variables_resolve_longest_prefix_and_case_insensitively(
 class _RaisingPattern:
     """Stands in for a compiled pattern that blows the per-match timeout budget."""
 
-    pattern = "catastrophic"
+    pattern = "(a+)+$"  # the classic runaway shape, with no fixed text to look for first
 
     def search(self, text, **kwargs):
         raise TimeoutError("match budget exceeded")

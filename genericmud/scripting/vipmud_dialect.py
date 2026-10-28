@@ -2069,8 +2069,12 @@ class VipMudPack:
         self._handles[handle] = channel
         if loop:
             self._last_loop_handle = handle
-        if not self._api.sound_exists(file) and self._fetch_in_background(
-            file, channel, volume, loop
+        # Only a pack with an online sound source asks first whether the file is here: for the
+        # rest the answer changes nothing, and finding a file twice doubled each cue's cost.
+        if (
+            self.can_fetch_sound(file)
+            and not self._api.sound_exists(file)
+            and self._fetch_in_background(file, channel, volume, loop)
         ):
             self._last_handle = handle  # it will play once the file lands
             return

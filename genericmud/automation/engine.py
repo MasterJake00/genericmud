@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from genericmud.automation.channels import ChannelRouter
+from genericmud.automation.prefilter import required_text
 from genericmud.model.buffer import Line
 from genericmud.session.hub import SessionHub
 from genericmud.sound.bus import SoundBus
@@ -188,6 +189,12 @@ class _Rule:
     # (MUSHclient sends what was typed only when no alias matched at all).
     consumes: bool = False
     fallback: bool = False  # an alias that runs only when no alias before it took the command
+    # Text every match of the trigger's pattern contains, so a line without it is passed over
+    # without running the regex (see prefilter). Worked out for the pattern in ``screened``;
+    # a pack that swaps the pattern later (MUSHclient's SetTriggerOption) gets it worked out
+    # again. Not part of what makes two rules equal.
+    required: str | None = field(default=None, compare=False, repr=False)
+    screened: object = field(default=None, compare=False, repr=False)
 
 
 def _rule_order(rule: _Rule) -> tuple[int, str]:
@@ -516,8 +523,14 @@ class AutomationEngine:
         for rule in list(self._triggers):
             if not rule.enabled or rule.stop_scope in stopped:
                 continue
+            pattern = rule.pattern
+            if rule.screened is not pattern:
+                rule.required = required_text(pattern)
+                rule.screened = pattern
+            if rule.required is not None and rule.required not in line.plain_text:
+                continue  # it can't match: the line lacks text every match has
             try:
-                match = rule.pattern.search(line.plain_text, **_MATCH_KWARGS)
+                match = pattern.search(line.plain_text, **_MATCH_KWARGS)
             except _MatchTimeout:
                 rule.enabled = False  # a pattern that backtracks past the budget is disabled
                 rule.timed_out = True

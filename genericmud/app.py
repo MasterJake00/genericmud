@@ -1234,7 +1234,8 @@ class EngineApp:
             )
         parts: list[str] = []
         if result.loaded:
-            parts.append(f"{len(result.loaded)} soundpack{'s' if len(result.loaded) != 1 else ''}")
+            count = len(result.loaded)
+            parts.append(f"{count} soundpack{'s' if count != 1 else ''} loaded")
         # Packs loaded but armed no triggers can never make a sound -- say so at connect, not
         # only in the trace, so a blind user learns the pack is inert without reading a file.
         if result.loaded and triggers == 0:

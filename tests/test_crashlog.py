@@ -125,3 +125,53 @@ def test_loop_handler_records_and_chains(tmp_path, monkeypatch):
     assert "crash source=asyncio" in text
     assert "ValueError: loop-boom" in text
     assert chained  # the handler we installed over is still invoked
+
+
+def test_mark_exit_records_a_normal_close(tmp_path):
+    log = CrashLog(tmp_path / "crash.log", clock=_fixed_clock)
+    log.start()
+    log.mark_exit()
+    log.stop()
+    lines = (tmp_path / "crash.log").read_text(encoding="utf-8").splitlines()
+    assert lines[-1] == "2026-06-24 12:00:00.123 exit normal"
+
+
+def test_mark_exit_is_a_noop_before_start(tmp_path):
+    path = tmp_path / "crash.log"
+    CrashLog(path, clock=_fixed_clock).mark_exit()
+    assert not path.exists()
+
+
+def _run_main_with(ui_run, tmp_path, monkeypatch):
+    """Run the app's entry point on the web path, with ``ui_run`` standing in for the UI."""
+    import genericmud.__main__ as entry
+    import genericmud.web_launcher as web_launcher
+
+    log = CrashLog(tmp_path / "crash.log", clock=_fixed_clock)
+    log.start()
+    monkeypatch.setattr(crashlog, "install_crash_handlers", lambda: log)
+    monkeypatch.setattr(crashlog, "_ACTIVE", log)
+    monkeypatch.setattr(web_launcher, "run", ui_run)
+    monkeypatch.setattr("genericmud.config.worlds.config_dir", lambda: tmp_path)  # its logs
+    try:
+        entry.main(["--web"])
+    finally:
+        log.stop()
+    return (tmp_path / "crash.log").read_text(encoding="utf-8")
+
+
+def test_main_marks_the_exit_when_the_ui_closes(tmp_path, monkeypatch):
+    text = _run_main_with(lambda _args: None, tmp_path, monkeypatch)
+    assert text.splitlines()[-1] == "2026-06-24 12:00:00.123 exit normal"
+
+
+def test_main_leaves_no_exit_mark_when_the_ui_dies(tmp_path, monkeypatch):
+    def dies(_args):
+        raise RuntimeError("the window fell over")
+
+    try:
+        _run_main_with(dies, tmp_path, monkeypatch)
+    except RuntimeError:
+        pass
+    text = (tmp_path / "crash.log").read_text(encoding="utf-8")
+    assert "exit normal" not in text

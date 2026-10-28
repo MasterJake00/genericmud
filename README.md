@@ -55,6 +55,7 @@ and the locked dependencies on first run. See "For developers" below.
    port `4000`. There's a **Use TLS** box for MUDs that want an encrypted
    connection, an **Encoding** choice for MUDs that don't send UTF-8, and a
    **Sounds folder** box if you already keep that MUD's sound files somewhere.
+   Leave it blank when a soundpack brings its own sounds.
    "Save this world" is checked by default.
 3. Press Enter.
 

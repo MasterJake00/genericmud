@@ -16,8 +16,12 @@ beside the diagnostic log:
 * ``loop.set_exception_handler`` -- raised inside a coroutine / loop callback
 * ``faulthandler``               -- a native fault, e.g. a pygame mixer segfault
 
-A clean run leaves a banner-only file; a real break appends a traceback below it, so a
-recent crash log that holds a traceback is itself the "it broke" signal. Every write is
+A clean run leaves the banner and an ``exit normal`` line; a real break appends a traceback
+below the banner, so a recent crash log that holds a traceback is itself the "it broke"
+signal. One exception to that: on Windows, ``faulthandler`` also writes native exceptions the
+app survives, such as a COM call refused with 0x8001010d that COM handles itself, under the
+same "Windows fatal exception" heading as a real crash. When ``exit normal`` follows one, the
+app carried on and closed the normal way; the exception didn't end the run. Every write is
 defensive (as in diaglog): a logging fault must never crash the app it observes, and
 each Python hook chains to the one it replaced so a dev running from a terminal still
 sees the traceback on stderr.
@@ -87,6 +91,12 @@ class CrashLog:
         with self._lock:
             self._write(header + body + "\n")
 
+    def mark_exit(self) -> None:
+        """Note that the app closed the normal way. The file stays open: a native fault while
+        Python shuts down still lands below this line."""
+        with self._lock:
+            self._write(f"{self._stamp()} exit normal\n")
+
     def handle(self) -> TextIO | None:
         """The open file, for handing to ``faulthandler.enable``; ``None`` before start."""
         return self._handle
@@ -139,6 +149,13 @@ def install_crash_handlers() -> CrashLog | None:
     _install_python_hooks(log)
     _install_faulthandler(log)
     return log
+
+
+def mark_normal_exit() -> None:
+    """Record in the active crash log that the app closed the normal way; no-op without one."""
+    log = _ACTIVE
+    if log is not None:
+        log.mark_exit()
 
 
 def install_loop_exception_handler(loop) -> None:

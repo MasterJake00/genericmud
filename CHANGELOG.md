@@ -1,19 +1,63 @@
 # Changelog
 
-Each release's section here becomes the body of its GitHub release, which is the
-text the in-app update dialog reads out. Write it for someone deciding whether to
+Each release's GitHub release carries its section here, followed by the earlier
+ones under their headings, and the in-app update window shows the versions a
+player doesn't have yet. Write each section for someone deciding whether to
 update, not for someone reading the diff. Tagging a version with no section here
 fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.20.5 — 2026-10-28
+
+**Faster with big soundpacks**
+
+* genericMud gets through each line about four times faster than before. With a
+  big soundpack, a long burst of output, like a full status screen or a busy
+  fight, used to hold up what you typed next for a second or more; it goes out
+  straight away now. Sound packs fire exactly as before.
+
+**A smaller download, and a tidier folder**
+
+* The Windows download is about 15 MB smaller: it no longer carries libraries
+  genericMud never uses.
+* Updating now removes the files earlier versions left behind. The first start
+  after this update tidies genericMud's program files, which can free 40 MB or
+  more if you've updated many times. Your worlds, soundpacks and logs aren't
+  touched.
+* Diagnostic and crash logs from more than 30 days ago are cleared out, keeping
+  the last 20 of each. The logs of your games are never cleared.
+
+**Small fixes**
+
+* After you install a soundpack, the window that confirms the world says the
+  pack's sounds are in place, and the Sounds folder box says that leaving it
+  blank uses the soundpack's own sounds. A blank box with nothing said about it
+  read as if the world had no sounds.
+* Connecting says "1 soundpack loaded" rather than just "1 soundpack".
+* In Browse Soundpacks, the Download and set up button no longer reads as
+  "Download and and Set Up".
+
+## 0.20.4 — 2026-10-27
+
+**Updating genericMud**
+
+* When you've skipped some versions, the update window now tells you what's new
+  in each of them, newest first, not just in the newest. This time it shows
+  every version's notes, so read down until you reach the one you have. From
+  the next update on it stops there by itself, and leaves out the stars and
+  other formatting marks.
+
 ## 0.20.3 — 2026-10-27
 
-**Also**
+**Licences**
 
 * genericMud comes with the licences of Python and every library it runs on, in
   THIRD-PARTY-NOTICES.txt, as those licences ask. BASS's terms are in its bass
   folder.
+
+**Soundpacks**
+
 * Toastush's index command, a tool for the pack's maintainers, no longer goes to
   the MUD.
 

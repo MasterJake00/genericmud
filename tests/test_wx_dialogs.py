@@ -1542,3 +1542,76 @@ def test_a_new_world_starts_on_no_auto_connect(frame):
         assert chosen.startswith("No auto-connect")
     finally:
         dialog.Destroy()
+
+
+def test_the_sounds_folder_says_what_blank_means(frame):
+    # After installing a soundpack the box was blank and nothing said why, which read as
+    # "this world has no sounds". Blank means the pack plays its own.
+    from genericmud.ui.wx_app import WorldDialog
+
+    dialog = WorldDialog(frame)
+    try:
+        children = list(dialog.GetChildren())
+        label = children[children.index(dialog._sounds) - 1]
+        assert isinstance(label, wx.StaticText)  # still the label NVDA names the box by
+        assert label.GetLabel() == "So&unds folder (blank uses the soundpack's own sounds):"
+        assert dialog._sounds.GetValue() == ""
+    finally:
+        dialog.Destroy()
+
+
+def test_a_world_dialog_note_comes_first_and_labels_no_control(frame):
+    # NVDA reads a dialog's text that labels no control as the dialog opens.
+    from genericmud.ui.wx_app import WorldDialog
+
+    dialog = WorldDialog(frame, note="The pack is in. Press Enter & connect.")
+    plain = WorldDialog(frame)
+    try:
+        children = list(dialog.GetChildren())
+        assert children[0] is dialog._note
+        assert dialog._note.GetLabelText() == "The pack is in. Press Enter & connect."
+        assert isinstance(children[1], wx.StaticText)  # the Name label, then the Name box
+        assert children[2] is dialog._name
+        assert plain._note is None
+    finally:
+        dialog.Destroy()
+        plain.Destroy()
+
+
+def test_installing_a_pack_with_its_own_sounds_says_the_folder_can_stay_blank(
+    frame, monkeypatch, tmp_path
+):
+    import asyncio
+    from types import SimpleNamespace
+
+    from genericmud.ui import wx_app
+    from tests.helpers import RecordingBackend
+
+    monkeypatch.setenv("HOME", str(tmp_path))  # the frame reads and writes its config
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setattr(wx_app, "make_voice_backend", RecordingBackend)
+    monkeypatch.setattr(wx_app, "make_diagnostic_log", lambda: None)
+    shown: list[dict] = []
+
+    class _Dialog:
+        def __init__(self, _parent, **kwargs):
+            shown.append(kwargs)
+
+        def ShowModal(self):
+            return wx.ID_CANCEL
+
+        def Destroy(self):
+            pass
+
+    loop = asyncio.new_event_loop()
+    main = wx_app.GenericMudFrame(loop, {})
+    try:
+        monkeypatch.setattr(wx_app, "WorldDialog", _Dialog)
+        pack = SimpleNamespace(id="sc", dialect="vipmud")
+        main._confirm_and_connect(World("Star Conquest", "squidsoft.net", 7777), pack)
+        assert shown[0]["title"] == "Confirm World"
+        assert "Star Conquest soundpack is installed, with its own sounds" in shown[0]["note"]
+        assert "can stay blank" in shown[0]["note"]
+    finally:
+        main.Destroy()
+        loop.close()

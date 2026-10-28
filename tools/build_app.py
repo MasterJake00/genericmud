@@ -22,7 +22,11 @@ APP_NAME = "genericMud"
 ENTRY = "run_genericmud.py"
 BASS_FOLDER = Path("build/bass")  # where tools/fetch_bass.py puts BASS for a build
 NOTICES_FILE = Path("build/notices/THIRD-PARTY-NOTICES.txt")  # tools/third_party_notices.py
+CONTENTS_FOLDER = Path("dist") / APP_NAME / "_internal"  # PyInstaller's, beside the exe
 _LIBRARY_SUFFIXES = (".dll", ".so", ".dylib")
+_NEVER_RUN_ON_WINDOWS = (
+    "pygame.tests", "pygame.examples", "pygame.docs", "test", "tkinter", "pywin", "win32ui",
+)
 
 
 def pyinstaller_args(
@@ -47,10 +51,11 @@ def pyinstaller_args(
         "--copy-metadata", "genericmud",
         "--add-data", f"frontend{separator}frontend",
         "--add-data", f"genericmud/config/keymaps{separator}genericmud/config/keymaps",
-        "--collect-all", "pygame",
         "--collect-all", "lupa",
         "--hidden-import", "websockets",
     ]
+    if platform != "win32":
+        args += ["--collect-all", "pygame"]
     # pywebview backs the optional --web UI; present on every platform's [gui] extra.
     args += ["--collect-all", "webview"]
     # prism is the self-voice backend on all three platforms. Collect-all because the speech
@@ -65,6 +70,13 @@ def pyinstaller_args(
             "--hidden-import", "win32com.client",
             "--hidden-import", "pythoncom",
         ]
+        # pygame (the fallback audio) comes in through its own hook, which brings its DLLs,
+        # and not whole: collecting all of it shipped its 12 MB of docs, tests and examples,
+        # and its tests pulled in Python's test package and with it Tcl/Tk. Pythonwin's MFC
+        # windows only reach the build through a win32com tool that writes COM wrappers,
+        # which the SAPI voice never runs.
+        for module in _NEVER_RUN_ON_WINDOWS:
+            args += ["--exclude-module", module]
     elif platform == "darwin":
         # A stable bundle id keeps preferences/TCC attribution across releases.
         args += ["--osx-bundle-identifier", "space.thealvernaz.genericmud"]
@@ -91,6 +103,20 @@ def main() -> None:
     # The libraries' licences, read from this environment: the one the build freezes.
     notices = third_party_notices.write(NOTICES_FILE)
     PyInstaller.__main__.run(pyinstaller_args(sys.platform, bass_folder, notices))
+    list_contents(CONTENTS_FOLDER)
+
+
+def list_contents(contents: Path) -> None:
+    """List the files of the built contents folder, so the app's first start after an update
+    can delete the ones an earlier version left there (upgrade_manager.prune_leftovers).
+    Nothing goes in the folder after this; the Windows workflow adds ZipExtractor.exe beside
+    the app, outside it. A macOS .app is replaced whole, so it needs no list."""
+    if not contents.is_dir():
+        return
+    from genericmud import __version__
+    from genericmud.update.upgrade_manager import write_manifest
+
+    write_manifest(contents, __version__)
 
 
 if __name__ == "__main__":
