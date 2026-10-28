@@ -2027,7 +2027,7 @@ class VaultBrowserDialog(wx.Dialog):
         sizer.Add(self._gauge, 0, wx.EXPAND | wx.ALL, 8)
 
         buttons = wx.BoxSizer(wx.HORIZONTAL)
-        self._setup_btn = wx.Button(self, label="&Download && Set Up")
+        self._setup_btn = wx.Button(self, label="&Download and set up")
         self._setup_btn.Bind(wx.EVT_BUTTON, self._on_download)
         self._setup_btn.Disable()
         browser_btn = wx.Button(self, label="Open in &browser")
@@ -2076,7 +2076,7 @@ class VaultBrowserDialog(wx.Dialog):
             if hidden
             else ""
         )
-        self._status(f"{shown} soundpacks loaded.{hint} Choose one, then Download and Set Up.")
+        self._status(f"{shown} soundpacks loaded.{hint} Choose one, then Download and set up.")
         if self._packs:
             self._list.SetSelection(0)
             self._list.SetFocus()

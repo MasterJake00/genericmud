@@ -36,7 +36,7 @@ def test_activate_packs_arms_triggers_and_announces(tmp_path):
     app, backend, _posted = _app(store)
     result = app.activate_packs("god-wars")
     assert result.loaded == ["hunt"]
-    assert any("soundpack" in s for s in backend.spoken)  # announced aloud
+    assert "1 soundpack loaded" in backend.spoken  # announced aloud, as a whole sentence
     app.on_telnet_event(DataReceived(b"Bob tells you hi\r\n"))
     assert any("Bob tells you hi" in s for s in backend.spoken)  # the routing rule is live
 
