@@ -88,7 +88,7 @@ def _sweep_update_leftovers() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    from genericmud.session.crashlog import install_crash_handlers
+    from genericmud.session.crashlog import install_crash_handlers, mark_normal_exit
 
     install_crash_handlers()  # earliest chokepoint: covers both UIs and an import-time wx fault
     args = _parse_args(argv)
@@ -102,6 +102,8 @@ def main(argv: list[str] | None = None) -> None:
         from genericmud.ui.wx_app import run
 
         run(args, recovery=recovery)
+    # Not reached when the run dies, so a native exception logged above this line was survived.
+    mark_normal_exit()
 
 
 if __name__ == "__main__":
