@@ -1436,9 +1436,17 @@ class WorldDialog(wx.Dialog):
         save_default: bool = True,
         show_save: bool = True,
         lock_name: bool = False,
+        note: str = "",
     ) -> None:
         super().__init__(parent, title=title)
         self._world: World | None = None
+        # Why the dialog is up, first in the window: NVDA reads a dialog's text that labels no
+        # control as it opens, and it can be read again. Said aloud just before the dialog
+        # instead, it was cut off when the dialog took the focus.
+        self._note: wx.StaticText | None = None
+        if note:
+            self._note = wx.StaticText(self, label=note.replace("&", "&&"))
+            self._note.Wrap(420)
         grid = wx.FlexGridSizer(0, 2, 6, 6)
         grid.AddGrowableCol(1)
 
@@ -1455,7 +1463,12 @@ class WorldDialog(wx.Dialog):
         self._encoding.SetName("Encoding")
         self._encoding.SetSelection(0)
         grid.Add(self._encoding, 1, wx.EXPAND)
-        self._sounds = self._labeled_text(grid, "So&unds folder:", "Sounds folder")
+        # Blank is the usual answer: a soundpack plays its own sounds from where it's installed.
+        # A blank box with nothing saying so read as "no sounds".
+        self._sounds = self._labeled_text(
+            grid, "So&unds folder (blank uses the soundpack's own sounds):",
+            "Sounds folder (blank uses the soundpack's own sounds)",
+        )
         grid.Add((0, 0))
         self._download_sounds = wx.CheckBox(self, label="Do&wnload sounds the MUD offers")
         self._download_sounds.SetName("Download sounds the MUD offers")
@@ -1526,6 +1539,8 @@ class WorldDialog(wx.Dialog):
             grid.Add(self._trust, 1, wx.EXPAND)
 
         sizer = wx.BoxSizer(wx.VERTICAL)
+        if self._note is not None:
+            sizer.Add(self._note, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
         sizer.Add(grid, 1, wx.EXPAND | wx.ALL, 8)
         sizer.Add(self.CreateButtonSizer(wx.OK | wx.CANCEL), 0, wx.EXPAND | wx.ALL, 8)
         self.SetSizerAndFit(sizer)
@@ -4375,6 +4390,10 @@ class GenericMudFrame(wx.Frame):
             title="Confirm World",
             offer_trust=needs_trust,
             show_save=False,
+            note=(
+                f"The {world.name} soundpack is installed, with its own sounds: the Sounds "
+                "folder can stay blank. Press Enter to connect."
+            ),
         )
         try:
             if dialog.ShowModal() != wx.ID_OK:
@@ -4403,15 +4422,16 @@ class GenericMudFrame(wx.Frame):
     def _finish_setup_via_dialog(self, result) -> None:
         """Fallback when the pack has no connection details and the MUD isn't in the known-MUD
         table: open the world form with the name prefilled, explaining what's needed."""
+        note = ""
         if result.world is not None and not result.world.host:
-            self.announce(
-                f"The {result.world.name} soundpack installed, but carries no connection "
-                "details. Enter the MUD's host and port to connect."
+            note = (
+                f"The {result.world.name} soundpack is installed, but it doesn't say where its "
+                "MUD is. Enter the MUD's host and port to connect."
             )
         elif result.world is not None and result.world.host:
-            self.announce(
-                f"The {result.world.name} soundpack installed. It ships no sounds of its own — "
-                "set the Sounds folder to your local sound files, then connect."
+            note = (
+                f"The {result.world.name} soundpack is installed. It ships no sounds of its "
+                "own: set the Sounds folder to where you keep them, then connect."
             )
         needs_trust = (
             result.manifest.dialect in CODE_EXEC_DIALECTS
@@ -4423,6 +4443,7 @@ class GenericMudFrame(wx.Frame):
             title="Finish World Setup",
             offer_trust=needs_trust,
             save_default=True,
+            note=note,
         )
         if connect.ShowModal() == wx.ID_OK:
             world = connect.get_world()

@@ -30,6 +30,10 @@ Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
 **Small fixes**
 
+* After you install a soundpack, the window that confirms the world says the
+  pack's sounds are in place, and the Sounds folder box says that leaving it
+  blank uses the soundpack's own sounds. A blank box with nothing said about it
+  read as if the world had no sounds.
 * Connecting says "1 soundpack loaded" rather than just "1 soundpack".
 * In Browse Soundpacks, the Download and set up button no longer reads as
   "Download and and Set Up".
