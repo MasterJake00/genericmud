@@ -276,6 +276,7 @@ def test_startup_clears_out_old_update_folders(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(entry, "_recover_pending_upgrade", lambda: None)
     monkeypatch.setattr("genericmud.session.crashlog.install_crash_handlers", lambda: None)
+    monkeypatch.setattr("genericmud.config.worlds.config_dir", lambda: tmp_path / "config")
     opened: list[bool] = []
     window = types.SimpleNamespace(run=lambda _args, recovery=None: opened.append(True))
     monkeypatch.setitem(sys.modules, "genericmud.ui.wx_app", window)

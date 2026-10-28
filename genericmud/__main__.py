@@ -109,10 +109,23 @@ def _prune_leftover_files() -> None:
         pass
 
 
+def _prune_old_logs() -> None:
+    """Delete the app's own diagnostic and crash logs from earlier runs that are past keeping
+    (diaglog.prune_old_logs). Never raises: tidying up must not stop the app starting."""
+    try:
+        from genericmud.config.worlds import config_dir
+        from genericmud.session.diaglog import prune_old_logs
+
+        prune_old_logs(config_dir() / "logs")
+    except Exception:  # noqa: BLE001 - best effort, like the sweeps above
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     from genericmud.session.crashlog import install_crash_handlers, mark_normal_exit
 
     install_crash_handlers()  # earliest chokepoint: covers both UIs and an import-time wx fault
+    _prune_old_logs()
     args = _parse_args(argv)
     if args.web:
         from genericmud.web_launcher import run

@@ -221,6 +221,7 @@ def test_startup_tidies_the_contents_folder_unless_it_rolled_back(tmp_path, monk
     monkeypatch.setattr(sys, "_MEIPASS", str(contents), raising=False)
     monkeypatch.setattr(entry, "_sweep_update_leftovers", lambda: None)
     monkeypatch.setattr("genericmud.session.crashlog.install_crash_handlers", lambda: None)
+    monkeypatch.setattr("genericmud.config.worlds.config_dir", lambda: tmp_path / "config")
     monkeypatch.setitem(
         sys.modules, "genericmud.ui.wx_app", types.SimpleNamespace(run=lambda *_a, **_k: None)
     )

@@ -152,6 +152,7 @@ def _run_main_with(ui_run, tmp_path, monkeypatch):
     monkeypatch.setattr(crashlog, "install_crash_handlers", lambda: log)
     monkeypatch.setattr(crashlog, "_ACTIVE", log)
     monkeypatch.setattr(web_launcher, "run", ui_run)
+    monkeypatch.setattr("genericmud.config.worlds.config_dir", lambda: tmp_path)  # its logs
     try:
         entry.main(["--web"])
     finally:

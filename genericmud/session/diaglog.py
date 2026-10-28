@@ -22,7 +22,9 @@ fault must never crash the app it is observing.
 from __future__ import annotations
 
 import platform
+import re
 import sys
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -114,6 +116,46 @@ def make_diagnostic_log() -> DiagnosticLog | None:
         return None
     write_banner(diag)
     return diag
+
+
+_APP_LOG_NAME = re.compile(r"^(diagnostic|crash)-\d{8}-\d{6}\.log$")
+_BANNER = b" banner version="
+KEEP_NEWEST_LOGS = 20  # of each kind, however old: the last few runs are what debugging needs
+LOG_MAX_AGE_DAYS = 30
+
+
+def prune_old_logs(logs_dir: Path, *, now: float | None = None) -> list[str]:
+    """Delete the app's own diagnostic and crash logs older than LOG_MAX_AGE_DAYS, keeping the
+    KEEP_NEWEST_LOGS newest of each kind whatever their age; returns the names deleted.
+
+    Every run adds one of each, and a long session's diagnostic log runs to megabytes, so
+    the folder grew for as long as genericMud was used. World logs, the transcripts a
+    player asked for, are never touched: a file goes only when its name is exactly an app
+    log's and its first line is an app log's banner, since a world named "crash" files its
+    transcripts under the same pattern. Never raises.
+    """
+    cutoff = (time.time() if now is None else now) - LOG_MAX_AGE_DAYS * 24 * 3600
+    removed: list[str] = []
+    try:
+        names = [path for path in Path(logs_dir).iterdir() if _APP_LOG_NAME.match(path.name)]
+    except OSError:
+        return removed
+    for kind in ("diagnostic", "crash"):
+        logs = sorted((p for p in names if p.name.startswith(kind + "-")), reverse=True)
+        for path in logs[KEEP_NEWEST_LOGS:]:  # names sort by their time stamp
+            try:
+                if path.stat().st_mtime >= cutoff or not _starts_with_banner(path):
+                    continue
+                path.unlink()
+            except OSError:
+                continue
+            removed.append(path.name)
+    return removed
+
+
+def _starts_with_banner(path: Path) -> bool:
+    with open(path, "rb") as handle:
+        return _BANNER in handle.readline(512)
 
 
 def write_banner(diag: DiagnosticLog) -> None:
