@@ -14,8 +14,6 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 # hooks/hook-prism.py picks that up, for this spec and for tools/build_app.py alike.
 tmp_ret = collect_all('prism')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('pygame')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('lupa')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 # BASS, the audio library the app plays through, into the app's "bass" folder where
@@ -39,7 +37,12 @@ a = Analysis(
     hookspath=[os.path.join(SPECPATH, 'hooks')],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # pygame comes in through its own hook (its DLLs, font and icon), not whole: its docs,
+    # tests and examples were 12 MB, and the tests pulled in Python's test package and Tcl/Tk.
+    # Pythonwin's MFC windows only arrive through win32com's wrapper writer, which SAPI never
+    # runs. Kept the same as tools/build_app.py.
+    excludes=['pygame.tests', 'pygame.examples', 'pygame.docs', 'test', 'tkinter', 'pywin',
+              'win32ui'],
     noarchive=False,
     optimize=0,
 )
