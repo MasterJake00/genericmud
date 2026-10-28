@@ -75,3 +75,17 @@ def test_the_licence_notices_go_in_the_app(tmp_path):
     assert win[win.index(f"{notices};.") - 1] == "--add-data"
     assert f"{notices}:." in pyinstaller_args("darwin", notices=notices)
     assert win[-1] == "run_genericmud.py"
+
+
+def test_the_build_lists_its_contents_folder_last(tmp_path):
+    from genericmud.update.upgrade_manager import MANIFEST_NAME
+    from tools.build_app import list_contents
+
+    contents = tmp_path / "dist" / "genericMud" / "_internal"
+    (contents / "wx").mkdir(parents=True)
+    (contents / "wx" / "core.pyd").write_bytes(b"x")
+    list_contents(contents)
+    listed = (contents / MANIFEST_NAME).read_text(encoding="utf-8").splitlines()
+    assert listed[1:] == ["wx/core.pyd", MANIFEST_NAME]
+    list_contents(tmp_path / "nowhere")  # a build with no contents folder (the macOS .app)
+    assert not (tmp_path / "nowhere").exists()

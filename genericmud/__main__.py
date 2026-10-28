@@ -87,6 +87,28 @@ def _sweep_update_leftovers() -> None:
         pass
 
 
+def _prune_leftover_files() -> None:
+    """Delete the files an earlier version left in the app's contents folder.
+
+    An in-app update lays the new build over the old one, so files a later build stopped
+    shipping stay behind. Frozen build only, after a startup that rolled nothing back, and
+    never raises: tidying up must not stop the app from starting.
+    """
+    import sys
+
+    contents = getattr(sys, "_MEIPASS", None)
+    if not getattr(sys, "frozen", False) or not contents:
+        return
+    try:
+        from pathlib import Path
+
+        from genericmud.update.upgrade_manager import prune_leftovers
+
+        prune_leftovers(Path(contents))
+    except Exception:  # noqa: BLE001 - best effort, like the sweep above
+        pass
+
+
 def main(argv: list[str] | None = None) -> None:
     from genericmud.session.crashlog import install_crash_handlers, mark_normal_exit
 
@@ -99,6 +121,8 @@ def main(argv: list[str] | None = None) -> None:
     else:
         recovery = _recover_pending_upgrade()  # before importing wx: roll back a bad swap first
         _sweep_update_leftovers()
+        if recovery is None:  # after a rollback the files on disk aren't this build's
+            _prune_leftover_files()  # before wx loads, so an old wx's DLLs can go too
         from genericmud.ui.wx_app import run
 
         run(args, recovery=recovery)
