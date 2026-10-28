@@ -18,7 +18,7 @@ from pathlib import Path
 from genericmud.automation.channels import ChannelPolicy
 from genericmud.automation.engine import AutomationEngine, Callback
 from genericmud.automation.variables import format_value
-from genericmud.safepath import is_absolute, is_traversal, is_unc, within
+from genericmud.safepath import inside, is_absolute, is_traversal, is_unc, real_path
 
 # Channels that carry the primary spoken output + app alerts. A pack must not be able to set
 # speak=False on these and silence the client -- for a blind user, total muting is catastrophic
@@ -36,6 +36,7 @@ _MAX_VAR_VALUE_LEN = 1_000_000  # 1 MB; a longer var/shared value is refused
 _MAX_EXECUTE_DEPTH = 20  # an alias that executes itself must terminate without recursion overflow
 _COMMAND_VARIABLE_RE = re.compile(r"\$\{([^{}]+)\}")
 _MISSING = object()
+_MAX_REAL_ROOTS = 64  # resolved sound roots kept per pack; @sppath can be set to anything
 
 # MUSHclient's msgbox button sets, each with the names its buttons answer with, in order.
 MESSAGE_BUTTONS = {
@@ -63,6 +64,9 @@ class ScriptApi:
         self._base_dir = base_dir
         self._sounds_index: dict[str, str] = {}  # basename(lower) -> full path under @sppath
         self._sounds_index_key: str | None = None  # the @sppath the index was built for
+        self._real_roots: dict[str, Path] = {}  # allowed sound roots, links followed (_real_root)
+        self._sounds_root_for: tuple[object, str | None, str | None] | None = None
+        self._sounds_root_value: str | None = None  # _sounds_root's answer for that key
         self._active_timers = 0  # pending pack timers, bounded by _MAX_ACTIVE_TIMERS
         self._timer_refusal_noted = False  # the diagnostic log hears about the first refusal
         self._execute_depth = 0
@@ -678,25 +682,57 @@ class ScriptApi:
         # /etc/... are rejected. A bare relative name (no pack dir) can't escape (.. already
         # refused above), so it passes through to the backend as before.
         if is_absolute(resolved):
-            roots = [root for root in (self._base_dir, self._sounds_root()) if root]
-            if not any(within(root, resolved) for root in roots):
+            # The requested path is looked at afresh every time; the roots it must lie in are
+            # resolved once (_real_root), as a cue that resolved them all again cost a dozen
+            # trips to the disk on Windows.
+            requested = real_path(resolved)
+            allowed = (self._base_dir, self._sounds_root())
+            roots = [self._real_root(root) for root in allowed if root]
+            if requested is None or not any(
+                root is not None and inside(root, requested) for root in roots
+            ):
                 return ""
         return resolved
+
+    def _real_root(self, root: str) -> Path | None:
+        """An allowed sound root with its links followed, remembered once it resolves. The pack
+        folder, the player's Sounds folder and @sppath stay put while a session plays, and a
+        path checked against a root is still resolved afresh, so a root that did move can only
+        turn a cue away, never let one out of the folders that were allowed."""
+        known = self._real_roots.get(root)
+        if known is None:
+            known = real_path(root)
+            if known is None:
+                return None  # not remembered: the next cue tries again
+            if len(self._real_roots) >= _MAX_REAL_ROOTS:
+                self._real_roots.clear()
+            self._real_roots[root] = known
+        return known
 
     def _sounds_root(self) -> str | None:
         """Where the pack's sounds are: @sppath when it lies inside the pack or the player's
         own sounds folder, else that folder. @sppath is a variable any pack, or MUD text a
         pack runs as script, can set; pointed at "/" it let any file play and a missing
-        sound walk the whole disk."""
+        sound walk the whole disk. Judged once for each @sppath and Sounds folder, since every
+        cue asks."""
         sppath = self._engine.get_var("sppath")
         if not sppath or is_unc(sppath):
             # A UNC @sppath isn't even looked at: on Windows, resolving one is enough to send
             # the player's NTLM hash to that host.
             return self._engine.sounds_dir
-        trusted = [root for root in (self._base_dir, self._engine.sounds_dir) if root]
-        if any(within(root, sppath) for root in trusted):
-            return sppath
-        return self._engine.sounds_dir
+        key = (sppath, self._base_dir, self._engine.sounds_dir)
+        if key != self._sounds_root_for:
+            target = real_path(sppath)
+            if target is None:
+                return self._engine.sounds_dir  # unresolvable just now: judged again next cue
+            trusted = [root for root in (self._base_dir, self._engine.sounds_dir) if root]
+            allowed = any(
+                (real := self._real_root(root)) is not None and inside(real, target)
+                for root in trusted
+            )
+            self._sounds_root_value = sppath if allowed else self._engine.sounds_dir
+            self._sounds_root_for = key
+        return self._sounds_root_value
 
     def _find_in_sounds_dir(self, path: str) -> str | None:
         """Locate a missing sound under the user's Sounds folder (``@sppath``).

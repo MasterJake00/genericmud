@@ -66,12 +66,26 @@ def is_absolute(name: str) -> bool:
 
 def within(root: str | Path, candidate: str | Path) -> bool:
     """True if ``candidate`` resolves to ``root`` or a path inside it (symlinks resolved)."""
+    root_real = real_path(root)
+    cand_real = real_path(candidate)
+    return root_real is not None and cand_real is not None and inside(root_real, cand_real)
+
+
+def real_path(path: str | Path) -> Path | None:
+    """``path`` with its links followed, or None when it can't be resolved."""
     try:
-        root_real = Path(root).resolve()
-        cand_real = Path(candidate).resolve()
+        return Path(path).resolve()
     except OSError:
-        return False
-    return cand_real == root_real or root_real in cand_real.parents
+        return None
+
+
+def inside(root_real: Path, candidate_real: Path) -> bool:
+    """:func:`within` for paths already resolved: ``candidate_real`` is ``root_real`` or in it.
+
+    For a caller that checks many paths against the same few roots. Resolving a path on
+    Windows opens it, so resolving the roots again for every path costs more than the check.
+    """
+    return candidate_real == root_real or root_real in candidate_real.parents
 
 
 def confine(root: str | Path, name: str) -> Path | None:

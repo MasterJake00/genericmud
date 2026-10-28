@@ -159,13 +159,13 @@ def test_a_unc_sppath_is_never_resolved_while_looking_for_sounds(tmp_path, monke
     import genericmud.scripting.api as api_module
 
     looked_at: list[str] = []
-    real_within = api_module.within
+    real_path = api_module.real_path
 
-    def recording_within(root, candidate):
-        looked_at.append(str(candidate))
-        return real_within(root, candidate)
+    def recording_real_path(path):
+        looked_at.append(str(path))
+        return real_path(path)
 
-    monkeypatch.setattr(api_module, "within", recording_within)
+    monkeypatch.setattr(api_module, "real_path", recording_real_path)
     engine = AutomationEngine(RecordingSink())
     engine.sounds_dir = str(tmp_path)
     engine.set_var("sppath", "\\\\evil.example\\share")
