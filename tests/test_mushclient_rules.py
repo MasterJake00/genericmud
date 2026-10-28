@@ -38,7 +38,7 @@ def _line(pack: MushclientPack, engine: AutomationEngine, text: str, spans=None)
 class _RaisingPattern:
     """A compiled pattern that blows the engine's per-match time budget."""
 
-    pattern = "slow"
+    pattern = "(a+)+$"  # the classic runaway shape, with no fixed text to look for first
 
     def search(self, text, **kwargs):
         raise TimeoutError("match budget exceeded")
