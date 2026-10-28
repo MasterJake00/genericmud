@@ -8,6 +8,32 @@ fails the build on purpose.
 
 Entries start at 0.7.1. Earlier releases were tagged before this file existed.
 
+## 0.20.5 — 2026-10-28
+
+**Faster with big soundpacks**
+
+* genericMud gets through each line about four times faster than before. With a
+  big soundpack, a long burst of output, like a full status screen or a busy
+  fight, used to hold up what you typed next for a second or more; it goes out
+  straight away now. Sound packs fire exactly as before.
+
+**A smaller download, and a tidier folder**
+
+* The Windows download is about 15 MB smaller: it no longer carries libraries
+  genericMud never uses.
+* Updating now removes the files earlier versions left behind. The first start
+  after this update tidies genericMud's program files, which can free 40 MB or
+  more if you've updated many times. Your worlds, soundpacks and logs aren't
+  touched.
+* Diagnostic and crash logs from more than 30 days ago are cleared out, keeping
+  the last 20 of each. The logs of your games are never cleared.
+
+**Small fixes**
+
+* Connecting says "1 soundpack loaded" rather than just "1 soundpack".
+* In Browse Soundpacks, the Download and set up button no longer reads as
+  "Download and and Set Up".
+
 ## 0.20.4 — 2026-10-27
 
 **Updating genericMud**
